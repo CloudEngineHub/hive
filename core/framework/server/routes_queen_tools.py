@@ -226,9 +226,7 @@ def _render_mcp_servers(
                     "input_schema": entry.get("input_schema", {}),
                     "enabled": enabled,
                     "provider": provider,
-                    "provider_connected": (
-                        True if provider is None else provider in connected_providers
-                    ),
+                    "provider_connected": (True if provider is None else provider in connected_providers),
                 }
             )
         servers.append({"name": server_name, "tools": tools})
@@ -269,9 +267,7 @@ def _catalog_from_live_session(session: Any) -> dict[str, list[dict[str, Any]]]:
             )
         return result if result["MCP Tools"] else {}
 
-    full_catalog = (
-        registry.get_full_mcp_catalog() if hasattr(registry, "get_full_mcp_catalog") else {}
-    )
+    full_catalog = registry.get_full_mcp_catalog() if hasattr(registry, "get_full_mcp_catalog") else {}
     if full_catalog:
         return {
             server: sorted(
@@ -413,11 +409,7 @@ def _connected_providers() -> set[str]:
         from aden_tools.credentials.store_adapter import CredentialStoreAdapter
 
         adapter = CredentialStoreAdapter.default()
-        return {
-            (a.get("provider") or "")
-            for a in adapter.get_all_account_info()
-            if a.get("provider")
-        }
+        return {(a.get("provider") or "") for a in adapter.get_all_account_info() if a.get("provider")}
     except Exception:
         logger.debug("Connected-providers snapshot unavailable", exc_info=True)
         return set()

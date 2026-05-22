@@ -1429,9 +1429,7 @@ async def fork_session_into_colony(
                     "description": profile.task,
                 }
             if profile.prompt_override:
-                profile_meta["system_prompt"] = (
-                    f"{worker_meta['system_prompt']}\n\n{profile.prompt_override}"
-                )
+                profile_meta["system_prompt"] = f"{worker_meta['system_prompt']}\n\n{profile.prompt_override}"
             if profile.tool_filter:
                 profile_meta["tools"] = [t for t in worker_meta["tools"] if t in set(profile.tool_filter)]
             if isinstance(profile.concurrency_hint, int) and profile.concurrency_hint > 0:
@@ -1638,8 +1636,7 @@ async def fork_session_into_colony(
             existing_profiles = []
         seen = {p["name"] for p in persisted_profiles if isinstance(p, dict) and p.get("name")}
         merged = list(persisted_profiles) + [
-            p for p in existing_profiles
-            if isinstance(p, dict) and p.get("name") and p["name"] not in seen
+            p for p in existing_profiles if isinstance(p, dict) and p.get("name") and p["name"] not in seen
         ]
         metadata["worker_profiles"] = merged
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")

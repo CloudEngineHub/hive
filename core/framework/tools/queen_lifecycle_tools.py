@@ -2273,9 +2273,7 @@ def register_queen_lifecycle_tools(
 
         cn = (colony_name or "").strip()
         if not _COLONY_NAME_RE.match(cn):
-            return json.dumps(
-                {"error": "colony_name must be lowercase alphanumeric with underscores."}
-            )
+            return json.dumps({"error": "colony_name must be lowercase alphanumeric with underscores."})
         err = validate_profile_name(profile_name)
         if err is not None:
             return json.dumps({"error": err})

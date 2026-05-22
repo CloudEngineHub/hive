@@ -218,9 +218,7 @@ def _render_servers(
                     "input_schema": entry.get("input_schema", {}),
                     "enabled": True if allowed is None else tool_name in allowed,
                     "provider": provider,
-                    "provider_connected": (
-                        True if provider is None else provider in connected_providers
-                    ),
+                    "provider_connected": (True if provider is None else provider in connected_providers),
                 }
             )
         servers.append({"name": name, "tools": tools})

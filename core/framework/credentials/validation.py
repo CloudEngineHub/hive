@@ -259,18 +259,12 @@ def compute_unavailable_mcp_tools(
 
         adapter = CredentialStoreAdapter.default()
         tool_provider_map = adapter.get_tool_provider_map()
-        live_providers = {
-            (a.get("provider") or "")
-            for a in adapter.get_all_account_info()
-            if a.get("provider")
-        }
+        live_providers = {(a.get("provider") or "") for a in adapter.get_all_account_info() if a.get("provider")}
     except Exception as exc:
         logger.debug("compute_unavailable_mcp_tools: adapter unavailable: %s", exc)
         return set(), []
 
-    candidate: set[str] | None = (
-        set(candidate_tool_names) if candidate_tool_names is not None else None
-    )
+    candidate: set[str] | None = set(candidate_tool_names) if candidate_tool_names is not None else None
 
     drop: set[str] = set()
     by_provider: dict[str, list[str]] = {}
@@ -287,9 +281,7 @@ def compute_unavailable_mcp_tools(
         names.sort()
         sample = ", ".join(names[:6])
         suffix = f" +{len(names) - 6} more" if len(names) > 6 else ""
-        messages.append(
-            f"{provider} (no live account) → drops {len(names)} tool(s): {sample}{suffix}"
-        )
+        messages.append(f"{provider} (no live account) → drops {len(names)} tool(s): {sample}{suffix}")
 
     return drop, messages
 

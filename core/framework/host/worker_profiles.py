@@ -76,11 +76,7 @@ class WorkerProfile:
             name=str(data.get("name", "")).strip(),
             task=str(data.get("task", "")),
             skill_name=str(data.get("skill_name", "")),
-            integrations={
-                str(k): str(v)
-                for k, v in (data.get("integrations") or {}).items()
-                if str(k) and str(v)
-            },
+            integrations={str(k): str(v) for k, v in (data.get("integrations") or {}).items() if str(k) and str(v)},
             concurrency_hint=(
                 int(data["concurrency_hint"])
                 if isinstance(data.get("concurrency_hint"), int) and data["concurrency_hint"] > 0

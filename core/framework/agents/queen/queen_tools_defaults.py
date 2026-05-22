@@ -467,13 +467,7 @@ def _credentialed_tool_names() -> set[str]:
     try:
         from aden_tools.credentials.store_adapter import CredentialStoreAdapter
 
-        return {
-            name
-            for name, provider in CredentialStoreAdapter.default()
-            .get_tool_provider_map()
-            .items()
-            if provider
-        }
+        return {name for name, provider in CredentialStoreAdapter.default().get_tool_provider_map().items() if provider}
     except Exception:
         logger.debug("Provider map unavailable for default-tools filter", exc_info=True)
         return set()

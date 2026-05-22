@@ -297,9 +297,7 @@ class AdenSyncProvider(CredentialProvider):
         # ``hive_auth.bin`` (or in the dashboard's Keys panel).
         cfg = self._client.config
         api_key = cfg.api_key or ""
-        key_summary = (
-            f"{api_key[:8]}…{api_key[-4:]}" if len(api_key) >= 12 else "<short>"
-        )
+        key_summary = f"{api_key[:8]}…{api_key[-4:]}" if len(api_key) >= 12 else "<short>"
         logger.info(
             "AdenSync: GET %s/v1/credentials key=%s len=%d",
             cfg.base_url.rstrip("/"),

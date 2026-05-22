@@ -423,10 +423,7 @@ class ToolRegistry:
         Returns a deep-ish copy so callers can mutate the structure
         without affecting the registry's internal state.
         """
-        return {
-            server: [dict(entry) for entry in entries]
-            for server, entries in self._mcp_full_catalog.items()
-        }
+        return {server: [dict(entry) for entry in entries] for server, entries in self._mcp_full_catalog.items()}
 
     def set_session_context(self, **context) -> None:
         """
