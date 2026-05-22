@@ -39,6 +39,39 @@ logger = logging.getLogger(__name__)
 
 BRIDGE_PORT = 9229
 
+# Heartbeat tuning. WS-layer ping (websockets library) catches dead TCP within
+# ~ping_interval+ping_timeout seconds. App-level ping (extension echoes pong)
+# additionally proves the offscreen page and service worker are still pumping
+# messages — if the SW is suspended but TCP is alive, the WS ping passes and
+# the app ping fails, surfacing a real disconnect instead of a false-healthy.
+_WS_PING_INTERVAL_S: float = 20.0
+_WS_PING_TIMEOUT_S: float = 20.0
+_APP_PING_INTERVAL_S: float = 5.0
+_APP_PING_TIMEOUT_S: float = 12.0  # ~2 missed app pings before we give up
+
+# Minimum extension protocol version we still talk to. Bumped here when the
+# wire format changes incompatibly. Older extensions still connect — the
+# bridge logs a warning and the popup surfaces "please update".
+_MIN_EXTENSION_PROTOCOL_VERSION: int = 1
+
+
+class BridgeError(RuntimeError):
+    """Structured error from a bridge command.
+
+    ``code`` lets callers branch (retry connection_lost, re-attach
+    cdp_not_attached, give up on protocol_mismatch) instead of grepping
+    error message strings. ``retryable`` is a hint to the tool wrapper:
+    transient drops are worth one retry; protocol/usage errors are not.
+    """
+
+    __slots__ = ("code", "retryable")
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
 # CDP wait_until values
 VALID_WAIT_UNTIL = {"commit", "domcontentloaded", "load", "networkidle"}
 
@@ -271,6 +304,21 @@ class BeelineBridge:
         self._pending: dict[str, asyncio.Future] = {}
         self._counter = 0
         self._cdp_attached: set[int] = set()  # Track tabs with CDP attached
+        # Per-tab serialization of CDP commands. Two queens accidentally
+        # targeting the same tab (e.g. shared profile) would otherwise
+        # interleave attach/detach calls and corrupt CDP session state.
+        self._tab_locks: dict[int, asyncio.Lock] = {}
+        # Heartbeat / connection-health bookkeeping. Set when the
+        # extension connects and cleared on disconnect.
+        self._connected_at_ms: float | None = None
+        self._last_pong_ms: float | None = None  # monotonic ms of last pong
+        self._extension_version: str | None = None
+        self._extension_id: str | None = None
+        self._extension_protocol_version: int | None = None
+        self._ping_task: asyncio.Task | None = None
+        self._started_at_ms: float = time.monotonic() * 1000
+        # Track in-flight requests for /status reporting.
+        self._in_flight: int = 0
 
     @property
     def is_connected(self) -> bool:
@@ -301,6 +349,12 @@ class BeelineBridge:
                 port,
                 logger=null_logger,
                 max_size=50 * 1024 * 1024,  # 50 MB — CDP responses (AX tree, screenshots) can be large
+                # WS-layer heartbeat: detects half-open TCP within
+                # ~ping_interval+ping_timeout seconds. Without this an
+                # idle NAT reaper or laptop sleep silently kills the
+                # socket and the next _send sits at its 30s timeout.
+                ping_interval=_WS_PING_INTERVAL_S,
+                ping_timeout=_WS_PING_TIMEOUT_S,
             )
             logger.info("Beeline bridge listening on ws://127.0.0.1:%d", port)
         except OSError as e:
@@ -320,21 +374,77 @@ class BeelineBridge:
         except OSError as e:
             logger.warning("Bridge status server could not start on port %d: %s", status_port, e)
 
-    async def stop(self) -> None:
-        # Cancel in-flight bridge requests so any caller stuck in _send
-        # sees CancelledError immediately instead of waiting the full
-        # 30s timeout. Mirrors the cleanup in _handle_connection's
-        # disconnect branch so both exit paths behave the same.
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Resolve every in-flight future with ``exc``.
+
+        Replaces the old "fut.cancel()" cleanup. Cancellation looks
+        identical to a deliberate caller cancel; resolving with a
+        structured exception lets tool wrappers branch (retry on
+        connection_lost, surface a clear error otherwise).
+        """
         for fut in self._pending.values():
             if not fut.done():
-                fut.cancel()
+                fut.set_exception(exc)
         self._pending.clear()
+
+    async def _ping_loop(self, ws) -> None:
+        """Send app-level pings until the connection drops.
+
+        WS-layer pings (configured on websockets.serve) only prove the
+        TCP socket is alive. App-level pings additionally prove the
+        extension's offscreen page can pump messages — important
+        because MV3 service workers can suspend even when TCP stays
+        open, and silent dispatch failures here are exactly the
+        "looks-connected-but-isn't" symptom users have hit.
+        """
+        try:
+            while self._ws is ws:
+                # Ping cadence is fixed — too short floods the SW with
+                # alarms, too long delays detection past the next
+                # _send timeout. 5s strikes the published MV3 sweet
+                # spot for keepAlive nudges.
+                await asyncio.sleep(_APP_PING_INTERVAL_S)
+                if self._ws is not ws:
+                    return
+                try:
+                    await ws.send(json.dumps({"type": "ping"}))
+                except Exception:
+                    # send() raising here means the socket is gone —
+                    # the read loop's finally branch will clean up.
+                    return
+                last = self._last_pong_ms
+                if last is not None and (time.monotonic() * 1000 - last) > _APP_PING_TIMEOUT_S * 1000:
+                    logger.warning("App-level ping timeout — closing extension WebSocket")
+                    log_connection_event("disconnect", {"reason": "ping_timeout"})
+                    try:
+                        await ws.close(code=4001, reason="ping_timeout")
+                    except Exception:
+                        pass
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def stop(self) -> None:
+        # Tear down the heartbeat task before futures so it doesn't
+        # observe a half-closed state.
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
+        self._ping_task = None
+        # Cancel in-flight bridge requests so any caller stuck in _send
+        # sees a structured connection_lost immediately instead of
+        # waiting the full 30s timeout. Mirrors the cleanup in
+        # _handle_connection's disconnect branch so both exit paths
+        # behave the same.
+        self._fail_pending(BridgeError("connection_lost", "Bridge stopping", retryable=False))
         # Drop CDP attach cache — next run must re-attach fresh.
         self._cdp_attached.clear()
         # Drop highlight state — stale entries would otherwise carry
         # over into a subsequent run and confuse screenshot annotation.
         _interaction_highlights.clear()
+        self._tab_locks.clear()
         self._ws = None
+        self._connected_at_ms = None
+        self._last_pong_ms = None
 
         if self._server:
             self._server.close()
@@ -351,13 +461,46 @@ class BeelineBridge:
                 pass
             self._status_server = None
 
+    def status_payload(self) -> dict:
+        """Build the /status JSON. Public so tests / tools can introspect.
+
+        Shape is intentionally a list so the desktop UI can render
+        per-extension state when the bridge later supports multiple
+        simultaneous connections; today there is at most one entry.
+        """
+        now_ms = time.monotonic() * 1000
+        connections: list[dict] = []
+        if self._ws is not None:
+            last_pong_age_ms: float | None = None
+            if self._last_pong_ms is not None:
+                last_pong_age_ms = round(now_ms - self._last_pong_ms, 1)
+            connections.append(
+                {
+                    "extension_id": self._extension_id,
+                    "version": self._extension_version,
+                    "protocol_version": self._extension_protocol_version,
+                    "connected_since_ms": (
+                        round(now_ms - self._connected_at_ms, 1) if self._connected_at_ms else None
+                    ),
+                    "last_pong_age_ms": last_pong_age_ms,
+                    "in_flight": self._in_flight,
+                }
+            )
+        return {
+            "bridge": "running" if self._server is not None else "stopped",
+            "port": BRIDGE_PORT,
+            "connected": self.is_connected,  # legacy single-bool field
+            "connections": connections,
+            "uptime_ms": round(now_ms - self._started_at_ms, 1),
+        }
+
     async def _http_status_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Minimal asyncio TCP handler serving HTTP GET /status on the status port."""
         try:
             raw = await asyncio.wait_for(reader.read(512), timeout=2.0)
             first_line = raw.split(b"\r\n", 1)[0].decode(errors="replace")
             if first_line.startswith("GET /status"):
-                body = json.dumps({"connected": self.is_connected, "bridge": "running"}).encode()
+                body = json.dumps(self.status_payload()).encode()
                 response = (
                     b"HTTP/1.1 200 OK\r\n"
                     b"Content-Type: application/json\r\n"
@@ -388,9 +531,30 @@ class BeelineBridge:
             writer.close()
 
     async def _handle_connection(self, ws) -> None:
+        # If a previous extension is still bound, displace it cleanly
+        # (extension reload, second desktop app launching, etc.) so the
+        # new connection inherits a clean slate.
+        if self._ws is not None and self._ws is not ws:
+            log_connection_event("disconnect", {"reason": "displaced_by_new_connection"})
+            self._fail_pending(BridgeError("connection_lost", "Extension reconnected", retryable=True))
         logger.info("Chrome extension connected")
         log_connection_event("connect")
         self._ws = ws
+        self._connected_at_ms = time.monotonic() * 1000
+        # Treat connect as the implicit first pong so the first ping
+        # interval doesn't immediately trip "missed pong".
+        self._last_pong_ms = self._connected_at_ms
+        # Reset extension identity until hello arrives.
+        self._extension_version = None
+        self._extension_id = None
+        self._extension_protocol_version = None
+        # Drop CDP attach cache: a brand new extension instance has no
+        # debugger sessions attached, regardless of what we cached for
+        # the previous connection.
+        self._cdp_attached.clear()
+        # Spin up the app-level ping loop bound to this ws.
+        self._ping_task = asyncio.create_task(self._ping_loop(ws))
+        disconnect_reason = "remote_close"
         try:
             async for raw in ws:
                 try:
@@ -399,8 +563,38 @@ class BeelineBridge:
                     continue
 
                 if msg.get("type") == "hello":
-                    logger.info("Extension hello: version=%s", msg.get("version"))
-                    log_connection_event("hello", {"version": msg.get("version")})
+                    self._extension_version = msg.get("version")
+                    self._extension_id = msg.get("extensionId")
+                    proto = msg.get("protocolVersion")
+                    if isinstance(proto, int):
+                        self._extension_protocol_version = proto
+                    if (
+                        self._extension_protocol_version is not None
+                        and self._extension_protocol_version < _MIN_EXTENSION_PROTOCOL_VERSION
+                    ):
+                        logger.warning(
+                            "Extension protocol_version=%s below minimum %s — please update the Beeline extension",
+                            self._extension_protocol_version,
+                            _MIN_EXTENSION_PROTOCOL_VERSION,
+                        )
+                    logger.info(
+                        "Extension hello: version=%s, protocol=%s, id=%s",
+                        self._extension_version,
+                        self._extension_protocol_version,
+                        (self._extension_id or "")[:8],
+                    )
+                    log_connection_event(
+                        "hello",
+                        {
+                            "version": self._extension_version,
+                            "protocol_version": self._extension_protocol_version,
+                            "extension_id": self._extension_id,
+                        },
+                    )
+                    continue
+
+                if msg.get("type") == "pong":
+                    self._last_pong_ms = time.monotonic() * 1000
                     continue
 
                 if msg.get("type") == "cdp_event":
@@ -430,19 +624,32 @@ class BeelineBridge:
                         else:
                             log_bridge_message("recv", "response", msg_id=msg_id, result=msg.get("result"))
                             fut.set_result(msg.get("result", {}))
-        except Exception:
-            pass
+        except Exception as exc:
+            disconnect_reason = f"exception:{type(exc).__name__}"
         finally:
+            # Cancel ping task tied to this ws; a new connection will
+            # spin up its own.
+            if self._ping_task and not self._ping_task.done():
+                self._ping_task.cancel()
+            self._ping_task = None
             # Only clear self._ws if this handler still owns it.
             if self._ws is ws:
-                logger.info("Chrome extension disconnected")
-                log_connection_event("disconnect")
+                logger.info("Chrome extension disconnected (%s)", disconnect_reason)
+                log_connection_event("disconnect", {"reason": disconnect_reason})
                 self._ws = None
-                # Cancel any pending requests
-                for fut in self._pending.values():
-                    if not fut.done():
-                        fut.cancel()
-                self._pending.clear()
+                self._connected_at_ms = None
+                self._last_pong_ms = None
+                self._extension_version = None
+                self._extension_id = None
+                self._extension_protocol_version = None
+                # Surface a structured error to in-flight callers so a
+                # tool wrapper can decide whether to retry. Cancelling
+                # the futures (old behavior) is indistinguishable from
+                # a deliberate caller cancel and gives the agent no
+                # signal to re-try with.
+                self._fail_pending(
+                    BridgeError("connection_lost", "Extension disconnected mid-request", retryable=True)
+                )
 
     def _handle_cdp_event(self, tab_id: int | None, method: str, params: dict) -> None:
         """Decode a CDP event forwarded from the extension and route it
@@ -589,14 +796,29 @@ class BeelineBridge:
     # don't regress.
     _DEFAULT_SEND_TIMEOUT_S: float = 30.0
 
+    def _tab_lock(self, tab_id: int) -> asyncio.Lock:
+        """Lazy-create an asyncio.Lock keyed by tab_id.
+
+        Used to serialize CDP commands targeting the same tab. Lock is
+        kept around for the lifetime of the bridge — the keyspace is
+        bounded by the number of tabs Chrome ever creates per session
+        and entries are dropped in stop().
+        """
+        lock = self._tab_locks.get(tab_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._tab_locks[tab_id] = lock
+        return lock
+
     async def _send(self, type_: str, *, timeout: float | None = None, **params) -> dict:
         """Send a command to the extension and wait for the result."""
         if not self._ws:
-            raise RuntimeError("Extension not connected")
+            raise BridgeError("not_connected", "Extension not connected", retryable=True)
         self._counter += 1
         msg_id = str(self._counter)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[msg_id] = fut
+        self._in_flight += 1
         start = time.perf_counter()
         effective_timeout = timeout if timeout is not None else self._DEFAULT_SEND_TIMEOUT_S
 
@@ -615,12 +837,23 @@ class BeelineBridge:
             # what actually hung — the generic 'cdp' type is useless
             # when ten different CDP calls use the same type.
             detail = f" method={params.get('method')}" if params.get("method") else ""
-            raise RuntimeError(f"Bridge command '{type_}'{detail} timed out after {effective_timeout:.0f}s") from None
+            raise BridgeError(
+                "timeout",
+                f"Bridge command '{type_}'{detail} timed out after {effective_timeout:.0f}s",
+                retryable=False,
+            ) from None
+        except BridgeError:
+            # _fail_pending already removed the future when it set the
+            # exception; just propagate so callers see the real code.
+            raise
         except BaseException:
             # CancelledError or any other exception — remove stale future so a late
             # response from the extension doesn't try to resolve a cancelled future.
             self._pending.pop(msg_id, None)
             raise
+        finally:
+            if self._in_flight > 0:
+                self._in_flight -= 1
 
     # Substrings that indicate Chrome detached the debugger out from
     # under us (tab closed, user opened DevTools, cross-origin nav).
@@ -661,52 +894,58 @@ class BeelineBridge:
         cache entry, reattach, and retry once. Without this the Python
         side would keep assuming it's attached and every subsequent call
         would hit the same error until someone restarted the bridge.
+
+        Concurrent calls targeting the same tab are serialized via a
+        per-tab asyncio.Lock — interleaved attach/detach/sendCommand
+        would otherwise corrupt CDP session state when two queens
+        accidentally share a tab.
         """
         start = time.perf_counter()
-        try:
-            result = await self._send(
-                "cdp",
-                tabId=tab_id,
-                method=method,
-                params=params or {},
-                timeout=timeout,
-            )
-            duration_ms = (time.perf_counter() - start) * 1000
-            log_cdp_command(tab_id, method, params, result, duration_ms=duration_ms)
-            return result
-        except Exception as e:
-            duration_ms = (time.perf_counter() - start) * 1000
-            log_cdp_command(tab_id, method, params, error=str(e), duration_ms=duration_ms)
-            if self._is_cdp_dead_session(e):
-                logger.info(
-                    "CDP session for tab %d looks dead (%s) — re-attaching and retrying",
-                    tab_id,
-                    str(e)[:120],
+        async with self._tab_lock(tab_id):
+            try:
+                result = await self._send(
+                    "cdp",
+                    tabId=tab_id,
+                    method=method,
+                    params=params or {},
+                    timeout=timeout,
                 )
-                self._cdp_attached.discard(tab_id)
-                try:
-                    reattach = await self._send("cdp.attach", tabId=tab_id)
-                    if reattach.get("ok"):
-                        self._cdp_attached.add(tab_id)
-                        retry_start = time.perf_counter()
-                        result = await self._send(
-                            "cdp",
-                            tabId=tab_id,
-                            method=method,
-                            params=params or {},
-                            timeout=timeout,
-                        )
-                        log_cdp_command(
-                            tab_id,
-                            method,
-                            params,
-                            result,
-                            duration_ms=(time.perf_counter() - retry_start) * 1000,
-                        )
-                        return result
-                except Exception as retry_exc:
-                    logger.debug("CDP reattach+retry for tab %d failed: %s", tab_id, retry_exc)
-            raise
+                duration_ms = (time.perf_counter() - start) * 1000
+                log_cdp_command(tab_id, method, params, result, duration_ms=duration_ms)
+                return result
+            except Exception as e:
+                duration_ms = (time.perf_counter() - start) * 1000
+                log_cdp_command(tab_id, method, params, error=str(e), duration_ms=duration_ms)
+                if self._is_cdp_dead_session(e):
+                    logger.info(
+                        "CDP session for tab %d looks dead (%s) — re-attaching and retrying",
+                        tab_id,
+                        str(e)[:120],
+                    )
+                    self._cdp_attached.discard(tab_id)
+                    try:
+                        reattach = await self._send("cdp.attach", tabId=tab_id)
+                        if reattach.get("ok"):
+                            self._cdp_attached.add(tab_id)
+                            retry_start = time.perf_counter()
+                            result = await self._send(
+                                "cdp",
+                                tabId=tab_id,
+                                method=method,
+                                params=params or {},
+                                timeout=timeout,
+                            )
+                            log_cdp_command(
+                                tab_id,
+                                method,
+                                params,
+                                result,
+                                duration_ms=(time.perf_counter() - retry_start) * 1000,
+                            )
+                            return result
+                    except Exception as retry_exc:
+                        logger.debug("CDP reattach+retry for tab %d failed: %s", tab_id, retry_exc)
+                raise
 
     async def _try_enable_domain(self, tab_id: int, domain: str) -> None:
         """Try to enable a CDP domain, ignoring errors if not available.

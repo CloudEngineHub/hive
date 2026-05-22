@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections.abc import AsyncIterator
@@ -793,11 +794,74 @@ def _summarize_request_for_log(kwargs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _exception_headers(exception: BaseException) -> Any:
+    """Return whatever dict-like headers the exception exposes, or None.
+
+    LiteLLM constructs RateLimitError with a synthetic httpx.Response whose
+    headers are only populated when the upstream response was attached. The
+    Anthropic handler often raises without attaching it, so also check
+    ``exception.headers`` (set directly on some litellm subclasses).
+    """
+    response = getattr(exception, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers:
+            return headers
+    headers = getattr(exception, "headers", None)
+    if headers:
+        return headers
+    return None
+
+
+def _parse_retry_after(headers: Any, max_delay: float) -> float | None:
+    """Parse retry-after-ms / retry-after from a header mapping.
+
+    Returns the delay in seconds clamped to [0, max_delay], or None when no
+    usable header is present.
+    """
+    retry_after_ms = headers.get("retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            return min(max(float(retry_after_ms) / 1000.0, 0), max_delay)
+        except (ValueError, TypeError):
+            pass
+
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 0), max_delay)
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            from email.utils import parsedate_to_datetime
+
+            retry_date = parsedate_to_datetime(retry_after)
+            now = datetime.now(retry_date.tzinfo)
+            return min(max((retry_date - now).total_seconds(), 0), max_delay)
+        except (ValueError, TypeError, OverflowError):
+            pass
+
+    return None
+
+
+# Floor used when the proxy's backpressure error has stripped Retry-After:
+# the Hive proxy's only signal is `{"type":"backpressure"}` so treat it as
+# "try again very soon" rather than falling through to exponential backoff.
+_BACKPRESSURE_RETRY_FLOOR = 1.0
+# Below this threshold we treat a server-provided Retry-After as "short" and
+# add positive jitter so N concurrent retrying clients don't all wake up
+# together. Long upstream values (Anthropic/OpenAI quota windows) are kept
+# verbatim.
+_SHORT_RETRY_AFTER_THRESHOLD = 5.0
+
+
 def _compute_retry_delay(
     attempt: int,
     exception: BaseException | None = None,
     backoff_base: int = RATE_LIMIT_BACKOFF_BASE,
     max_delay: int = RATE_LIMIT_MAX_DELAY,
+    jitter: bool = False,
 ) -> float:
     """Compute retry delay, preferring server-provided Retry-After headers.
 
@@ -805,48 +869,38 @@ def _compute_retry_delay(
     1. retry-after-ms header (milliseconds, float)
     2. retry-after header as seconds (float)
     3. retry-after header as HTTP-date (RFC 7231)
-    4. Exponential backoff: backoff_base * 2^attempt
+    4. Implicit short retry when the error body identifies as proxy backpressure
+    5. Exponential backoff: backoff_base * 2^attempt
 
-    All values are capped at max_delay seconds.
+    ``jitter`` desynchronizes lockstep retries from concurrent callers: when
+    True, short delays gain positive jitter and the exponential fallback gains
+    bidirectional jitter. Long upstream Retry-After values are kept verbatim.
+    All values are capped at ``max_delay`` seconds.
     """
     if exception is not None:
-        response = getattr(exception, "response", None)
-        if response is not None:
-            headers = getattr(response, "headers", None)
-            if headers is not None:
-                # Priority 1: retry-after-ms (milliseconds)
-                retry_after_ms = headers.get("retry-after-ms")
-                if retry_after_ms is not None:
-                    try:
-                        delay = float(retry_after_ms) / 1000.0
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError):
-                        pass
+        headers = _exception_headers(exception)
+        if headers is not None:
+            delay = _parse_retry_after(headers, max_delay)
+            if delay is not None:
+                if jitter and delay < _SHORT_RETRY_AFTER_THRESHOLD:
+                    delay = delay * random.uniform(1.0, 1.5) + random.uniform(0, 0.5)
+                    delay = min(delay, max_delay)
+                return delay
 
-                # Priority 2: retry-after (seconds or HTTP-date)
-                retry_after = headers.get("retry-after")
-                if retry_after is not None:
-                    # Try as seconds (float)
-                    try:
-                        delay = float(retry_after)
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError):
-                        pass
+        # No headers — check whether this looks like Hive proxy backpressure.
+        # The proxy emits {"type":"error","error":{"type":"backpressure",...}}
+        # with retry-after:1, but LiteLLM may strip headers before raising.
+        if "backpressure" in str(exception).lower():
+            delay = _BACKPRESSURE_RETRY_FLOOR
+            if jitter:
+                delay = delay * random.uniform(1.0, 1.5) + random.uniform(0, 0.5)
+            return min(delay, max_delay)
 
-                    # Try as HTTP-date (e.g., "Fri, 31 Dec 2025 23:59:59 GMT")
-                    try:
-                        from email.utils import parsedate_to_datetime
-
-                        retry_date = parsedate_to_datetime(retry_after)
-                        now = datetime.now(retry_date.tzinfo)
-                        delay = (retry_date - now).total_seconds()
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError, OverflowError):
-                        pass
-
-    # Fallback: exponential backoff
     delay = backoff_base * (2**attempt)
-    return min(delay, max_delay)
+    delay = min(delay, max_delay)
+    if jitter:
+        delay *= random.uniform(0.75, 1.25)
+    return delay
 
 
 def _is_stream_transient_error(exc: BaseException) -> bool:
@@ -1222,7 +1276,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                 logger.warning(
                     f"[retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -1465,7 +1519,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                 logger.warning(
                     f"[async-retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -2368,6 +2422,11 @@ class LiteLLMProvider(LLMProvider):
                     self.model,
                 )
 
+        # Tracked across the outer loop so an empty stream immediately after a
+        # 429 can adopt the rate-limit backoff instead of the fast 1s retry.
+        last_rate_limit_attempt: int | None = None
+        last_rate_limit_exc: BaseException | None = None
+
         for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
             # Post-stream events (ToolCall, TextEnd, Finish) are buffered
             # because they depend on the full stream.  TextDeltaEvents are
@@ -2626,31 +2685,45 @@ class LiteLLMProvider(LLMProvider):
                             self.model,
                             full_messages,
                         )
-                        dump_path = _dump_failed_request(
-                            model=self.model,
-                            kwargs=kwargs,
-                            error_type="empty_stream",
-                            attempt=attempt,
-                        )
+                        # If a 429 just landed in the same loop, the empty
+                        # response is likely backpressure-adjacent — use the
+                        # rate-limit backoff (jittered) instead of 1s.
+                        if (
+                            last_rate_limit_attempt is not None
+                            and attempt - last_rate_limit_attempt <= 1
+                        ):
+                            wait = _compute_retry_delay(
+                                attempt,
+                                exception=last_rate_limit_exc,
+                                jitter=True,
+                            )
+                        else:
+                            wait = EMPTY_STREAM_RETRY_DELAY
                         logger.warning(
                             f"[stream-retry] {self.model} returned empty stream "
                             f"after {last_role} message — "
                             f"~{token_count} tokens ({token_method}). "
-                            f"Request dumped to: {dump_path}. "
-                            f"Retrying in {EMPTY_STREAM_RETRY_DELAY}s "
+                            f"Retrying in {wait:.1f}s "
                             f"(attempt {attempt + 1}/{EMPTY_STREAM_MAX_RETRIES})"
                         )
-                        await asyncio.sleep(EMPTY_STREAM_RETRY_DELAY)
+                        await asyncio.sleep(wait)
                         continue
 
-                    # All retries exhausted — log and return the empty
-                    # result.  EventLoopNode's empty response guard will
+                    # All retries exhausted — dump the request for postmortem
+                    # and log.  EventLoopNode's empty response guard will
                     # accept if all outputs are set, or handle the ghost
                     # stream case if outputs are still missing.
+                    dump_path = _dump_failed_request(
+                        model=self.model,
+                        kwargs=kwargs,
+                        error_type="empty_stream",
+                        attempt=attempt,
+                    )
                     logger.error(
                         f"[stream] {self.model} returned empty stream after "
                         f"{EMPTY_STREAM_MAX_RETRIES} retries "
-                        f"(last_role={last_role}). Returning empty result."
+                        f"(last_role={last_role}). Request dumped to: "
+                        f"{dump_path}. Returning empty result."
                     )
 
                 # Gemini sometimes outputs tool calls as text in
@@ -2693,12 +2766,14 @@ class LiteLLMProvider(LLMProvider):
 
             except RateLimitError as e:
                 if attempt < RATE_LIMIT_MAX_RETRIES:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                     logger.warning(
                         f"[stream-retry] {self.model} rate limited (429): {e!s}. "
                         f"Retrying in {wait:.1f}s "
                         f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
                     )
+                    last_rate_limit_attempt = attempt
+                    last_rate_limit_exc = e
                     await asyncio.sleep(wait)
                     continue
                 yield StreamErrorEvent(error=str(e), recoverable=False)
@@ -2746,7 +2821,7 @@ class LiteLLMProvider(LLMProvider):
                         yield event
                     return
                 if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "

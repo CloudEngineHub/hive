@@ -58,6 +58,44 @@ _event_log_file: IO[str] | None = None
 _event_log_ready = False  # lazy init guard
 
 
+# Module-level singleton bus used for app-wide events that aren't
+# scoped to a particular session — credential connect/disconnect,
+# tool-catalog refreshes, tools-config changes. Anything that needs
+# to fan out to every UI surface (Tool Library, integrations page,
+# etc.) publishes here. Sessions still use their own per-session
+# EventBus for per-session telemetry; the global bus is purely for
+# cross-cutting state changes.
+_global_event_bus: "EventBus | None" = None
+
+
+def get_global_event_bus() -> "EventBus":
+    """Return the process-wide global event bus, creating it on first use.
+
+    Lazily-initialised so importing the module never spawns asyncio
+    primitives in the wrong loop. Callers in async contexts should be
+    fine — ``EventBus.__init__`` only constructs ``asyncio.Lock`` /
+    ``Semaphore``, both of which bind to the current loop on first use.
+    """
+    global _global_event_bus
+    if _global_event_bus is None:
+        _global_event_bus = EventBus(max_history=200)
+    return _global_event_bus
+
+
+async def publish_global(event: "AgentEvent") -> None:
+    """Publish ``event`` on the global bus, swallowing failures.
+
+    The global bus is purely informational — UI surfaces refetch on
+    receipt, but no business logic depends on it. Wrapping in a
+    swallow-all keeps us from breaking the originating handler when
+    a stray subscriber raises.
+    """
+    try:
+        await get_global_event_bus().publish(event)
+    except Exception:  # pragma: no cover — best-effort telemetry
+        logger.exception("Global event publish failed for type=%s", getattr(event, "type", "?"))
+
+
 class EventType(StrEnum):
     """Types of events that can be published."""
 
@@ -67,6 +105,13 @@ class EventType(StrEnum):
     EXECUTION_FAILED = "execution_failed"
     EXECUTION_PAUSED = "execution_paused"
     EXECUTION_RESUMED = "execution_resumed"
+
+    # Billing / entitlement signal from the Hive LLM proxy. Emitted once
+    # the moment a 402 (or equivalent) is detected, *in addition to* the
+    # usual EXECUTION_FAILED that follows. The desktop client listens for
+    # this and reopens the upgrade popup so the user can refresh their
+    # plan without parsing free-form error strings.
+    PAYMENT_REQUIRED = "payment_required"
 
     # State changes
     STATE_CHANGED = "state_changed"
@@ -175,6 +220,26 @@ class EventType(StrEnum):
     TASK_LIST_REATTACH_MISMATCH = "task_list_reattach_mismatch"
     COLONY_TEMPLATE_ASSIGNMENT = "colony_template_assignment"
 
+    # Synthesised event sent FIRST on every fresh SSE subscribe so the
+    # renderer can rehydrate "is this queen still busy?" instantly,
+    # without waiting for the next live event. Built from the ring
+    # buffer; never persisted. See compute_session_snapshot() and the
+    # SSE replay loop for the producer.
+    SESSION_SNAPSHOT = "session_snapshot"
+
+    # Cross-cutting "app-wide" events used by the global SSE channel
+    # (`/api/events/global`). They have no session scope — every
+    # interested UI surface (Tool Library, integrations page, ...)
+    # subscribes once at app boot and refreshes its local state on
+    # receipt. Published by:
+    #   - routes_credentials on save/delete
+    #   - routes_queen_tools / routes_colony_tools on PATCH/DELETE
+    #   - tool_registry after resync_mcp_servers_if_needed completes
+    CREDENTIAL_PROVIDER_CONNECTED = "credential_provider_connected"
+    CREDENTIAL_PROVIDER_DISCONNECTED = "credential_provider_disconnected"
+    TOOL_CATALOG_REFRESHED = "tool_catalog_refreshed"
+    TOOLS_CONFIG_CHANGED = "tools_config_changed"
+
 
 @dataclass
 class AgentEvent:
@@ -189,6 +254,10 @@ class AgentEvent:
     correlation_id: str | None = None  # For tracking related events
     colony_id: str | None = None  # Which colony emitted this event
     run_id: str | None = None  # Unique ID per trigger() invocation — used for run dividers
+    # Monotonic publish counter assigned by EventBus.publish(). Lets the
+    # renderer dedupe duplicate events that arrive via both the disk
+    # eventsHistory and the live SSE replay paths.
+    seq: int = 0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
@@ -201,6 +270,7 @@ class AgentEvent:
             "timestamp": self.timestamp.isoformat(),
             "correlation_id": self.correlation_id,
             "colony_id": self.colony_id,
+            "seq": self.seq,
         }
         if self.run_id is not None:
             d["run_id"] = self.run_id
@@ -273,12 +343,24 @@ class EventBus:
         self._semaphore = asyncio.Semaphore(max_concurrent_handlers)
         self._subscription_counter = 0
         self._lock = asyncio.Lock()
+        # Monotonic counter stamped onto every published event. Used
+        # by the renderer for dedupe across the disk-history and
+        # live-SSE replay paths.
+        self._seq_counter: int = 0
         # Per-session persistent event log (always-on, survives restarts)
         self._session_log: IO[str] | None = None
         self._session_log_iteration_offset: int = 0
         # Accumulator for client_output_delta snapshots — flushed on llm_turn_complete.
         # Key: (stream_id, node_id, execution_id, iteration, inner_turn) → latest AgentEvent
         self._pending_output_snapshots: dict[tuple, AgentEvent] = {}
+        # Per-execution tool index counter used to stamp tool_index on
+        # TOOL_CALL_STARTED events so the frontend can assign deterministic
+        # pill IDs across replay paths (disk history vs SSE ring buffer).
+        # Key: execution_id → next index (1-based).
+        self._tool_index_by_execution: dict[str, int] = {}
+        # tool_use_id → stored tool_index so TOOL_CALL_COMPLETED can
+        # stamp the same index that STARTED assigned.
+        self._tool_index_by_use_id: dict[str, int] = {}
 
     def set_session_log(self, path: Path, *, iteration_offset: int = 0) -> None:
         """Enable per-session event persistence to a JSONL file.
@@ -469,11 +551,33 @@ class EventBus:
             offset = self._session_log_iteration_offset
             event.data = {**event.data, "iteration": event.data["iteration"] + offset}
 
-        # Add to history
+        # Add to history (lock-protected so seq assignment is atomic
+        # under concurrent publishers).
         async with self._lock:
+            self._seq_counter += 1
+            event.seq = self._seq_counter
             self._event_history.append(event)
             if len(self._event_history) > self._max_history:
                 self._event_history = self._event_history[-self._max_history :]
+
+        # Stamp tool_index so the frontend's pill IDs are deterministic
+        # across replay paths. Without this, ReplayState.turnCounters
+        # racing between the disk-history and SSE-ring-buffer paths
+        # produced different pill IDs for the same tool call → duplicates.
+        if isinstance(event.data, dict):
+            if event.type == EventType.TOOL_CALL_STARTED and event.execution_id:
+                idx = self._tool_index_by_execution.get(event.execution_id, 0) + 1
+                self._tool_index_by_execution[event.execution_id] = idx
+                event.data["tool_index"] = idx
+                tool_use_id = event.data.get("tool_use_id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    self._tool_index_by_use_id[tool_use_id] = idx
+            elif event.type == EventType.TOOL_CALL_COMPLETED:
+                tool_use_id = event.data.get("tool_use_id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    idx = self._tool_index_by_use_id.get(tool_use_id)
+                    if idx is not None:
+                        event.data["tool_index"] = idx
 
         # Write event to JSONL file (gated by HIVE_DEBUG_EVENTS env var)
         if _DEBUG_EVENTS_ENABLED:
@@ -625,6 +729,35 @@ class EventBus:
                 stream_id=stream_id,
                 execution_id=execution_id,
                 data={"error": error},
+                correlation_id=correlation_id,
+                run_id=run_id,
+            )
+        )
+
+    async def emit_payment_required(
+        self,
+        stream_id: str,
+        execution_id: str | None = None,
+        message: str | None = None,
+        upstream_status: int | None = 402,
+        correlation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        """Emit a billing-gate signal (typically a 402 from the Hive LLM proxy).
+
+        Fires alongside the EXECUTION_FAILED that follows. The desktop client
+        listens for this dedicated event and reopens the upgrade popup so
+        the user can refresh their plan without parsing the failure string.
+        """
+        await self.publish(
+            AgentEvent(
+                type=EventType.PAYMENT_REQUIRED,
+                stream_id=stream_id,
+                execution_id=execution_id,
+                data={
+                    "message": message or "LLM provider returned payment required.",
+                    "upstream_status": upstream_status,
+                },
                 correlation_id=correlation_id,
                 run_id=run_id,
             )
@@ -821,6 +954,7 @@ class EventBus:
         cached_tokens: int = 0,
         cache_creation_tokens: int = 0,
         cost_usd: float = 0.0,
+        credits: float | None = None,
         execution_id: str | None = None,
         iteration: int | None = None,
     ) -> None:
@@ -832,6 +966,11 @@ class EventBus:
 
         ``cost_usd`` is the USD cost for this turn when known (Anthropic,
         OpenAI, OpenRouter). 0.0 means unreported (not free).
+
+        ``credits`` is the per-turn Hive credit cost summed across requests
+        in the turn. ``None`` means no Hive-aliased call carried a credits
+        field; the data dict omits the key entirely in that case so
+        subscribers can distinguish "no estimate" from zero.
         """
         data: dict = {
             "stop_reason": stop_reason,
@@ -842,6 +981,14 @@ class EventBus:
             "cache_creation_tokens": cache_creation_tokens,
             "cost_usd": cost_usd,
         }
+        if credits is not None:
+            data["credits"] = credits
+        logger.info(
+            "[credits] emit_llm_turn_complete: credits=%r model=%s data_has_credits_key=%s",
+            credits,
+            model,
+            "credits" in data,
+        )
         if iteration is not None:
             data["iteration"] = iteration
         await self.publish(
@@ -1439,3 +1586,152 @@ class EventBus:
             return result
         finally:
             self.unsubscribe(sub_id)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot helpers (consumed by the SSE handler)
+# ---------------------------------------------------------------------------
+
+
+def compute_session_snapshot(event_bus: "EventBus") -> dict:
+    """Walk the ring buffer once, derive the queen's current state.
+
+    Read-only; nothing here mutates state. Used to build the
+    ``session_snapshot`` event the SSE handler injects first on every
+    fresh subscribe so the renderer can rehydrate "queen busy / current
+    tool / awaiting input" instantly on revisit.
+    """
+    history = event_bus._event_history
+    seq = event_bus._seq_counter
+
+    open_tools: dict[str, dict] = {}
+    is_executing = False
+    current_execution_id: str | None = None
+    awaiting_input = False
+    last_event_ts: datetime | None = None
+    last_queen_event_ts: datetime | None = None
+    last_unresolved_req_seq: int | None = None
+    pending_questions: list[dict] | None = None
+
+    for ev in history:
+        last_event_ts = ev.timestamp
+        # Skip worker streams — they share the queen's event_bus but
+        # their lifecycle is invisible to the queen DM. Counting them
+        # here would make the queen appear "Working" while only a
+        # subagent is running.
+        stream = ev.stream_id or "queen"
+        if stream.startswith("worker"):
+            continue
+        last_queen_event_ts = ev.timestamp
+        # ``is_executing`` is set by ANY of: EXECUTION_STARTED,
+        # NODE_LOOP_STARTED, NODE_LOOP_ITERATION, TOOL_CALL_STARTED,
+        # TOOL_CALL_COMPLETED, LLM_TEXT_DELTA, CLIENT_OUTPUT_DELTA,
+        # CLIENT_INPUT_RECEIVED. Some queens (auto-park / colony
+        # patterns) never emit EXECUTION_STARTED at all — under the
+        # narrower previous set, those queens reported is_executing=
+        # false even mid-tool, breaking the typing indicator.
+        if ev.type in (
+            EventType.EXECUTION_STARTED,
+            EventType.NODE_LOOP_STARTED,
+            EventType.NODE_LOOP_ITERATION,
+        ):
+            is_executing = True
+            if ev.type == EventType.EXECUTION_STARTED:
+                current_execution_id = ev.execution_id
+        elif ev.type in (EventType.EXECUTION_COMPLETED, EventType.EXECUTION_FAILED):
+            is_executing = False
+            current_execution_id = None
+            open_tools.clear()
+        elif ev.type == EventType.NODE_LOOP_COMPLETED:
+            is_executing = False
+        elif ev.type in (EventType.LLM_TEXT_DELTA, EventType.CLIENT_OUTPUT_DELTA):
+            is_executing = True
+        elif ev.type == EventType.TOOL_CALL_STARTED:
+            tool_use_id = (ev.data or {}).get("tool_use_id")
+            if tool_use_id:
+                open_tools[tool_use_id] = {
+                    "id": tool_use_id,
+                    "name": (ev.data or {}).get("tool_name"),
+                    "started_at": ev.timestamp.isoformat(),
+                    "execution_id": ev.execution_id,
+                    "seq": ev.seq,
+                }
+            is_executing = True
+        elif ev.type == EventType.TOOL_CALL_COMPLETED:
+            tool_use_id = (ev.data or {}).get("tool_use_id")
+            if tool_use_id:
+                open_tools.pop(tool_use_id, None)
+            # Tool result arrived → queen will turn it into the next
+            # LLM call. Stay "executing" until a terminal event flips
+            # it off (EXECUTION_COMPLETED, NODE_LOOP_COMPLETED, or
+            # CLIENT_INPUT_REQUESTED below).
+            is_executing = True
+        elif ev.type == EventType.CLIENT_INPUT_REQUESTED:
+            last_unresolved_req_seq = ev.seq
+            awaiting_input = True
+            qs = (ev.data or {}).get("questions")
+            pending_questions = qs if isinstance(qs, list) else None
+        elif ev.type == EventType.CLIENT_INPUT_RECEIVED:
+            last_unresolved_req_seq = None
+            awaiting_input = False
+            pending_questions = None
+            # Receiving user input unblocks the queen — she resumes
+            # immediately. Treat as executing.
+            is_executing = True
+
+    # Staleness guard: 5-minute idle window with is_executing=true is
+    # almost certainly a zombie (AgentLoop crashed without finalising).
+    _STALENESS_S = 300.0
+    if is_executing and last_queen_event_ts is not None:
+        try:
+            now = datetime.now(last_queen_event_ts.tzinfo) if last_queen_event_ts.tzinfo else datetime.now()
+            age = (now - last_queen_event_ts).total_seconds()
+        except Exception:
+            age = 0.0
+        if age > _STALENESS_S:
+            is_executing = False
+            current_execution_id = None
+            open_tools.clear()
+
+    # Awaiting-input takes precedence over executing — see canonical.
+    if awaiting_input:
+        is_executing = False
+        open_tools.clear()
+
+    queen_busy_reason: str | None = None
+    if awaiting_input:
+        queen_busy_reason = "awaiting_input"
+    elif is_executing:
+        queen_busy_reason = "tool" if open_tools else "llm"
+
+    return {
+        "snapshot_seq": seq,
+        "is_executing": is_executing,
+        "current_execution_id": current_execution_id,
+        "current_tool_calls": list(open_tools.values()),
+        "awaiting_input": awaiting_input,
+        "queen_busy_reason": queen_busy_reason,
+        "pending_questions": pending_questions if awaiting_input else None,
+        "last_event_seq": last_unresolved_req_seq,
+        "last_event_at": last_event_ts.isoformat() if last_event_ts else None,
+        "last_queen_event_at": last_queen_event_ts.isoformat() if last_queen_event_ts else None,
+    }
+
+
+def collect_resolved_request_seqs(event_bus: "EventBus") -> set[int]:
+    """Indices of CLIENT_INPUT_REQUESTED events already answered by a
+    later CLIENT_INPUT_RECEIVED in the buffer. Used by the SSE replay
+    path to suppress already-resolved questions so the renderer
+    doesn't re-pop a modal the user already dismissed.
+    """
+    history = event_bus._event_history
+    resolved: set[int] = set()
+    last_unresolved: int | None = None
+    for ev in history:
+        if ev.type == EventType.CLIENT_INPUT_REQUESTED:
+            last_unresolved = ev.seq
+        elif ev.type == EventType.CLIENT_INPUT_RECEIVED:
+            if last_unresolved is not None:
+                resolved.add(last_unresolved)
+                last_unresolved = None
+    return resolved

@@ -4,6 +4,7 @@ export interface QueenProfile {
   id: string;
   name: string;
   title: string;
+  has_avatar?: boolean;
   summary?: string;
   experience?: Array<{ role: string; details: string[] }>;
   skills?: string;
@@ -70,11 +71,16 @@ export interface QueenToolsResetResult {
 }
 
 export const queensApi = {
-  /** List all queen profiles (id, name, title). */
+  /** List all queen profiles (id, name, title, has_avatar). */
   list: () =>
-    api.get<{ queens: Array<{ id: string; name: string; title: string }> }>(
-      "/queen/profiles",
-    ),
+    api.get<{
+      queens: Array<{
+        id: string;
+        name: string;
+        title: string;
+        has_avatar?: boolean;
+      }>;
+    }>("/queen/profiles"),
 
   /** Get full profile for a queen. */
   getProfile: (queenId: string) =>
@@ -88,7 +94,10 @@ export const queensApi = {
   uploadAvatar: (queenId: string, file: File) => {
     const fd = new FormData();
     fd.append("avatar", file);
-    return api.upload<{ avatar_url: string }>(`/queen/${queenId}/avatar`, fd);
+    return api.upload<{ avatar_url: string; has_avatar: boolean }>(
+      `/queen/${queenId}/avatar`,
+      fd,
+    );
   },
 
   /** Get or create a persistent session for a queen. */

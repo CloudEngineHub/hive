@@ -7,6 +7,7 @@ No Playwright required - all operations go through the Chrome extension.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -23,6 +24,19 @@ logger = logging.getLogger(__name__)
 # Track active contexts per profile
 _contexts: dict[str, dict[str, Any]] = {}
 
+# Lazy per-profile lock so two concurrent queens hitting _ensure_context
+# for the same profile don't both call bridge.create_context (which would
+# produce duplicate tab groups for one logical profile).
+_context_locks: dict[str, asyncio.Lock] = {}
+
+
+def _profile_lock(profile_name: str) -> asyncio.Lock:
+    lock = _context_locks.get(profile_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _context_locks[profile_name] = lock
+    return lock
+
 
 def _resolve_profile(profile: str | None) -> str:
     """Resolve profile name, using context variable if not provided."""
@@ -32,7 +46,17 @@ def _resolve_profile(profile: str | None) -> str:
 
 
 # Resolve extension path relative to this file: tools/browser-extension/
+# Kept around for legacy callers; the install flow now points at the
+# Chrome Web Store rather than an unpacked-dev "Load unpacked" path.
 _EXTENSION_PATH = (Path(__file__).parent.parent.parent.parent.parent / "browser-extension").resolve()
+
+# Public Chrome Web Store listing for the Hive Browser Bridge.
+# Returned by browser_setup so users running the published build of
+# the desktop app get a one-click install link instead of dev-mode
+# instructions that don't apply to them.
+_CHROME_WEB_STORE_URL = (
+    "https://chromewebstore.google.com/detail/hive-browser-bridge/jkpcegnbfimimjodblcemoheedidnppm"
+)
 
 
 def _clear_profile_tab_caches(ctx: dict[str, Any]) -> None:
@@ -72,27 +96,35 @@ async def _ensure_context(
     if existing is not None:
         return profile_name, existing, False
 
-    result = await bridge.create_context(profile_name)
-    group_id = result.get("groupId")
-    tab_id = result.get("tabId")
+    # Serialize concurrent first-touch creators so we don't race the
+    # bridge.create_context call. Re-check after acquiring; the winner
+    # populates _contexts and the runner-up returns the same ctx.
+    async with _profile_lock(profile_name):
+        existing = _contexts.get(profile_name)
+        if existing is not None:
+            return profile_name, existing, False
 
-    ctx: dict[str, Any] = {
-        "groupId": group_id,
-        "activeTabId": tab_id,
-        "_seedTabId": tab_id,  # reused by first browser_open call
-        "tabs": {tab_id} if tab_id is not None else set(),
-    }
-    _contexts[profile_name] = ctx
+        result = await bridge.create_context(profile_name)
+        group_id = result.get("groupId")
+        tab_id = result.get("tabId")
 
-    logger.info(
-        "Started browser context '%s': groupId=%s, tabId=%s",
-        profile_name,
-        group_id,
-        tab_id,
-    )
-    log_context_event("start", profile_name, group_id=group_id, tab_id=tab_id)
+        ctx: dict[str, Any] = {
+            "groupId": group_id,
+            "activeTabId": tab_id,
+            "_seedTabId": tab_id,  # reused by first browser_open call
+            "tabs": {tab_id} if tab_id is not None else set(),
+        }
+        _contexts[profile_name] = ctx
 
-    return profile_name, ctx, True
+        logger.info(
+            "Started browser context '%s': groupId=%s, tabId=%s",
+            profile_name,
+            group_id,
+            tab_id,
+        )
+        log_context_event("start", profile_name, group_id=group_id, tab_id=tab_id)
+
+        return profile_name, ctx, True
 
 
 async def shutdown_all_contexts() -> None:
@@ -121,17 +153,14 @@ def register_lifecycle_tools(mcp: FastMCP) -> None:
         Check browser extension status and show installation instructions if needed.
 
         Call this first if browser tools are not working. It checks whether the
-        Hive Chrome extension is installed and connected, and provides step-by-step
-        instructions to install it if not.
+        Hive Chrome extension is installed and connected, and points the user
+        at the published Chrome Web Store listing if not.
 
         Returns:
             Dict with connection status and setup instructions if needed
         """
         bridge = get_bridge()
         connected = bool(bridge and bridge.is_connected)
-
-        ext_path = str(_EXTENSION_PATH)
-        ext_exists = _EXTENSION_PATH.exists()
 
         if connected:
             return {
@@ -140,23 +169,32 @@ def register_lifecycle_tools(mcp: FastMCP) -> None:
                 "status": "Extension is connected and ready. Call browser_open(url) to begin.",
             }
 
+        # Public install flow: link straight to the Chrome Web Store
+        # listing.  The previous chrome://extensions + "Load unpacked"
+        # path was for unpacked dev builds and confused users running
+        # the published desktop app — they don't have the extension
+        # source on disk.
         return {
             "ok": False,
             "connected": False,
             "status": "Extension not connected",
+            "install_url": _CHROME_WEB_STORE_URL,
             "instructions": {
-                "step_1": "Open Chrome and go to chrome://extensions",
-                "step_2": "Enable 'Developer mode' (toggle in the top-right corner)",
-                "step_3": "Click 'Load unpacked'",
-                "step_4": f"Select this directory: {ext_path}",
-                "step_5": ("Click the extension icon in the Chrome toolbar to confirm it says 'Connected'"),
-                "step_6": "Return here and call browser_open(url) to begin",
+                "step_1": (
+                    "Open the Hive Browser Bridge listing in the Chrome Web Store: "
+                    f"{_CHROME_WEB_STORE_URL}"
+                ),
+                "step_2": "Click 'Add to Chrome' and confirm the install prompt.",
+                "step_3": (
+                    "Pin the extension (puzzle-piece icon → pin) and click its toolbar icon "
+                    "to verify it says 'Connected'."
+                ),
+                "step_4": "Return here and retry — the bridge will pick up the new connection automatically.",
             },
-            "extensionPath": ext_path,
-            "extensionPathExists": ext_exists,
             "note": (
-                "The extension connects via WebSocket on ws://127.0.0.1:9229/beeline. "
-                "Make sure Chrome is running before loading the extension."
+                "The extension connects to the local Hive runtime via WebSocket on "
+                "ws://127.0.0.1:9229/bridge. Chrome must be running and the extension "
+                "must be enabled."
             ),
         }
 

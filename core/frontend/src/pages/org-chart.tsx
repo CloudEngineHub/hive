@@ -209,13 +209,27 @@ function ColonyDetailPanel({ colony, queenName, onClose, onIconChange }: {
 
 /* ── Queen avatar ────────────────────────────────────────────────────── */
 
-function QueenAvatar({ queenId, name, size = "w-11 h-11" }: { queenId: string; name: string; size?: string }) {
-  const [hasAvatar, setHasAvatar] = useState(true);
-  const url = `/api/queen/${queenId}/avatar`;
+function QueenAvatar({
+  queenId,
+  name,
+  hasAvatar,
+  version,
+  size = "w-11 h-11",
+}: {
+  queenId: string;
+  name: string;
+  hasAvatar: boolean;
+  version: number;
+  size?: string;
+}) {
+  const [imgFailed, setImgFailed] = useState(false);
+  useEffect(() => setImgFailed(false), [version, hasAvatar]);
+  const showImg = hasAvatar && !imgFailed;
+  const url = `/api/queen/${queenId}/avatar?v=${version}`;
   return (
     <div className={`${size} rounded-full bg-primary/15 flex items-center justify-center overflow-hidden`}>
-      {hasAvatar ? (
-        <img src={url} alt={name} className="w-full h-full object-cover" onError={() => setHasAvatar(false)} />
+      {showImg ? (
+        <img src={url} alt={name} className="w-full h-full object-cover" onError={() => setImgFailed(true)} />
       ) : (
         <span className="text-sm font-bold text-primary">{name.charAt(0)}</span>
       )}
@@ -238,6 +252,7 @@ function QueenCard({
   onSelect: () => void;
   onSelectColony: (colony: Colony) => void;
 }) {
+  const { queenAvatarVersions } = useColony();
   return (
     <div className="flex flex-col items-center w-[140px] flex-shrink-0">
       {/* Vertical stub from horizontal bar */}
@@ -253,7 +268,12 @@ function QueenCard({
         }`}
       >
         <div className="mb-2.5">
-          <QueenAvatar queenId={queen.id} name={queen.name} />
+          <QueenAvatar
+            queenId={queen.id}
+            name={queen.name}
+            hasAvatar={Boolean(queen.hasAvatar)}
+            version={queenAvatarVersions[queen.id] ?? 0}
+          />
         </div>
         <span className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors line-clamp-1">
           {queen.name}

@@ -6,13 +6,20 @@ import logging
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError as _AiohttpConnReset
 
-from framework.host.event_bus import EventType
+from framework.host.event_bus import (
+    AgentEvent,
+    EventType,
+    collect_resolved_request_seqs,
+    compute_session_snapshot,
+    get_global_event_bus,
+)
 from framework.server.app import resolve_session
 
 logger = logging.getLogger(__name__)
 
 # Default event types streamed to clients
 DEFAULT_EVENT_TYPES = [
+    EventType.SESSION_SNAPSHOT,
     EventType.CLIENT_OUTPUT_DELTA,
     EventType.CLIENT_INPUT_REQUESTED,
     EventType.CLIENT_INPUT_RECEIVED,
@@ -23,6 +30,7 @@ DEFAULT_EVENT_TYPES = [
     EventType.EXECUTION_COMPLETED,
     EventType.EXECUTION_FAILED,
     EventType.EXECUTION_PAUSED,
+    EventType.PAYMENT_REQUIRED,
     EventType.NODE_LOOP_STARTED,
     EventType.NODE_LOOP_ITERATION,
     EventType.NODE_LOOP_COMPLETED,
@@ -201,9 +209,17 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     # they're published during session load — BEFORE the frontend's
     # SSE subscription is established. Without replay, a freshly-opened
     # colony would never see its own triggers.
+    # Tool lifecycle and turn boundaries are now replayed too: without
+    # them a queen mid-tool-call (e.g. a long browser_scroll loop)
+    # rendered as idle on revisit. ``replayState`` (queen-dm.tsx)
+    # dedupes by event seq, see H1 in the plan.
     _REPLAY_TYPES = {
         EventType.CLIENT_OUTPUT_DELTA.value,
         EventType.EXECUTION_STARTED.value,
+        EventType.EXECUTION_COMPLETED.value,
+        EventType.LLM_TURN_COMPLETE.value,
+        EventType.TOOL_CALL_STARTED.value,
+        EventType.TOOL_CALL_COMPLETED.value,
         EventType.CLIENT_INPUT_REQUESTED.value,
         EventType.CLIENT_INPUT_RECEIVED.value,
         EventType.TRIGGER_AVAILABLE.value,
@@ -215,24 +231,50 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     }
     event_type_values = {et.value for et in event_types}
     replay_types = _REPLAY_TYPES & event_type_values
+
+    # Inject the session snapshot first so the renderer rehydrates
+    # "queen busy / current tool / awaiting input" instantly.
+    snapshot_data = compute_session_snapshot(event_bus)
+    snapshot_event = AgentEvent(
+        type=EventType.SESSION_SNAPSHOT,
+        stream_id="queen",
+        node_id="queen",
+        execution_id=snapshot_data.get("current_execution_id"),
+        data=snapshot_data,
+    )
+    try:
+        queue.put_nowait(snapshot_event.to_dict())
+    except asyncio.QueueFull:
+        pass
+
+    # Suppress already-resolved client_input_requested entries.
+    resolved_request_seqs = collect_resolved_request_seqs(event_bus)
+
     replayed = 0
     for past_event in event_bus._event_history:
-        if past_event.type.value in replay_types:
-            past_dict = past_event.to_dict()
-            if filter_worker_noise and _is_worker_noise(past_dict):
-                continue
-            try:
-                queue.put_nowait(past_dict)
-                replayed += 1
-            except asyncio.QueueFull:
-                break
+        if past_event.type.value not in replay_types:
+            continue
+        if (
+            past_event.type == EventType.CLIENT_INPUT_REQUESTED
+            and past_event.seq in resolved_request_seqs
+        ):
+            continue
+        past_dict = past_event.to_dict()
+        if filter_worker_noise and _is_worker_noise(past_dict):
+            continue
+        try:
+            queue.put_nowait(past_dict)
+            replayed += 1
+        except asyncio.QueueFull:
+            break
     if replayed:
-        logger.info("SSE replayed %d buffered events for session='%s'", replayed, session.id)
-
-    # Live status is surfaced via the EventBus ring-buffer replay above
-    # (executed earlier in this handler).  The old graph-executor snapshot
-    # injection was removed when graph execution was retired -- the
-    # AgentLoop publishes its own lifecycle events to the EventBus.
+        logger.info(
+            "SSE replayed %d buffered events for session='%s' (snapshot seq=%d, suppressed %d resolved questions)",
+            replayed,
+            session.id,
+            snapshot_data.get("snapshot_seq", 0),
+            len(resolved_request_seqs),
+        )
 
     event_count = 0
     close_reason = "unknown"
@@ -285,7 +327,91 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     return sse.response
 
 
+# Global SSE channel — cross-cutting events that aren't scoped to a
+# session (credential connect/disconnect, tool catalog refreshes,
+# tools-config edits in another tab/window). Subscribers are UI
+# surfaces that need to refetch when these events fire (Tool Library,
+# Integrations page). Lightweight: no replay, no filter, no worker
+# noise — every published event reaches every subscriber.
+_GLOBAL_EVENT_TYPES = [
+    EventType.CREDENTIAL_PROVIDER_CONNECTED,
+    EventType.CREDENTIAL_PROVIDER_DISCONNECTED,
+    EventType.TOOL_CATALOG_REFRESHED,
+    EventType.TOOLS_CONFIG_CHANGED,
+]
+
+
+async def handle_global_events(request: web.Request) -> web.StreamResponse:
+    """SSE event stream for app-wide events (no session scope).
+
+    See ``_GLOBAL_EVENT_TYPES`` for the surface area. Used by the
+    desktop renderer's ``useGlobalEvents`` hook to keep the Tool
+    Library and integrations UI in sync without manual refresh.
+    """
+    from framework.server.sse import SSEResponse
+
+    bus = get_global_event_bus()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    client_disconnected = asyncio.Event()
+
+    async def on_event(event: AgentEvent) -> None:
+        if client_disconnected.is_set():
+            return
+        try:
+            queue.put_nowait(event.to_dict())
+        except asyncio.QueueFull:
+            # Global events are infrequent; if the queue fills the
+            # client is wedged. Drop and let it reconnect.
+            client_disconnected.set()
+
+    sub_id = bus.subscribe(event_types=_GLOBAL_EVENT_TYPES, handler=on_event)
+
+    sse = SSEResponse()
+    await sse.prepare(request)
+    logger.info("Global SSE connected: sub_id='%s'", sub_id)
+
+    close_reason = "unknown"
+    try:
+        while not client_disconnected.is_set():
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
+                await sse.send_event(data)
+            except TimeoutError:
+                try:
+                    await sse.send_keepalive()
+                except (ConnectionResetError, ConnectionError, _AiohttpConnReset):
+                    close_reason = "client_disconnected"
+                    break
+                except Exception as exc:
+                    close_reason = f"keepalive_error: {exc}"
+                    break
+            except (ConnectionResetError, ConnectionError, _AiohttpConnReset):
+                close_reason = "client_disconnected"
+                break
+            except RuntimeError as exc:
+                if "closing transport" in str(exc).lower():
+                    close_reason = "client_disconnected"
+                else:
+                    close_reason = f"error: {exc}"
+                break
+            except Exception as exc:
+                close_reason = f"error: {exc}"
+                break
+    except asyncio.CancelledError:
+        close_reason = "cancelled"
+    finally:
+        try:
+            bus.unsubscribe(sub_id)
+        except Exception:
+            pass
+        logger.info("Global SSE disconnected: reason='%s'", close_reason)
+
+    return sse.response
+
+
 def register_routes(app: web.Application) -> None:
     """Register SSE event streaming routes."""
     # Session-primary route
     app.router.add_get("/api/sessions/{session_id}/events", handle_events)
+    # Global cross-cutting channel (no session scope).
+    app.router.add_get("/api/events/global", handle_global_events)

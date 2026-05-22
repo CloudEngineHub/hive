@@ -570,6 +570,51 @@ class TestComputeRetryDelay:
         exc = _make_exception_with_headers({"retry-after-ms": "300000"})  # 300s
         assert _compute_retry_delay(0, exception=exc) == 120  # capped
 
+    def test_retry_after_from_exception_headers_attr(self):
+        """LiteLLM may attach headers directly to the exception (no .response)."""
+        exc = _make_exception_with_headers_attr({"retry-after": "1"})
+        # Without the new fallback this would return 16 (2 * 2^3).
+        assert _compute_retry_delay(3, exception=exc) == 1.0
+
+    def test_backpressure_message_implicit_short_retry(self):
+        """Hive proxy backpressure errors get a 1s floor when headers are missing."""
+        exc = Exception(
+            'AnthropicException - {"type":"error","error":'
+            '{"type":"backpressure","message":"concurrent limit (per_user)"}}'
+        )
+        # attempt=3 would yield 16s on exponential fallback.
+        assert _compute_retry_delay(3, exception=exc) == 1.0
+
+    def test_backpressure_does_not_override_explicit_retry_after(self):
+        """When a real Retry-After is present, backpressure heuristic must not kick in."""
+        exc = _make_exception_with_headers({"retry-after": "7"})
+        exc.args = ("backpressure: concurrent limit",)
+        assert _compute_retry_delay(0, exception=exc) == 7.0
+
+    def test_jitter_widens_exponential_backoff(self):
+        """Jitter should spread sampled delays in [0.75x, 1.25x] of base."""
+        samples = [_compute_retry_delay(3, jitter=True) for _ in range(100)]
+        assert all(12.0 <= s <= 20.0 for s in samples)
+        assert len(set(samples)) >= 3
+
+    def test_jitter_lengthens_short_retry_after(self):
+        """Short Retry-After values gain positive jitter to avoid lockstep retry."""
+        exc = _make_exception_with_headers({"retry-after": "1"})
+        samples = [_compute_retry_delay(0, exception=exc, jitter=True) for _ in range(100)]
+        assert all(1.0 <= s <= 2.0 for s in samples)
+        assert len(set(samples)) >= 3
+
+    def test_jitter_skips_long_retry_after(self):
+        """Long upstream Retry-After values are kept verbatim under jitter."""
+        exc = _make_exception_with_headers({"retry-after": "60"})
+        assert _compute_retry_delay(0, exception=exc, jitter=True) == 60.0
+
+    def test_jitter_default_off_preserves_exact_values(self):
+        """Default jitter=False keeps deterministic delays for non-jittered call sites."""
+        assert _compute_retry_delay(3) == 16
+        exc = _make_exception_with_headers({"retry-after": "1"})
+        assert _compute_retry_delay(0, exception=exc) == 1.0
+
 
 def _make_exception_with_headers(headers: dict[str, str]) -> BaseException:
     """Create a mock exception with response headers for testing."""
@@ -577,6 +622,13 @@ def _make_exception_with_headers(headers: dict[str, str]) -> BaseException:
     response = MagicMock()
     response.headers = headers
     exc.response = response  # type: ignore[attr-defined]
+    return exc
+
+
+def _make_exception_with_headers_attr(headers: dict[str, str]) -> BaseException:
+    """Mock exception with headers set directly on the exception (no .response)."""
+    exc = Exception("rate limited")
+    exc.headers = headers  # type: ignore[attr-defined]
     return exc
 
 

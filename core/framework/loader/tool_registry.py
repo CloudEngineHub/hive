@@ -1177,7 +1177,7 @@ class ToolRegistry:
         except OSError:
             return set()
 
-    def resync_mcp_servers_if_needed(self) -> bool:
+    def resync_mcp_servers_if_needed(self, *, force: bool = False) -> bool:
         """Restart MCP servers if credential files changed since last load.
 
         Compares the current credential directory listing against the snapshot
@@ -1185,6 +1185,12 @@ class ToolRegistry:
         user connected an OAuth account mid-session), disconnects all MCP
         clients and re-loads them so the new subprocess picks up the fresh
         credentials.
+
+        ``force=True`` skips the credential-snapshot diff and ALWAYS rebuilds.
+        Used by the credential save handler so re-authorising a provider
+        (which can overwrite the same credential file in-place without
+        changing its mtime) immediately rebuilds the catalog rather than
+        waiting for some other change to nudge it.
 
         Note: Individual credential TTL/refresh is handled by the MCP server
         process internally -- it resolves tokens from the credential store
@@ -1201,16 +1207,19 @@ class ToolRegistry:
         files_changed = current != self._mcp_cred_snapshot
         aden_key_changed = current_aden_key != self._mcp_aden_key_snapshot
 
-        if not files_changed and not aden_key_changed:
+        if not force and not files_changed and not aden_key_changed:
             return False
 
-        reason = (
-            "Credential files and ADEN_API_KEY changed"
-            if files_changed and aden_key_changed
-            else "ADEN_API_KEY changed"
-            if aden_key_changed
-            else "Credential files changed"
-        )
+        if force and not files_changed and not aden_key_changed:
+            reason = "Forced resync (credential save / explicit refresh)"
+        else:
+            reason = (
+                "Credential files and ADEN_API_KEY changed"
+                if files_changed and aden_key_changed
+                else "ADEN_API_KEY changed"
+                if aden_key_changed
+                else "Credential files changed"
+            )
         logger.info("%s — resyncing MCP servers", reason)
 
         # 1. Disconnect existing MCP clients

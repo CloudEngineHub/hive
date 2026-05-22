@@ -41,8 +41,22 @@ function wsSend(obj) {
 // Connection state (shared with popup via storage.session)
 // ---------------------------------------------------------------------------
 
-async function setConnected(value) {
-  await chrome.storage.session.set({ wsConnected: value });
+async function setConnected(value, extra = {}) {
+  await chrome.storage.session.set({ wsConnected: value, ...extra });
+}
+
+// Stable per-install identifier so the bridge can recognise the same
+// extension across reconnects. chrome.storage.local survives extension
+// reloads, updates, and Chrome restarts.
+const EXTENSION_PROTOCOL_VERSION = 1;
+const EXTENSION_VERSION = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "0.0.0";
+
+async function getOrCreateExtensionId() {
+  const stored = await chrome.storage.local.get(["beelineExtensionId"]);
+  if (stored.beelineExtensionId) return stored.beelineExtensionId;
+  const id = (self.crypto && self.crypto.randomUUID) ? self.crypto.randomUUID() : `ext-${Date.now()}-${Math.random()}`;
+  await chrome.storage.local.set({ beelineExtensionId: id });
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,13 +194,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg._beeline) return;
 
   if (msg.type === "ws_open") {
-    setConnected(true);
-    wsSend({ type: "hello", version: "1.0" });
+    getOrCreateExtensionId().then((extensionId) => {
+      setConnected(true, { lastDisconnectReason: null });
+      wsSend({
+        type: "hello",
+        version: EXTENSION_VERSION,
+        protocolVersion: EXTENSION_PROTOCOL_VERSION,
+        extensionId,
+      });
+    });
     return;
   }
 
   if (msg.type === "ws_close") {
-    setConnected(false);
+    setConnected(false, {
+      lastDisconnectReason: msg.reason || `code=${msg.code ?? "?"}`,
+    });
     return;
   }
 
@@ -197,8 +220,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   // Popup asking for live status
   if (msg.type === "status") {
-    chrome.storage.session.get(["wsConnected"]).then((data) => {
-      sendResponse({ connected: !!data.wsConnected });
+    chrome.storage.session.get(["wsConnected", "lastDisconnectReason"]).then((data) => {
+      sendResponse({
+        connected: !!data.wsConnected,
+        lastDisconnectReason: data.lastDisconnectReason || null,
+      });
     });
     return true; // keep channel open for async response
   }
@@ -240,8 +266,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 // Periodic alarm keeps the service worker from being garbage-collected and
-// recreates the offscreen document if it was evicted.
+// recreates the offscreen document if it was evicted. The keepalive ping
+// also nudges the offscreen page to send a noop on the WS so a half-open
+// socket surfaces as an onclose instead of sitting dead until the next
+// real command.
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "keepAlive") ensureOffscreen();
+  if (alarm.name !== "keepAlive") return;
+  ensureOffscreen();
+  try {
+    chrome.runtime.sendMessage({ _beeline: true, type: "ws_keepalive" });
+  } catch (_) {
+    // sendMessage throws when there are no listeners (offscreen still spinning up) — fine.
+  }
 });

@@ -30,17 +30,22 @@ function SectionHeader({ children, onEdit }: { children: React.ReactNode; onEdit
 
 export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenProfilePanelProps) {
   const navigate = useNavigate();
-  const { queenProfiles, refresh } = useColony();
+  const { queenProfiles, refresh, queenAvatarVersions, bumpQueenAvatar } = useColony();
   const summary = queenProfiles.find((q) => q.id === queenId);
   const [profile, setProfile] = useState<QueenProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Avatar state
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  // Avatar state. `hasAvatar` mirrors profile.has_avatar (falling back to the
+  // summary while the profile is still loading); set to true immediately on
+  // upload, and back to false if the <img> ever 404s (defensive).
+  const summaryHasAvatar = summary?.hasAvatar;
+  const [hasAvatar, setHasAvatar] = useState<boolean>(summaryHasAvatar ?? false);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const avatarVersion = queenAvatarVersions[queenId] ?? 0;
+  const avatarUrl = hasAvatar ? `/api/queen/${queenId}/avatar?v=${avatarVersion}` : null;
 
   // Edit form state
   const [editName, setEditName] = useState("");
@@ -53,9 +58,17 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
     setLoading(true);
     setProfile(null);
     setEditing(false);
-    // Set avatar URL with cache buster
-    setAvatarUrl(`/api/queen/${queenId}/avatar?t=${Date.now()}`);
-    queensApi.getProfile(queenId).then(setProfile).catch(() => {}).finally(() => setLoading(false));
+    setHasAvatar(summaryHasAvatar ?? false);
+    queensApi
+      .getProfile(queenId)
+      .then((p) => {
+        setProfile(p);
+        setHasAvatar(Boolean(p.has_avatar));
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+    // summaryHasAvatar intentionally excluded — only re-init on queenId change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queenId]);
 
   const startEditing = () => {
@@ -104,7 +117,9 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
     try {
       const compressed = await compressImage(file);
       await queensApi.uploadAvatar(queenId, compressed);
-      setAvatarUrl(`/api/queen/${queenId}/avatar?t=${Date.now()}`);
+      setHasAvatar(true);
+      bumpQueenAvatar(queenId);
+      refresh();
     } catch (err) {
       console.error("Failed to upload avatar:", err);
     } finally {
@@ -186,7 +201,7 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
             src={avatarUrl}
             alt={name}
             className="w-full h-full object-cover"
-            onError={() => setAvatarUrl(null)}
+            onError={() => setHasAvatar(false)}
           />
         ) : (
           <span className="text-xl font-bold text-primary">{name.charAt(0)}</span>

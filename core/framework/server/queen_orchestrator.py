@@ -526,6 +526,12 @@ async def create_queen(
     # call into to fan out parallel workers from the queen.
     session._queen_tools = queen_tools  # type: ignore[attr-defined]
     session._queen_tool_executor = queen_tool_executor  # type: ignore[attr-defined]
+    # Stash the queen's tool registry on the session so the Tool Library
+    # API can read the FULL MCP catalog (pre-credential-gate) directly
+    # from the same registry the queen is using. Without this handle,
+    # the route falls back to a stale per-process snapshot built at
+    # queen-boot time and never refreshed when credentials change.
+    session._queen_tool_registry = queen_registry  # type: ignore[attr-defined]
 
     # ---- Partition tools by phase ------------------------------------
     independent_names = set(_QUEEN_INDEPENDENT_TOOLS)
@@ -592,32 +598,26 @@ async def create_queen(
         )
 
     # ---- MCP tool catalog for the frontend ---------------------------
-    # Snapshot per-server tool metadata so the Queen Tools API can render
-    # the tool surface without spawning MCP subprocesses. Keyed by server
-    # name so the UI can group tools by origin. Updated every time a
-    # queen boots, so installing a new server and starting a new queen
-    # session refreshes the catalog.
-    #
-    # We source from the registry's full pre-credential-gate catalog so
-    # the Library shows credentialed tools whose provider isn't yet
-    # authorized — they appear greyed-out with a Connect button rather
-    # than vanishing entirely. The strict admission gate still controls
-    # what the queen sees in her prompt.
-    full_catalog = queen_registry.get_full_mcp_catalog()
-    mcp_tool_catalog: dict[str, list[dict[str, Any]]] = {}
-    for server_name, entries in full_catalog.items():
-        mcp_tool_catalog[server_name] = sorted(
-            (dict(e) for e in entries),
-            key=lambda e: e.get("name", ""),
-        )
-    # All queens share one MCP registry, so the catalog is a manager-level
-    # fact; stash it on the SessionManager so the Queen Tools route can
-    # render the tool list even when no queen session is currently live.
+    # Stash the registry itself on the SessionManager so the Tool
+    # Library can pull a FRESH catalog on every request. Previously we
+    # cached a dict snapshot here, which meant credential authorisations
+    # mid-session never propagated to the Library until the next queen
+    # boot. The registry's `_mcp_full_catalog` is rebuilt in place when
+    # `resync_mcp_servers_if_needed` fires, so reading through the
+    # registry guarantees freshness.
     if session_manager is not None:
         try:
-            session_manager._mcp_tool_catalog = mcp_tool_catalog  # type: ignore[attr-defined]
+            session_manager._bootstrap_tool_registry = queen_registry  # type: ignore[attr-defined]
+            # Drop any legacy snapshot so the route's freshness check
+            # doesn't accidentally serve a stale dict from an earlier
+            # queen boot.
+            if hasattr(session_manager, "_mcp_tool_catalog"):
+                try:
+                    delattr(session_manager, "_mcp_tool_catalog")
+                except AttributeError:
+                    pass
         except Exception:
-            logger.debug("Queen: could not attach mcp_tool_catalog to manager", exc_info=True)
+            logger.debug("Queen: could not attach registry to manager", exc_info=True)
 
     # ---- Global + queen-scoped memory ----------------------------------
     global_dir, queen_mem_dir = initialize_memory_scopes(session, phase_state)

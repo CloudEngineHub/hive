@@ -120,25 +120,40 @@ async def _render_catalog(manager: Any, colony_name: str) -> dict[str, list[dict
                 )
         return catalog
 
-    # Otherwise fall back to the queen-level snapshot. Build it on demand
-    # (off the event loop) when empty so the Tool Library works before
-    # any queen has been started in this process.
-    cached = getattr(manager, "_mcp_tool_catalog", None)
-    if isinstance(cached, dict) and cached:
-        return cached
+    # Otherwise read live from the bootstrap registry so credential
+    # changes propagate without an explicit invalidation step. Build
+    # the registry on demand (off the event loop) on first access.
+    registry = getattr(manager, "_bootstrap_tool_registry", None) if manager is not None else None
+    if registry is not None:
+        return {
+            server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", ""))
+            for server, entries in registry.get_full_mcp_catalog().items()
+        }
+    # Legacy dict snapshot (still used by some tests).
+    legacy = getattr(manager, "_mcp_tool_catalog", None) if manager is not None else None
+    if isinstance(legacy, dict) and legacy:
+        return {
+            server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", ""))
+            for server, entries in legacy.items()
+        }
+    if manager is None:
+        return {}
     try:
         import asyncio
 
         from framework.server.queen_orchestrator import build_queen_tool_registry_bare
 
-        registry, built = await asyncio.to_thread(build_queen_tool_registry_bare)
-        if manager is not None:
-            manager._mcp_tool_catalog = built  # type: ignore[attr-defined]
-            manager._bootstrap_tool_registry = registry  # type: ignore[attr-defined]
-        return built
+        registry, _initial = await asyncio.to_thread(build_queen_tool_registry_bare)
+        manager._bootstrap_tool_registry = registry  # type: ignore[attr-defined]
     except Exception:
         logger.warning("Colony tools: catalog bootstrap failed", exc_info=True)
         return {}
+    if registry is None:
+        return {}
+    return {
+        server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", ""))
+        for server, entries in registry.get_full_mcp_catalog().items()
+    }
 
 
 def _lifecycle_entries_from_runtime(manager: Any, colony_name: str) -> list[dict[str, Any]]:
@@ -312,6 +327,20 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
         "null" if enabled is None else f"{len(enabled)} tool(s)",
         refreshed,
     )
+    # Broadcast a TOOLS_CONFIG_CHANGED event so other Tool Library
+    # tabs viewing this colony silently refetch.
+    try:
+        from framework.host.event_bus import AgentEvent, EventType, publish_global
+
+        await publish_global(
+            AgentEvent(
+                type=EventType.TOOLS_CONFIG_CHANGED,
+                stream_id="global",
+                data={"scope": "colony", "scope_id": colony_name, "action": "update"},
+            )
+        )
+    except Exception:
+        logger.debug("Failed to publish TOOLS_CONFIG_CHANGED for colony", exc_info=True)
     return web.json_response(
         {
             "colony_name": colony_name,

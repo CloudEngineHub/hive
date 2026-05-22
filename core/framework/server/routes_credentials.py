@@ -58,6 +58,75 @@ def _reset_credential_adapter_cache() -> None:
         logger.warning("Failed to reset credential adapter cache", exc_info=True)
 
 
+def _provider_for_credential(credential_id: str) -> str | None:
+    """Return the OAuth provider name (``aden_provider_name``) for ``credential_id``.
+
+    Used when publishing global credential events so subscribers can
+    flip per-provider UI state without having to look up the spec
+    themselves. Returns ``None`` when the credential isn't OAuth-bound
+    or aden_tools isn't available.
+    """
+    try:
+        from aden_tools.credentials import CREDENTIAL_SPECS
+
+        for name, spec in CREDENTIAL_SPECS.items():
+            cid = spec.credential_id or name
+            if cid == credential_id:
+                return getattr(spec, "aden_provider_name", None) or None
+    except Exception:
+        logger.debug("Could not resolve provider for %s", credential_id, exc_info=True)
+    return None
+
+
+async def _publish_credential_event(
+    *,
+    connected: bool,
+    credential_id: str,
+    provider: str | None,
+) -> None:
+    """Publish a global SSE event so the UI can refetch tool catalogs.
+
+    Pairs every credential save/delete with a single event on the
+    process-wide bus. Subscribers (Tool Library, Integrations page)
+    use this to refresh per-provider state without polling.
+    """
+    from framework.host.event_bus import (
+        AgentEvent,
+        EventType,
+        publish_global,
+    )
+
+    event_type = (
+        EventType.CREDENTIAL_PROVIDER_CONNECTED
+        if connected
+        else EventType.CREDENTIAL_PROVIDER_DISCONNECTED
+    )
+    await publish_global(
+        AgentEvent(
+            type=event_type,
+            stream_id="global",
+            data={
+                "credential_id": credential_id,
+                "provider": provider,
+            },
+        )
+    )
+    # Pair with TOOL_CATALOG_REFRESHED so generic catalog subscribers
+    # (which don't care about which provider changed) only need to
+    # listen for one event type.
+    await publish_global(
+        AgentEvent(
+            type=EventType.TOOL_CATALOG_REFRESHED,
+            stream_id="global",
+            data={
+                "trigger": "credential_save" if connected else "credential_delete",
+                "credential_id": credential_id,
+                "provider": provider,
+            },
+        )
+    )
+
+
 def _invalidate_queen_credentials_cache(request: web.Request) -> None:
     """Force every live Queen session to rebuild its ambient credentials block.
 
@@ -192,6 +261,11 @@ async def handle_save_credential(request: web.Request) -> web.Response:
             logger.warning("Aden token sync after key save failed: %s", exc)
 
         _invalidate_queen_credentials_cache(request)
+        # Aden key save fans out OAuth tokens; broadcast a refresh so the
+        # Tool Library re-evaluates every provider's connected state.
+        await _publish_credential_event(
+            connected=True, credential_id="aden_api_key", provider=None
+        )
         return web.json_response({"saved": "aden_api_key"}, status=201)
 
     store = _get_store(request)
@@ -200,7 +274,13 @@ async def handle_save_credential(request: web.Request) -> web.Response:
         keys={k: CredentialKey(name=k, value=SecretStr(v)) for k, v in keys.items()},
     )
     store.save_credential(cred)
+    _reset_credential_adapter_cache()
     _invalidate_queen_credentials_cache(request)
+    await _publish_credential_event(
+        connected=True,
+        credential_id=credential_id,
+        provider=_provider_for_credential(credential_id),
+    )
     return web.json_response({"saved": credential_id}, status=201)
 
 
@@ -219,6 +299,9 @@ async def handle_delete_credential(request: web.Request) -> web.Response:
         os.environ.pop("ADEN_API_KEY", None)
         _reset_credential_adapter_cache()
         _invalidate_queen_credentials_cache(request)
+        await _publish_credential_event(
+            connected=False, credential_id="aden_api_key", provider=None
+        )
         return web.json_response({"deleted": True})
 
     store = _get_store(request)
@@ -235,7 +318,13 @@ async def handle_delete_credential(request: web.Request) -> web.Response:
 
     if not deleted_from_store and not deleted_from_env:
         return web.json_response({"error": f"Credential '{credential_id}' not found"}, status=404)
+    _reset_credential_adapter_cache()
     _invalidate_queen_credentials_cache(request)
+    await _publish_credential_event(
+        connected=False,
+        credential_id=credential_id,
+        provider=_provider_for_credential(credential_id),
+    )
     return web.json_response({"deleted": True})
 
 
@@ -390,6 +479,13 @@ async def handle_resync_credentials(request: web.Request) -> web.Response:
         _invalidate_queen_credentials_cache(request)
 
         accounts_by_provider = _collect_accounts_by_provider()
+        # Aden resync may have surfaced brand-new providers (the user
+        # just authorised an integration on the Aden site). Broadcast
+        # a generic refresh so every Tool Library tab re-evaluates
+        # provider_connected without polling.
+        await _publish_credential_event(
+            connected=True, credential_id="<aden_resync>", provider=None
+        )
         return web.json_response(
             {
                 "synced": True,

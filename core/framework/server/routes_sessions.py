@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError as _AiohttpConnReset
 
 from framework.server.app import (
     resolve_session,
@@ -218,6 +219,94 @@ async def handle_list_live_sessions(request: web.Request) -> web.Response:
     manager = _get_manager(request)
     sessions = [_session_to_live_dict(s) for s in manager.list_sessions()]
     return web.json_response({"sessions": sessions})
+
+
+def _live_session_summary(session) -> dict:
+    """Per-session row for the multi-queen sidebar feed.
+
+    Combines stable session metadata with the live snapshot derived
+    from the per-session ring buffer.  Mirror of the canonical
+    helper; keep the two in sync.
+    """
+    from framework.host.event_bus import compute_session_snapshot
+
+    info = session.worker_info
+    phase_state = getattr(session, "phase_state", None)
+    snap = compute_session_snapshot(session.event_bus) if getattr(session, "event_bus", None) else {}
+    tools = snap.get("current_tool_calls") or []
+    primary_tool = tools[0]["name"] if tools else None
+    return {
+        "session_id": session.id,
+        "colony_id": session.colony_id,
+        "colony_name": info.name if info else session.colony_id,
+        "queen_id": getattr(phase_state, "queen_id", None) if phase_state else None,
+        "queen_name": (phase_state.queen_profile or {}).get("name") if phase_state else None,
+        "phase": phase_state.phase if phase_state else None,
+        "is_executing": bool(snap.get("is_executing")),
+        "awaiting_input": bool(snap.get("awaiting_input")),
+        "queen_busy_reason": snap.get("queen_busy_reason"),
+        "current_tool_name": primary_tool,
+        "current_tool_count": len(tools),
+        "last_event_at": snap.get("last_event_at"),
+        "snapshot_seq": snap.get("snapshot_seq", 0),
+    }
+
+
+async def handle_live_sessions_stream(request: web.Request) -> web.StreamResponse:
+    """GET /api/sessions/live — SSE feed of every live session's snapshot.
+
+    Drives the multi-queen sidebar dot indicators and the away-queen
+    attention badge. Emits a coalesced ``snapshot`` event whenever any
+    session's state field changes; heartbeats every 30 s.
+    """
+    import asyncio
+    import json as _json
+
+    manager = _get_manager(request)
+    from framework.server.sse import SSEResponse
+
+    sse = SSEResponse()
+    await sse.prepare(request)
+
+    from framework.host.runtime_health import get_runtime_network
+
+    last_signature: str | None = None
+    last_emit_ts = 0.0
+    POLL_SEC = 2.5
+    HEARTBEAT_SEC = 30.0
+
+    try:
+        while True:
+            rows = [_live_session_summary(s) for s in manager.list_sessions()]
+            rows.sort(key=lambda r: r["session_id"])
+            network = get_runtime_network()
+            sig = _json.dumps(
+                [
+                    (
+                        r["session_id"],
+                        r["is_executing"],
+                        r["awaiting_input"],
+                        r["current_tool_name"],
+                        r["queen_busy_reason"],
+                    )
+                    for r in rows
+                ] + [("__network__", network["degraded"], network["reason"])]
+            )
+            now = time.monotonic()
+            if sig != last_signature or (now - last_emit_ts) > HEARTBEAT_SEC:
+                await sse.send_event(
+                    {"sessions": rows, "network": network},
+                    event="snapshot",
+                )
+                last_signature = sig
+                last_emit_ts = now
+            await asyncio.sleep(POLL_SEC)
+    except (asyncio.CancelledError, ConnectionResetError, _AiohttpConnReset):
+        pass
+    except Exception as exc:
+        logger.warning("live sessions stream error: %s", exc)
+
+    return sse.response  # type: ignore[return-value]
 
 
 async def handle_get_live_session(request: web.Request) -> web.Response:
@@ -934,6 +1023,13 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
 
     The actual file read runs in a worker thread via ``asyncio.to_thread`` so
     it doesn't block the event loop while other requests are in flight.
+
+    On cold resume, ``_start_queen`` truncates ``events.jsonl`` before the
+    new EventBus begins writing (see session_manager.py).  This keeps each
+    runtime segment self-contained — the frontend never sees stale tool
+    calls from prior runs, and the seq-based dedup in chat-helpers.ts
+    (which assumes a single monotonically-increasing seq space per
+    session) works correctly.
     """
     session_id = request.match_info["session_id"]
 
@@ -972,6 +1068,18 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
                 "limit": limit,
             }
         )
+
+    # Each cold resume creates a new EventBus whose seq counter
+    # restarts at 1, so events.jsonl accumulates multiple segments
+    # with overlapping seq ranges.  The frontend's seq-based dedup
+    # (shouldSkipForDedupe in chat-helpers.ts) assumes a single
+    # monotonically-increasing seq space and would silently drop
+    # events from later segments whose seqs collide with earlier
+    # ones.  Rewrite seq to the event's index in the response array
+    # so every event has a globally unique seq — the frontend's
+    # existing dedup works correctly without any frontend changes.
+    for i, e in enumerate(events):
+        e["seq"] = i + 1
 
     return web.json_response(
         {
@@ -1149,6 +1257,165 @@ async def handle_reveal_session_folder(request: web.Request) -> web.Response:
     return web.json_response({"path": str(folder)})
 
 
+async def handle_session_attachment(request: web.Request) -> web.Response:
+    """GET /api/sessions/{session_id}/attachment/{filename} — serve a saved attachment."""
+    session_id = request.match_info["session_id"]
+    filename = request.match_info["filename"]
+
+    # Prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return web.Response(status=400, text="Invalid filename")
+
+    from framework.server.session_manager import _find_queen_session_dir
+
+    session_dir = _find_queen_session_dir(session_id)
+    filepath = session_dir / "attachments" / filename
+    if not filepath.exists() or not filepath.is_file():
+        return web.Response(status=404, text="Attachment not found")
+
+    mime_map = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".pdf": "application/pdf",
+        ".csv": "text/csv",
+    }
+    content_type = mime_map.get(filepath.suffix.lower(), "application/octet-stream")
+    return web.FileResponse(filepath, headers={"Content-Type": content_type})
+
+
+async def handle_upload_attachment(request: web.Request) -> web.Response:
+    """POST /api/sessions/{session_id}/upload-attachment — upload a file attachment.
+
+    Accepts multipart/form-data with a single file field named 'file'.
+    Saves to the session's attachments/ directory and returns the filename.
+    """
+    import time
+
+    session_id = request.match_info["session_id"]
+    manager: SessionManager = request.app["manager"]
+
+    session = manager.get_session(session_id)
+    if not session:
+        return web.json_response({"error": "session not found"}, status=404)
+
+    queen_dir = session.queen_dir
+    if not queen_dir:
+        from framework.server.session_manager import _find_queen_session_dir
+
+        queen_dir = _find_queen_session_dir(session.queen_resume_from or session_id)
+
+    attachments_dir = queen_dir / "attachments"
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+
+    reader = await request.multipart()
+    field = await reader.next()
+    if field is None or field.name != "file":
+        return web.json_response({"error": "expected a 'file' field"}, status=400)
+
+    original_name = field.filename or "upload"
+    ext_map = {
+        "application/pdf": ".pdf",
+        "text/csv": ".csv",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    content_type = field.headers.get("Content-Type", "application/octet-stream")
+    # Also check by filename extension
+    import os
+
+    file_ext = os.path.splitext(original_name)[1].lower()
+    ext = ext_map.get(content_type, file_ext or ".bin")
+
+    ts = int(time.time() * 1000)
+    filename = f"{ts}_0{ext}"
+    filepath = attachments_dir / filename
+
+    # Stream to disk to avoid loading entire file into memory
+    with open(filepath, "wb") as f:
+        while True:
+            chunk = await field.read_chunk(8192)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    # Extract text from PDFs so the queen can read the content
+    extracted_text = ""
+    page_image_data_uris: list[str] = []
+    if ext == ".pdf":
+        try:
+            import base64 as b64mod
+            import io
+
+            import pdfplumber
+
+            with pdfplumber.open(filepath) as pdf:
+                text_parts = []
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        text_parts.append(f"[PDF page {page_num + 1}]\n{page_text.strip()}")
+                    # Render page as image — return as base64 data URI
+                    # so the frontend can send directly as image_url blocks
+                    try:
+                        page_img = page.to_image(resolution=150)
+                        img_buf = io.BytesIO()
+                        page_img.save(img_buf, format="PNG")
+                        img_bytes = img_buf.getvalue()
+                        # Also save to disk for replay
+                        page_filename = f"{ts}_0_p{page_num}.png"
+                        (attachments_dir / page_filename).write_bytes(img_bytes)
+                        # Return data URI for the chat endpoint
+                        b64 = b64mod.b64encode(img_bytes).decode()
+                        page_image_data_uris.append(f"data:image/png;base64,{b64}")
+                    except Exception:
+                        pass
+                extracted_text = "\n\n".join(text_parts)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    elif ext == ".csv":
+        try:
+            import csv
+            import io
+
+            raw = filepath.read_text(encoding="utf-8", errors="replace")
+            reader = csv.reader(io.StringIO(raw))
+            rows = list(reader)
+            if rows:
+                # Format as a readable table — header + first 200 rows
+                header = rows[0]
+                data_rows = rows[1:201]
+                lines = [f"[CSV file: {original_name}, {len(rows) - 1} rows, {len(header)} columns]"]
+                lines.append(" | ".join(header))
+                lines.append(" | ".join("---" for _ in header))
+                for row in data_rows:
+                    lines.append(" | ".join(row))
+                if len(rows) - 1 > 200:
+                    lines.append(f"... ({len(rows) - 1 - 200} more rows truncated)")
+                extracted_text = "\n".join(lines)
+        except Exception:
+            pass
+
+    return web.json_response(
+        {
+            "filename": filename,
+            "path": f"attachments/{filename}",
+            "session_id": session_id,
+            "content_type": content_type,
+            "original_name": original_name,
+            "extracted_text": extracted_text,
+            "page_images": page_image_data_uris,
+        }
+    )
+
+
 async def handle_update_colony_metadata(request: web.Request) -> web.Response:
     """PATCH /api/agents/metadata — update colony metadata (e.g. icon).
 
@@ -1198,7 +1465,8 @@ def register_routes(app: web.Application) -> None:
     # Session lifecycle
     app.router.add_post("/api/sessions", handle_create_session)
     app.router.add_get("/api/sessions", handle_list_live_sessions)
-    # history must be registered before {session_id} so it takes priority
+    # ``live`` and ``history`` must be registered before {session_id}.
+    app.router.add_get("/api/sessions/live", handle_live_sessions_stream)
     app.router.add_get("/api/sessions/history", handle_session_history)
     app.router.add_delete("/api/sessions/history/{session_id}", handle_delete_history_session)
     app.router.add_get("/api/sessions/{session_id}", handle_get_live_session)
@@ -1210,6 +1478,8 @@ def register_routes(app: web.Application) -> None:
 
     # Session info
     app.router.add_post("/api/sessions/{session_id}/reveal", handle_reveal_session_folder)
+    app.router.add_get("/api/sessions/{session_id}/attachment/{filename}", handle_session_attachment)
+    app.router.add_post("/api/sessions/{session_id}/upload-attachment", handle_upload_attachment)
     app.router.add_get("/api/sessions/{session_id}/stats", handle_session_stats)
     app.router.add_get("/api/sessions/{session_id}/entry-points", handle_session_entry_points)
     app.router.add_patch("/api/sessions/{session_id}/triggers/{trigger_id}", handle_update_trigger_task)

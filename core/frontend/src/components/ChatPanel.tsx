@@ -33,6 +33,7 @@ import QuestionWidget from "@/components/QuestionWidget";
 import MultiQuestionWidget from "@/components/MultiQuestionWidget";
 import { useQueenProfile } from "@/context/QueenProfileContext";
 import { useColonyWorkers } from "@/context/ColonyWorkersContext";
+import { useColony } from "@/context/ColonyContext";
 import ParallelSubagentBubble, {
   type SubagentGroup,
 } from "@/components/ParallelSubagentBubble";
@@ -970,7 +971,14 @@ export default function ChatPanel({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastAppliedDraftRef = useRef<string | null | undefined>(undefined);
-  const queenAvatarUrl = queenId ? `/api/queen/${queenId}/avatar` : null;
+  const { queenProfiles, queenAvatarVersions } = useColony();
+  const queenHasAvatar = queenId
+    ? Boolean(queenProfiles.find((q) => q.id === queenId)?.hasAvatar)
+    : false;
+  const queenAvatarUrl =
+    queenId && queenHasAvatar
+      ? `/api/queen/${queenId}/avatar?v=${queenAvatarVersions[queenId] ?? 0}`
+      : null;
 
   useEffect(() => {
     if (!initialDraft || initialDraft === lastAppliedDraftRef.current) return;

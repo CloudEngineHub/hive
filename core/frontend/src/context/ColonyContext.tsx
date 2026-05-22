@@ -64,6 +64,9 @@ interface ColonyContextValue {
   /** Cache-busting version for user avatar — bump after upload */
   userAvatarVersion: number;
   bumpUserAvatar: () => void;
+  /** Cache-busting version per queen — bump after that queen's avatar upload. */
+  queenAvatarVersions: Record<string, number>;
+  bumpQueenAvatar: (queenId: string) => void;
 }
 
 const ColonyContext = createContext<ColonyContextValue | null>(null);
@@ -93,6 +96,11 @@ export function ColonyProvider({ children }: { children: ReactNode }) {
 
   const [userAvatarVersion, setUserAvatarVersion] = useState(0);
   const bumpUserAvatar = useCallback(() => setUserAvatarVersion((v) => v + 1), []);
+
+  const [queenAvatarVersions, setQueenAvatarVersions] = useState<Record<string, number>>({});
+  const bumpQueenAvatar = useCallback((queenId: string) => {
+    setQueenAvatarVersions((prev) => ({ ...prev, [queenId]: (prev[queenId] ?? 0) + 1 }));
+  }, []);
 
   const coloniesRef = useRef<Colony[]>(colonies);
   useEffect(() => {
@@ -215,7 +223,15 @@ export function ColonyProvider({ children }: { children: ReactNode }) {
       // Sort queens by most recent DM activity (newest first). Stable tiebreak
       // by original API order keeps no-history queens at the bottom and prevents
       // flicker between renders when timestamps tie.
-      const sortedQueens = queenProfilesResult.queens
+      const normalized: QueenProfileSummary[] = queenProfilesResult.queens.map(
+        (qp) => ({
+          id: qp.id,
+          name: qp.name,
+          title: qp.title,
+          hasAvatar: "has_avatar" in qp ? Boolean(qp.has_avatar) : undefined,
+        }),
+      );
+      const sortedQueens = normalized
         .map((qp, idx) => ({ qp, idx, ts: queenLastActive.get(qp.id) ?? -Infinity }))
         .sort((a, b) => (b.ts - a.ts) || (a.idx - b.idx))
         .map((x) => x.qp);
@@ -329,6 +345,8 @@ export function ColonyProvider({ children }: { children: ReactNode }) {
         refresh,
         userAvatarVersion,
         bumpUserAvatar,
+        queenAvatarVersions,
+        bumpQueenAvatar,
       }}
     >
       {children}

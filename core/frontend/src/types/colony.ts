@@ -39,6 +39,8 @@ export interface QueenProfileSummary {
   id: string;
   name: string;
   title: string;
+  // Absent ⇒ assume no avatar (don't render <img> ⇒ no 404 spam).
+  hasAvatar?: boolean;
 }
 
 export interface UserProfile {

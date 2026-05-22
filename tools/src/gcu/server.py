@@ -66,6 +66,29 @@ from gcu import register_gcu_tools  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+async def _bridge_rebind_supervisor(bridge, port: int) -> None:
+    """Retry binding the bridge port until it succeeds.
+
+    bridge.start() logs and swallows OSError when the port is held by
+    another process (a stale runtime, an old Electron instance, etc.).
+    Without retry the bridge stays dead until the user restarts the
+    runtime — so the desktop app appears to "support hot install" but
+    really doesn't. This loop polls every 5s and re-attempts start()
+    whenever the underlying server is missing; once the conflicting
+    holder exits the bridge comes up automatically.
+    """
+    while True:
+        await asyncio.sleep(5.0)
+        # ``_server`` is None either because start() never succeeded or
+        # because stop() ran (in which case the supervisor was cancelled
+        # and we won't reach here). Either way: try again.
+        if getattr(bridge, "_server", None) is None:
+            try:
+                await bridge.start(port=port)
+            except Exception as e:
+                logger.debug("Bridge rebind attempt failed: %s", e)
+
+
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """FastMCP lifespan hook: start the Beeline bridge, clean up on shutdown."""
@@ -74,12 +97,18 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:
     bridge = init_bridge()
     bridge_port = int(os.getenv("HIVE_BRIDGE_PORT", "9229"))
     await bridge.start(port=bridge_port)
+    rebind_task = asyncio.create_task(_bridge_rebind_supervisor(bridge, bridge_port))
 
     yield {}
 
     from gcu.browser.session import shutdown_all_browsers
 
     logger.info("Server shutting down, cleaning up browser sessions...")
+    rebind_task.cancel()
+    try:
+        await rebind_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await shutdown_all_browsers()
     await bridge.stop()
 

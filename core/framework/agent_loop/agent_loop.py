@@ -955,6 +955,16 @@ class AgentLoop(AgentProtocol):
                         "[AgentLoop.execute] iteration=%d: _run_single_turn completed successfully",
                         iteration,
                     )
+                    # The stream completed without raising — upstream
+                    # LLM is reachable. If a previous attempt lit the
+                    # global runtime_network degraded flag, clear it
+                    # now so the desktop banner returns to "online".
+                    try:
+                        from framework.host.runtime_health import mark_upstream_healthy
+
+                        mark_upstream_healthy()
+                    except Exception:
+                        pass
                     _turn_ms = int((time.monotonic() - _turn_t0) * 1000)
                     logger.info(
                         "[%s] iter=%d: LLM done (%dms) — text=%d chars, real_tools=%d, "
@@ -1088,6 +1098,24 @@ class AgentLoop(AgentProtocol):
                     # Retry transient errors with exponential backoff
                     if self._is_transient_error(e) and _stream_retry_count < self._config.max_stream_retries:
                         self._bump("llm_transient_retry")
+                        # Recognise upstream-network failures (DNS,
+                        # refused, TLS, etc.) and flip the
+                        # process-wide ``runtime_health`` flag so the
+                        # desktop connectivity banner can surface
+                        # "LLM proxy unreachable" — the renderer↔runtime
+                        # IPC stays healthy on these, so without this
+                        # the UI would have no signal that wifi just
+                        # dropped.
+                        try:
+                            from framework.host.runtime_health import (
+                                is_upstream_network_error,
+                                mark_upstream_degraded,
+                            )
+
+                            if is_upstream_network_error(e):
+                                mark_upstream_degraded(f"{type(e).__name__}: {str(e)[:200]}")
+                        except Exception:
+                            pass
                         _stream_retry_count += 1
                         delay = min(
                             self._config.stream_retry_backoff_base * (2 ** (_stream_retry_count - 1)),

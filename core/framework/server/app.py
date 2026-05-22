@@ -228,11 +228,14 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def _probe_browser_bridge() -> dict:
-    """Probe the local GCU bridge and return ``{bridge, connected}``.
+    """Probe the local GCU bridge and return its status.
 
-    Shared by the one-shot ``GET /api/browser/status`` handler and the
-    ``/api/browser/status/stream`` SSE feed so both see the same data
-    source.
+    Returns a dict with at minimum ``{bridge, connected}``; when the
+    bridge is reachable, also includes ``connections`` (per-extension
+    diagnostics) and ``last_pong_age_ms`` for the primary connection
+    so the UI can distinguish "extension stale" from "extension
+    healthy". Read budget is bumped to 4 KB because the rich payload
+    can run hundreds of bytes once tab/profile lists are populated.
     """
     import asyncio
 
@@ -243,17 +246,29 @@ async def _probe_browser_bridge() -> dict:
         reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", status_port), timeout=0.5)
         writer.write(b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(512), timeout=0.5)
+        raw = await asyncio.wait_for(reader.read(4096), timeout=0.5)
         writer.close()
         if b"\r\n\r\n" in raw:
             body = raw.split(b"\r\n\r\n", 1)[1]
             import json as _json
 
             data = _json.loads(body)
-            return {"bridge": True, "connected": bool(data.get("connected", False))}
+            connections = data.get("connections") or []
+            primary = connections[0] if connections else {}
+            return {
+                "bridge": True,
+                "connected": bool(data.get("connected", False)),
+                "connections": connections,
+                # Surface a simple "stale" hint derived from last_pong age.
+                # Anything beyond ~30s implies the offscreen page or SW
+                # is wedged even though the TCP socket is still up.
+                "last_pong_age_ms": primary.get("last_pong_age_ms"),
+                "extension_version": primary.get("version"),
+                "uptime_ms": data.get("uptime_ms"),
+            }
     except Exception:
         pass
-    return {"bridge": False, "connected": False}
+    return {"bridge": False, "connected": False, "connections": []}
 
 
 async def handle_browser_status(request: web.Request) -> web.Response:
@@ -295,9 +310,19 @@ async def handle_browser_status_stream(request: web.Request) -> web.StreamRespon
     try:
         while True:
             status = await _probe_browser_bridge()
-            signature = (status["bridge"], status["connected"])
+            # Include a coarse-grained health bucket in the signature
+            # (healthy / stale / disconnected) so the badge transitions
+            # without spamming an event for every pong-age fluctuation.
+            pong = status.get("last_pong_age_ms")
+            health = (
+                "healthy" if status.get("connected") and (pong is None or pong < 15000)
+                else "stale" if status.get("connected")
+                else "disconnected" if status.get("bridge")
+                else "offline"
+            )
+            signature = (status["bridge"], status["connected"], health)
             if signature != last:
-                await _send("status", status)
+                await _send("status", {**status, "health": health})
                 last = signature
             await asyncio.sleep(3.0)
     except (asyncio.CancelledError, ConnectionResetError):
