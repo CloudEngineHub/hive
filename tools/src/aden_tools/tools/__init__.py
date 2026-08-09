@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
@@ -23,13 +24,12 @@ from fastmcp import FastMCP
 if TYPE_CHECKING:
     from aden_tools.credentials import CredentialStoreAdapter
 
+
 # ---------------------------------------------------------------------------
 # Verified tools (stable, on main)
 # ---------------------------------------------------------------------------
 # File system: one canonical module for read/write/edit/search/patch.
 # Shell: still its own toolkit.
-from aden_tools.file_ops import register_file_tools
-
 from .account_info_tool import register_tools as register_account_info
 
 # ---------------------------------------------------------------------------
@@ -40,6 +40,7 @@ from .apify_tool import register_tools as register_apify
 from .apollo_tool import register_tools as register_apollo
 from .arxiv_tool import register_tools as register_arxiv
 from .asana_tool import register_tools as register_asana
+from .attach_file_tool import register_tools as register_attach_file
 from .attio_tool import register_tools as register_attio
 from .aws_s3_tool import register_tools as register_aws_s3
 from .azure_sql_tool import register_tools as register_azure_sql
@@ -73,6 +74,12 @@ from .greenhouse_tool import register_tools as register_greenhouse
 from .http_headers_scanner import register_tools as register_http_headers_scanner
 from .hubspot_tool import register_tools as register_hubspot
 from .huggingface_tool import register_tools as register_huggingface
+
+# image_generate routes through the Hive LLM proxy and is billed to the user's
+# credits like an LLM call. It is credential-less (auth is the runtime's
+# HIVE_API_KEY proxy token), so it MUST be verified — the queen MCP admission
+# gate drops credential-less tools that are absent from the verified manifest.
+from .image_gen_tool import register_tools as register_image_gen
 from .intercom_tool import register_tools as register_intercom
 from .jira_tool import register_tools as register_jira
 from .kafka_tool import register_tools as register_kafka
@@ -104,6 +111,13 @@ from .redshift_tool import register_tools as register_redshift
 from .risk_scorer import register_tools as register_risk_scorer
 from .salesforce_tool import register_tools as register_salesforce
 from .sap_tool import register_tools as register_sap
+
+# Email senders: a unified send_email/list_senders/pick_sender/send_campaign
+# surface over the team's cloud-configured sender pool. Credential-less at the
+# MCP layer (secrets/tokens come from the sender registry, not the per-tool
+# credential store), so it MUST be verified — the queen admission gate drops
+# credential-less tools absent from the verified manifest.
+from .senders_tool import register_tools as register_senders
 from .serpapi_tool import register_tools as register_serpapi
 from .shopify_tool import register_tools as register_shopify
 from .similarweb_tool import register_tools as register_similarweb
@@ -146,6 +160,23 @@ from .zoom_tool import register_tools as register_zoom
 _VERIFIED_TOOL_NAMES: set[str] = set()
 
 
+def _email_senders_enabled() -> bool:
+    """Whether the email-senders suite should be registered. Default: no.
+
+    Reads ``HIVE_EMAIL_SENDERS``, which the runtime publishes into the
+    environment every MCP subprocess inherits. Env is the only channel:
+    ``aden_tools`` deliberately knows nothing about configuration.json —
+    the runtime resolves the flag (env > config file > off) and hands us
+    the answer, exactly as ``INCLUDE_UNVERIFIED_TOOLS`` works.
+
+    Absent env means off, which is also what a bare ``python
+    mcp_server.py`` gets: the suite is opt-in everywhere, not just in the
+    desktop.
+    """
+    raw = os.getenv("HIVE_EMAIL_SENDERS", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _register_verified(
     mcp: FastMCP,
     credentials: CredentialStoreAdapter | None = None,
@@ -156,9 +187,24 @@ def _register_verified(
     if register_web_scrape:
         register_web_scrape(mcp)
     register_pdf_read(mcp)
+    register_attach_file(mcp)
     register_time(mcp)
     register_wikipedia(mcp)
     register_arxiv(mcp)
+    # Credential-less: bills via the Hive proxy using the runtime's HIVE_API_KEY.
+    register_image_gen(mcp)
+    # Credential-less: senders resolve secrets/tokens from the cloud sender
+    # registry, so a queen that has them needs no per-tool credential (an
+    # empty pool self-describes). Gated OFF by default: senders are an
+    # advanced developer feature, opted into in the desktop's Settings →
+    # Developer, which writes `email_senders` to configuration.json and
+    # republishes it as HIVE_EMAIL_SENDERS (framework.config
+    # .sync_email_senders_env). Not registering is the whole gate — the
+    # tools are then absent from the MCP catalog, so no prompt manifest,
+    # tool search, allowlist or allow-all fallback can surface them, and
+    # the model has no way to learn the feature exists.
+    if _email_senders_enabled():
+        register_senders(mcp)
 
     # Tools that need credentials (pass credentials if provided)
     # web_search supports multiple providers (Google, Brave) with auto-detection
@@ -189,11 +235,11 @@ def _register_verified(
     register_account_info(mcp, credentials=credentials)
 
     # --- File system + shell ---
-    # File tools (read_file, write_file, edit_file, hashline_edit,
-    # search_files, apply_patch) all share one path policy. ``home``
-    # defaults to CWD here; framework callers that own a session-specific
-    # workspace should call register_file_tools directly with home set.
-    register_file_tools(mcp)
+    # The read/write/edit/search file tools were removed from the agent
+    # surface in favor of the terminal tools (terminal_exec / terminal_rg /
+    # terminal_glob), which default their cwd to the session workdir.
+    # file_ops.py stays for internal helpers (_FilePolicy, V4A patch) and the
+    # standalone files_server.py, but is no longer registered here.
     register_csv(mcp)
     register_excel(mcp)
 

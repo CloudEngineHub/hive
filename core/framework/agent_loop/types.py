@@ -47,24 +47,22 @@ class AgentSpec(BaseModel):
         description="Output keys that can be None without triggering validation errors",
     )
 
-    input_schema: dict[str, dict] = Field(
+    report_schema: dict[str, Any] = Field(
         default_factory=dict,
-        description="Optional schema for input validation.",
-    )
-    output_schema: dict[str, dict] = Field(
-        default_factory=dict,
-        description="Optional schema for output validation.",
+        description=(
+            "Optional JSON-Schema (object) the worker's report_to_parent `data` "
+            "payload must conform to. When set, it specializes the report_to_parent "
+            "tool's `data` parameter and adds a StructuredOutput instruction to the "
+            "system prompt, so the worker is told the exact receipt shape to return. "
+            "Empty = no receipt contract (free-form data)."
+        ),
     )
 
     system_prompt: str | None = Field(default=None, description="System prompt for the LLM")
     tools: list[str] = Field(default_factory=list, description="Tool names this agent can use")
     tool_access_policy: str = Field(
         default="explicit",
-        description=(
-            "'all' = all tools from registry, "
-            "'explicit' = only tools listed in `tools` (default), "
-            "'none' = no tools at all."
-        ),
+        description=("'all' = all tools from registry, 'explicit' = only tools listed in `tools` (default), 'none' = no tools at all."),
     )
     model: str | None = Field(default=None, description="Specific model override")
 
@@ -77,15 +75,6 @@ class AgentSpec(BaseModel):
     max_visits: int = Field(
         default=0,
         description=("Max times this agent executes in one colony run. 0 = unlimited. Set >1 for one-shot agents."),
-    )
-
-    output_model: type[BaseModel] | None = Field(
-        default=None,
-        description="Optional Pydantic model for validating LLM output.",
-    )
-    max_validation_retries: int = Field(
-        default=2,
-        description="Maximum retries when Pydantic validation fails",
     )
 
     client_facing: bool = Field(
@@ -181,17 +170,13 @@ class AgentContext:
     stream_id: str = ""
 
     # ----- Task system fields (see framework/tasks) -------------------
-    # task_list_id: this agent's own session-scoped list, e.g.
-    #   session:{agent_id}:{session_id}. Set by the runner / ColonyRuntime
-    #   before the loop starts; immutable after first task_create.
-    task_list_id: str | None = None
-    # colony_id: set on the queen of a colony AND on every spawned worker
-    #   so workers can render the "picked up" chip and the queen can address
-    #   her colony template via colony_template_* tools.
+    # session_id: this agent's own session-scoped list, keyed by session_id
+    #   (globally unique). Set by the runner / ColonyRuntime before the
+    #   loop starts; immutable after first task_create.
+    session_id: str | None = None
+    # colony_id: set on the queen of a colony AND on every spawned worker;
+    #   scopes the event bus and per-colony storage paths.
     colony_id: str | None = None
-    # picked_up_from: for workers, the (colony_task_list_id, template_task_id)
-    #   pair their session was spawned for. None for the queen and queen-DM.
-    picked_up_from: tuple[str, int] | None = None
 
     dynamic_tools_provider: Any = None
     dynamic_prompt_provider: Any = None
@@ -217,10 +202,93 @@ class AgentContext:
     skills_catalog_prompt: str = ""
     protocols_prompt: str = ""
     skill_dirs: list[str] = field(default_factory=list)
-    default_skill_batch_nudge: str | None = None
-    default_skill_warn_ratio: float | None = None
 
     iteration_metadata_provider: Any = None
+
+    # Optional Callable[[], list[dict]]: returns a snapshot of the queen's
+    # currently active colony workers. Each dict has at least
+    # ``worker_id`` / ``status`` / ``task`` (truncated). Wired by the queen
+    # orchestrator to ``session.colony.get_active_streams``; read by the
+    # active-workers reminder source so the queen is reminded of in-flight
+    # parallel work whenever the user re-engages. None for non-queen
+    # contexts and for queens with no colony runtime.
+    active_workers_provider: Any = None
+
+    # Optional Callable[[], ColonyBinding | None]: resolves the on-disk
+    # colony this agent is bound to. Wired by the queen orchestrator from
+    # ``session.colony.binding`` and by colony worker spawn from
+    # ``input_data['binding']``. Returns ``None`` for an independent-mode
+    # queen (no colony forked yet) — reminder sources that snapshot
+    # tracker / fleet state self-skip on a None binding.
+    colony_binding_provider: Any = None
+
+    # Optional Callable[[], dict]: queen-only. Returns
+    # ``{"active": int, "total": int}`` for the bound colony's worker
+    # registry. Workers leave this None; an independent-mode queen returns
+    # zeroes (or any callable returning a falsy dict) — the source skips.
+    colony_stats_provider: Any = None
+
+    # True when this session was opened as a CRM setup / configuration
+    # conversation — the desktop's "Set up my CRM" / "Configure" doors, which
+    # seed a first message and route into the growth queen's DM.
+    #
+    # It has to be an explicit label because nothing else identifies one:
+    # ``queen_growth`` is also the DEFAULT queen (queen_profiles._DEFAULT_QUEEN_ID)
+    # and the fallback for auto-selection, so "the growth queen is talking" says
+    # only that a user is chatting with the Head of Growth — about anything.
+    crm_setup: bool = False
+
+    # Optional Callable[[], list]: returns the stream's current *searchable*
+    # tools — everything it MAY use that is not always-enabled and not yet
+    # loaded. Queens: wired by the orchestrator to
+    # ``phase_state.get_searchable_tools``. Tiered workers: wired by
+    # ColonyRuntime to ``ToolTierState.get_searchable_tools``. Read by the
+    # searchable-tools reminder source so the agent is told what it can load
+    # via search_tools. None for streams that carry their full tool schemas
+    # up front (the split disabled).
+    searchable_tools_provider: Any = None
+
+    # Optional Callable[[], str]: queen-only. Returns the queen's phase-filtered
+    # skills catalog (the ``<available_skills>`` block). Wired by the queen
+    # orchestrator to ``phase_state.render_skills_catalog``; read by the skills
+    # reminder source. Distinct from ``dynamic_skills_catalog_provider`` (which
+    # feeds the worker prompt-build path) — this one is consumed ONLY by the
+    # reminder, so the catalog rides the conversation instead of the prompt.
+    queen_skills_catalog_provider: Any = None
+
+    # Optional Callable[[], list[str]]: returns the tool names this stream has
+    # loaded via search_tools this session (queen: ``phase_state.loaded_tool_names``;
+    # tiered worker: ``ToolTierState.loaded_tool_names``). Read by the
+    # searchable-tools reminder so a tool that LEFT the searchable set because
+    # it was loaded (now eager) is dropped silently, while one that left
+    # because it was removed from the allowed pool is announced as "no longer
+    # available".
+    loaded_tool_names_provider: Any = None
+
+    # Optional ToolTierState (framework.tools.tool_tiers): the worker-side
+    # eager/searchable split engine, set by ColonyRuntime at spawn when the
+    # worker keep-set is configured. When present, the loop appends a
+    # synthetic ``search_tools`` for parallel workers and refuses dispatch of
+    # searchable-not-yet-loaded names with an instructive error. Queens keep
+    # their split inside QueenPhaseState and leave this None.
+    tool_tier_state: Any = None
+
+    # Optional Callable[[dict], str | None]: queen-only sink invoked by
+    # the task_create(new_colony=true) synthetic intercept to hand the
+    # rich payload (goal/handoff/tasks) to the queen orchestrator, which
+    # stashes it on the Session so the colony-spawn route handler can
+    # pick it up when the user confirms the popup.
+    #
+    # Returning a non-empty string from the sink VETOES the pivot — the
+    # intercept treats the return value as the error message and surfaces
+    # it as an is_error tool result instead of opening the popup. Used to
+    # block re-pivot on a freshly-forked colony (``fork_kickoff_pending``)
+    # without leaking session knowledge into agent_loop. Returning None
+    # accepts the payload.
+    #
+    # Wired only for queens whose phase exposes new_colony; None elsewhere
+    # (the intercept rejects the call before reaching this sink in that case).
+    pivot_payload_sink: Any = None
 
     @property
     def is_queen_stream(self) -> bool:
@@ -248,6 +316,10 @@ class AgentResult:
 
     tokens_used: int = 0
     latency_ms: int = 0
+    # Cumulative tool calls actually dispatched across the whole execute()
+    # run (the loop's lifetime tool-call counter). Feeds colony-level
+    # budget adaptation: successful workers' consumption defines the norm.
+    tool_calls_used: int = 0
 
     validation_errors: list[str] = field(default_factory=list)
 

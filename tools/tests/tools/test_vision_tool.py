@@ -22,9 +22,7 @@ def mcp() -> FastMCP:
 def sample_image(tmp_path: Path) -> Path:
     """Create a small test image file."""
     # Create a minimal valid PNG (1x1 pixel)
-    png_data = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-    )
+    png_data = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
     image_file = tmp_path / "test.png"
     image_file.write_bytes(png_data)
     return image_file

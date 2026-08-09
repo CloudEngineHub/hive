@@ -37,12 +37,28 @@ ADEN_ENV_VAR = "ADEN_API_KEY"
 def load_credential_key() -> str | None:
     """Load HIVE_CREDENTIAL_KEY with priority: env > file > shell config.
 
-    Sets ``os.environ["HIVE_CREDENTIAL_KEY"]`` as a side-effect when found.
+    Sets ``os.environ["HIVE_CREDENTIAL_KEY"]`` as a side-effect when found,
+    and **persists the key to ``~/.hive/secrets/credential_key`` whenever
+    it came from a non-file source** so subsequent boots without the env
+    var can recover it from disk.
+
+    Without this persistence, a process that was started with the key in
+    its env (e.g. hive serve under supervisord in the sandbox VM, where
+    the env var only lives in the parent's environment) would encrypt
+    credentials with an in-memory key and then lose it on restart —
+    leaving the .enc files on the persistent volume permanently
+    undecryptable. See the boot-warning at
+    `validation.ensure_credential_key_env` for the exact failure mode
+    ("HIVE_CREDENTIAL_KEY is missing but encrypted credentials already
+    exist; not generating a replacement key because it would not
+    decrypt existing credentials").
+
     Returns the key string, or ``None`` if unavailable everywhere.
     """
     # 1. Already in environment (set by parent process, CI, Windows Registry, etc.)
     key = os.environ.get(CREDENTIAL_KEY_ENV_VAR)
     if key:
+        _persist_key_if_missing_or_stale(key)
         return key
 
     # 2. Dedicated secrets file
@@ -55,9 +71,46 @@ def load_credential_key() -> str | None:
     key = _read_from_shell_config(CREDENTIAL_KEY_ENV_VAR)
     if key:
         os.environ[CREDENTIAL_KEY_ENV_VAR] = key
+        _persist_key_if_missing_or_stale(key)
         return key
 
     return None
+
+
+def _persist_key_if_missing_or_stale(key: str) -> None:
+    """Save ``key`` to the credential_key file when the file is absent or
+    contains a different value. Best-effort: failures (e.g. read-only
+    filesystem during a smoke test) are logged but don't propagate, so
+    a callable load doesn't become a fatal one when the on-disk write
+    fails.
+
+    Always-write-when-different (rather than only-when-absent) matters
+    for the case where the parent passes an env var that overrides an
+    older on-disk key: we want the file to track the actually-used key
+    so a restart without the env var still decrypts the data that was
+    just encrypted with this key.
+    """
+    try:
+        existing = _read_credential_key_file()
+        if existing == key:
+            return
+        save_credential_key(key)
+        if existing is None:
+            logger.info(
+                "persisted HIVE_CREDENTIAL_KEY from env to %s for cross-restart durability",
+                CREDENTIAL_KEY_PATH,
+            )
+        else:
+            logger.warning(
+                "HIVE_CREDENTIAL_KEY in env differed from %s; overwrote on-disk key to match env",
+                CREDENTIAL_KEY_PATH,
+            )
+    except Exception:
+        logger.warning(
+            "failed to persist HIVE_CREDENTIAL_KEY to %s; future restarts without the env var may not decrypt the credential store",
+            CREDENTIAL_KEY_PATH,
+            exc_info=True,
+        )
 
 
 def save_credential_key(key: str) -> Path:
@@ -190,7 +243,16 @@ def _read_credential_key_file() -> str | None:
 
 
 def _read_from_shell_config(env_var: str) -> str | None:
-    """Fallback: read an env var from ~/.zshrc or ~/.bashrc."""
+    """Fallback: read an env var from ~/.zshrc or ~/.bashrc.
+
+    Disabled under desktop mode — the runtime's identity must match the
+    Aden user signed into the desktop, never a stray export the developer
+    happened to leave in their shell rc. Without this guard, two users on
+    the same machine (or one user on different tenants) would silently
+    diverge between the desktop UI and the runtime's credential view.
+    """
+    if os.environ.get("HIVE_DESKTOP_MODE") == "1":
+        return None
     try:
         from aden_tools.credentials.shell_config import check_env_var_in_shell_config
 

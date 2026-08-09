@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 
 from framework.server.routes_sessions import (
+    _EVENTS_HISTORY_MAX_FIELD_BYTES,
     _EVENTS_HISTORY_REVERSE_TAIL_THRESHOLD_BYTES,
     _read_events_tail,
+    _truncate_large_event,
 )
 
 
@@ -133,3 +135,41 @@ def test_small_path_various_limits(tmp_path: Path, limit: int) -> None:
     assert [e["i"] for e in events] == list(range(20 - limit, 20))
     assert total == 20
     assert truncated is True
+
+
+# --- _truncate_large_event ------------------------------------------------
+
+
+def test_truncate_strips_full_request_field() -> None:
+    """The diagnostic-only ``full_request`` field is always dropped, even
+    when it happens to be small — old logs carry it on every event."""
+    event = {
+        "type": "context_usage_updated",
+        "data": {"usage_pct": 42, "full_request": {"messages": ["small"]}},
+    }
+    out = _truncate_large_event(event)
+    assert out["data"]["usage_pct"] == 42
+    assert out["data"]["full_request"] == {"_truncated": True, "_reason": "diagnostic_field"}
+    # Input is not mutated.
+    assert event["data"]["full_request"] == {"messages": ["small"]}
+
+
+def test_truncate_replaces_oversized_field() -> None:
+    """Any nested field above the byte cap is replaced with a marker."""
+    big = {"blob": "x" * (_EVENTS_HISTORY_MAX_FIELD_BYTES + 1000)}
+    event = {"type": "tool_call_completed", "data": {"tool_name": "t", "result": big}}
+    out = _truncate_large_event(event)
+    assert out["data"]["tool_name"] == "t"
+    assert out["data"]["result"]["_truncated"] is True
+    assert out["data"]["result"]["_original_bytes"] > _EVENTS_HISTORY_MAX_FIELD_BYTES
+
+
+def test_truncate_leaves_small_events_untouched() -> None:
+    """A normal event is returned unchanged (same object, no copy)."""
+    event = {"type": "client_input_received", "data": {"content": "hello"}}
+    assert _truncate_large_event(event) is event
+
+
+def test_truncate_handles_missing_or_nondict_data() -> None:
+    assert _truncate_large_event({"type": "x"}) == {"type": "x"}
+    assert _truncate_large_event({"type": "x", "data": None}) == {"type": "x", "data": None}

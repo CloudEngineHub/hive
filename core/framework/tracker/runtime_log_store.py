@@ -69,8 +69,7 @@ class RuntimeLogStore:
         import warnings
 
         warnings.warn(
-            f"Reading logs from deprecated location for run_id={run_id}. "
-            "New sessions use unified storage at sessions/<session_id>/logs/",
+            f"Reading logs from deprecated location for run_id={run_id}. New sessions use unified storage at sessions/<session_id>/logs/",
             DeprecationWarning,
             stacklevel=3,
         )

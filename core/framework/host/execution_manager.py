@@ -41,8 +41,7 @@ class ExecutionAlreadyRunningError(RuntimeError):
         self.stream_id = stream_id
         self.active_ids = active_ids
         super().__init__(
-            f"Stream '{stream_id}' already has an active execution: {active_ids}. "
-            "Concurrent executions on the same stream are not allowed."
+            f"Stream '{stream_id}' already has an active execution: {active_ids}. Concurrent executions on the same stream are not allowed."
         )
 
 
@@ -191,8 +190,6 @@ class ExecutionManager:
         skills_catalog_prompt: str = "",
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
-        context_warn_ratio: float | None = None,
-        batch_init_nudge: str | None = None,
         dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = None,
     ):
         """
@@ -220,8 +217,6 @@ class ExecutionManager:
             skills_catalog_prompt: Available skills catalog for system prompt
             protocols_prompt: Default skill operational protocols for system prompt
             skill_dirs: Skill base directories for Tier 3 resource access
-            context_warn_ratio: Token usage ratio to trigger DS-13 preservation warning
-            batch_init_nudge: System prompt nudge for DS-12 batch auto-detection
         """
         self.stream_id = stream_id
         self.entry_spec = entry_spec
@@ -246,8 +241,6 @@ class ExecutionManager:
         self._skills_catalog_prompt = skills_catalog_prompt
         self._protocols_prompt = protocols_prompt
         self._skill_dirs: list[str] = skill_dirs or []
-        self._context_warn_ratio: float | None = context_warn_ratio
-        self._batch_init_nudge: str | None = batch_init_nudge
         self._dynamic_memory_provider_factory = dynamic_memory_provider_factory
 
         _es_logger = logging.getLogger(__name__)
@@ -560,8 +553,7 @@ class ExecutionManager:
             import warnings
 
             warnings.warn(
-                "SessionStore not available, using deprecated exec_* ID format. "
-                "Please ensure AgentRuntime is properly initialized.",
+                "SessionStore not available, using deprecated exec_* ID format. Please ensure AgentRuntime is properly initialized.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -736,12 +728,8 @@ class ExecutionManager:
                         skills_catalog_prompt=self._skills_catalog_prompt,
                         protocols_prompt=self._protocols_prompt,
                         skill_dirs=self._skill_dirs,
-                        context_warn_ratio=self._context_warn_ratio,
-                        batch_init_nudge=self._batch_init_nudge,
                         dynamic_memory_provider=(
-                            self._dynamic_memory_provider_factory(execution_id)
-                            if self._dynamic_memory_provider_factory is not None
-                            else None
+                            self._dynamic_memory_provider_factory(execution_id) if self._dynamic_memory_provider_factory is not None else None
                         ),
                     )
                     # Track executor so inject_input() can reach EventLoopNode instances

@@ -1,17 +1,26 @@
-import { useEffect, useRef, useState } from "react";
-import { X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2, AlertCircle, Camera } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  X, Eye, EyeOff, Check, Pencil, ChevronDown, Zap, ThumbsUp, Loader2,
+  AlertCircle, Camera, LogOut, ExternalLink, CreditCard, BarChart3,
+  Link2, KeyRound, Users, Shield, Bell, Gift, User, PlayCircle, Sparkles,
+} from "lucide-react";
+import { useTutorial } from "./Tutorial/TutorialOverlay";
+import { apiUrl } from "@/api/client";
 import { useColony } from "@/context/ColonyContext";
 import { useTheme } from "@/context/ThemeContext";
+import { useMe } from "@/lib/me";
 import { useModel, LLM_PROVIDERS } from "@/context/ModelContext";
 import { credentialsApi } from "@/api/credentials";
-import { configApi, type ModelOption } from "@/api/config";
+import { configApi, type ModelOption, type RateLimitEntry } from "@/api/config";
 import { compressImage } from "@/lib/image-utils";
+import { useShowRuntimeLogs } from "@/hooks/use-show-runtime-logs";
 import McpServersPanel from "./McpServersPanel";
+import { Switch } from "./Switch";
 
 interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
-  initialSection?: "profile" | "byok" | "mcp";
+  initialSection?: "profile" | "byok" | "mcp" | "cloud";
 }
 
 function ValidationBadge({ state }: { state: "validating" | { valid: boolean | null; message: string } | undefined }) {
@@ -28,17 +37,45 @@ function StatusText({ icon, color, title, children }: { icon: React.ReactNode; c
 }
 
 export default function SettingsModal({ open, onClose, initialSection }: SettingsModalProps) {
-  const { userProfile, setUserProfile, userAvatarVersion, bumpUserAvatar } = useColony();
-  const { theme, setTheme } = useTheme();
+  const { userProfile, setUserProfile, userAvatarVersion, bumpUserAvatar, userHasAvatar } = useColony();
+  const { theme, setTheme, density, setDensity } = useTheme();
+  const { me, refresh: refreshMe } = useMe();
   const {
     currentProvider, currentModel, connectedProviders, availableModels,
     setModel, saveProviderKey, subscriptions, detectedSubscriptions,
     activeSubscription, activateSubscription,
   } = useModel();
 
-  const [displayName, setDisplayName] = useState(userProfile.displayName);
+  const [displayName, setDisplayName] = useState(
+    me?.user?.full_name ?? userProfile.displayName,
+  );
   const [about, setAbout] = useState(userProfile.about);
-  const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp">(initialSection || "profile");
+  const [savingName, setSavingName] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp" | "cloud" | "help" | "developer" | "rate-limits">(initialSection || "profile");
+  const [showRuntimeLogs, setShowRuntimeLogs] = useShowRuntimeLogs();
+  // null = not yet loaded from the runtime (Switch renders disabled until
+  // the GET resolves). Loaded lazily on first visit to the Developer tab.
+  const [adaptiveBudget, setAdaptiveBudget] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!open || activeSection !== "developer" || adaptiveBudget !== null) return;
+    configApi
+      .getFeatures()
+      .then((r) => setAdaptiveBudget(r.features.adaptive_tool_budget))
+      .catch(() => setAdaptiveBudget(true));
+  }, [open, activeSection, adaptiveBudget]);
+  const [rateLimits, setRateLimits] = useState<RateLimitEntry[] | null>(null);
+  const [rateLimitDirty, setRateLimitDirty] = useState<Record<string, number>>({});
+  const [rateLimitSaving, setRateLimitSaving] = useState(false);
+  const [rateLimitWarnings, setRateLimitWarnings] = useState<string[]>([]);
+  useEffect(() => {
+    if (!open || activeSection !== "rate-limits" || rateLimits !== null) return;
+    configApi
+      .getRateLimits()
+      .then((r) => setRateLimits(r.limits))
+      .catch(() => setRateLimits([]));
+  }, [open, activeSection, rateLimits]);
+  const { start: startTour } = useTutorial();
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [showKey, setShowKey] = useState(false);
@@ -46,11 +83,18 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   const [validation, setValidation] = useState<Record<string, "validating" | { valid: boolean | null; message: string }>>({});
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [themeDropdownOpen, setThemeDropdownOpen] = useState(false);
-  const avatarUrl = `/api/config/profile/avatar?v=${userAvatarVersion}`;
-  const [avatarFailed, setAvatarFailed] = useState(false);
+  const [densityDropdownOpen, setDensityDropdownOpen] = useState(false);
+  const avatarUrl = apiUrl(`/config/profile/avatar?v=${userAvatarVersion}`);
+  // Start "failed" when the runtime says no avatar exists — that way we
+  // render initials immediately without firing an `<img>` request.
+  const [avatarFailed, setAvatarFailed] = useState(!userHasAvatar);
+  useEffect(() => {
+    setAvatarFailed(!userHasAvatar);
+  }, [userAvatarVersion, userHasAvatar]);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const themeDropdownRef = useRef<HTMLDivElement>(null);
+  const densityDropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!themeDropdownOpen) return;
@@ -63,17 +107,53 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   }, [themeDropdownOpen]);
 
   useEffect(() => {
+    if (!densityDropdownOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (densityDropdownRef.current && !densityDropdownRef.current.contains(e.target as Node))
+        setDensityDropdownOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [densityDropdownOpen]);
+
+  useEffect(() => {
     if (open) {
-      setDisplayName(userProfile.displayName);
+      setDisplayName(me?.user?.full_name ?? userProfile.displayName);
       setAbout(userProfile.about);
+      setNameError(null);
       if (initialSection) setActiveSection(initialSection);
     }
-  }, [open, userProfile, initialSection]);
+  }, [open, me, userProfile, initialSection]);
 
   if (!open) return null;
 
-  const handleSave = () => {
-    setUserProfile({ displayName: displayName.trim(), about: about.trim() });
+  const profileDirty =
+    displayName !== (me?.user?.full_name ?? userProfile.displayName) ||
+    about !== userProfile.about;
+
+  const handleSave = async () => {
+    const trimmedName = displayName.trim();
+    const trimmedAbout = about.trim();
+    setNameError(null);
+
+    if (trimmedName && (trimmedName.length < 1 || trimmedName.length > 120)) {
+      setNameError("Name must be 1–120 characters.");
+      return;
+    }
+
+    setSavingName(true);
+    try {
+      // Persist the profile to the local runtime (no cloud account).
+      await configApi.setProfile(trimmedName, trimmedAbout);
+    } catch {
+      setSavingName(false);
+      setNameError("Could not update profile.");
+      return;
+    }
+    setSavingName(false);
+    void refreshMe();
+
+    setUserProfile({ displayName: trimmedName, about: trimmedAbout });
     onClose();
   };
 
@@ -167,265 +247,414 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
 
-      <div className="relative bg-card border border-border/60 rounded-2xl shadow-2xl w-full max-w-[720px] h-[520px] max-h-[80vh] flex overflow-hidden">
+      <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-[680px] h-[500px] max-h-[80vh] flex overflow-hidden">
         {/* Sidebar */}
-        <div className="w-[180px] flex-shrink-0 border-r border-border/40 py-6 px-3 flex flex-col gap-6">
-          <h2 className="text-sm font-semibold text-foreground px-3">SETTINGS</h2>
-          <div className="flex flex-col gap-1">
-            <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider px-3 mb-1">Account</p>
+        <div className="w-[156px] flex-shrink-0 border-r border-border/40 py-4 px-2 flex flex-col gap-4">
+          <h2 className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-[0.12em] px-2.5">Settings</h2>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Account</p>
             <button
               onClick={() => setActiveSection("profile")}
-              className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "profile" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "profile" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
             >
               Profile
             </button>
           </div>
-          <div className="flex flex-col gap-1">
-            <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider px-3 mb-1">System</p>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">System</p>
             <button
               onClick={() => setActiveSection("byok")}
-              className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "byok" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "byok" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
             >
-              BYOK
+              AI Model
             </button>
             <button
-              onClick={() => setActiveSection("mcp")}
-              className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "mcp" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+              onClick={() => setActiveSection("rate-limits")}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "rate-limits" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
             >
-              MCP Servers
+              Rate Limits
+            </button>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Cloud</p>
+            <button
+              onClick={() => setActiveSection("cloud")}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "cloud" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+            >
+              Dashboard
+            </button>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Help</p>
+            <button
+              onClick={() => setActiveSection("help")}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "help" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+            >
+              Walkthrough
+            </button>
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Advanced</p>
+            <button
+              onClick={() => setActiveSection("developer")}
+              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "developer" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
+            >
+              Developer
             </button>
           </div>
         </div>
 
         {/* Content */}
         <div className="flex-1 flex flex-col min-h-0">
-          <button onClick={onClose} className="absolute top-4 right-4 p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50">
-            <X className="w-4 h-4" />
+          <button onClick={onClose} className="absolute top-3 right-3 p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50">
+            <X className="w-3.5 h-3.5" />
           </button>
 
-          <div className="flex-1 overflow-y-auto overscroll-contain px-8 py-6 flex flex-col gap-6">
+          <div className="flex-1 overflow-y-auto overscroll-contain px-6 py-5 flex flex-col gap-5">
             {activeSection === "profile" && (
               <>
                 <div>
-                  <label className="text-sm font-medium text-foreground mb-2 block">
-                    Display <span className="text-primary">*</span>
+                  <h3 className="text-base font-semibold text-foreground">Profile</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    How you appear in Hive, plus your plan, workspace, and account.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-medium text-muted-foreground/80 uppercase tracking-wider mb-1.5 block">
+                    Display name <span className="text-primary normal-case">*</span>
                   </label>
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2.5">
                     <div className="relative group flex-shrink-0">
-                      <div className="w-10 h-10 rounded-full bg-primary/15 flex items-center justify-center overflow-hidden">
+                      <div className="w-9 h-9 rounded-full bg-primary/15 flex items-center justify-center overflow-hidden">
                         {!avatarFailed ? (
                           <img src={avatarUrl} alt="" className="w-full h-full object-cover" onError={() => setAvatarFailed(true)} />
                         ) : (
-                          <span className="text-xs font-bold text-primary">{initials || "?"}</span>
+                          <span className="text-[11px] font-bold text-primary">{initials || "?"}</span>
                         )}
                       </div>
                       <button
                         onClick={() => avatarInputRef.current?.click()}
                         disabled={uploadingAvatar}
-                        className="absolute inset-0 w-10 h-10 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 cursor-pointer"
+                        className="absolute inset-0 w-9 h-9 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 cursor-pointer"
                         title="Change photo"
                       >
-                        {uploadingAvatar ? <Loader2 className="w-3.5 h-3.5 text-white animate-spin" /> : <Camera className="w-3.5 h-3.5 text-white" />}
+                        {uploadingAvatar ? <Loader2 className="w-3 h-3 text-white animate-spin" /> : <Camera className="w-3 h-3 text-white" />}
                       </button>
                       <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
                     </div>
                     <input
                       type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)}
                       placeholder="Display name"
-                      className="flex-1 bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      maxLength={120}
+                      disabled={savingName}
+                      className="flex-1 h-8 bg-muted/30 border border-border/50 rounded-md px-2.5 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 disabled:opacity-60"
                     />
                   </div>
+                  {nameError && (
+                    <p className="text-[11px] text-red-500 mt-1.5 ml-[2.875rem]">{nameError}</p>
+                  )}
                 </div>
 
                 <div>
-                  <label className="text-sm font-medium text-foreground mb-2 block">About</label>
+                  <label className="text-[11px] font-medium text-muted-foreground/80 uppercase tracking-wider mb-1.5 block">
+                    About <span className="normal-case tracking-normal font-normal text-muted-foreground/60">— your queens remember this</span>
+                  </label>
                   <textarea
                     value={about} onChange={(e) => setAbout(e.target.value)}
-                    placeholder="Tell people about yourself or your organization" rows={4}
-                    className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 resize-none"
+                    placeholder="Your role, company, what you're working on" rows={3}
+                    className="w-full bg-muted/30 border border-border/50 rounded-md px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 resize-none leading-relaxed"
                   />
+                  {profileDirty && (
+                    <div className="flex justify-end mt-2 animate-in fade-in duration-150">
+                      <button
+                        onClick={() => void handleSave()}
+                        disabled={savingName}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-60"
+                      >
+                        {savingName && <Loader2 className="w-3 h-3 animate-spin" />}
+                        Save
+                      </button>
+                    </div>
+                  )}
                 </div>
 
-                <div className="flex items-center justify-between">
-                  <label className="text-sm font-medium text-foreground">Theme</label>
-                  <div className="relative" ref={themeDropdownRef}>
-                    <button onClick={() => setThemeDropdownOpen(!themeDropdownOpen)}
-                      className="flex items-center gap-2 bg-muted/30 border border-border/50 rounded-lg px-3 py-1.5 text-sm text-foreground hover:bg-muted/40">
-                      {theme === "light" ? "Light" : "Dark"}
-                      <ChevronDown className={`w-3.5 h-3.5 text-muted-foreground ${themeDropdownOpen ? "rotate-180" : ""}`} />
-                    </button>
-                    {themeDropdownOpen && (
-                      <div className="absolute right-0 top-full mt-1 bg-card border border-border/60 rounded-lg shadow-xl z-10 min-w-[120px]">
-                        {(["light", "dark"] as const).map((option) => (
-                          <button key={option} onClick={() => { setTheme(option); setThemeDropdownOpen(false); }}
-                            className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 first:rounded-t-lg last:rounded-b-lg ${theme === option ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted/30"}`}>
-                            {theme === option ? <Check className="w-3 h-3 flex-shrink-0" /> : <span className="w-3" />}
-                            <span>{option === "light" ? "Light" : "Dark"}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                <div className="rounded-md border border-border/50 bg-muted/10 px-2.5 py-2">
+                  <p className="text-[9.5px] font-semibold text-muted-foreground/70 uppercase tracking-wider mb-1">
+                    Appearance
+                  </p>
+                  <div className="flex items-center justify-between px-2 py-1">
+                    <span className="text-[13px] text-foreground">Theme</span>
+                    <div className="relative" ref={themeDropdownRef}>
+                      <button onClick={() => setThemeDropdownOpen(!themeDropdownOpen)}
+                        className="flex items-center gap-1.5 h-7 bg-muted/30 border border-border/50 rounded-md px-2.5 text-xs text-foreground hover:bg-muted/40">
+                        {theme === "light" ? "Light" : "Dark"}
+                        <ChevronDown className={`w-3 h-3 text-muted-foreground ${themeDropdownOpen ? "rotate-180" : ""}`} />
+                      </button>
+                      {themeDropdownOpen && (
+                        <div className="absolute right-0 top-full mt-1 bg-card border border-border/60 rounded-md shadow-lg z-10 min-w-[110px] overflow-hidden">
+                          {(["light", "dark"] as const).map((option) => (
+                            <button key={option} onClick={() => { setTheme(option); setThemeDropdownOpen(false); }}
+                              className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 ${theme === option ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted/30"}`}>
+                              {theme === option ? <Check className="w-3 h-3 flex-shrink-0" /> : <span className="w-3" />}
+                              <span>{option === "light" ? "Light" : "Dark"}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between px-2 py-1">
+                    <span className="text-[13px] text-foreground">Density</span>
+                    <div className="relative" ref={densityDropdownRef}>
+                      <button onClick={() => setDensityDropdownOpen(!densityDropdownOpen)}
+                        className="flex items-center gap-1.5 h-7 bg-muted/30 border border-border/50 rounded-md px-2.5 text-xs text-foreground hover:bg-muted/40">
+                        {density === "compact" ? "Compact" : "Spacious"}
+                        <ChevronDown className={`w-3 h-3 text-muted-foreground ${densityDropdownOpen ? "rotate-180" : ""}`} />
+                      </button>
+                      {densityDropdownOpen && (
+                        <div className="absolute right-0 top-full mt-1 bg-card border border-border/60 rounded-md shadow-lg z-10 min-w-[140px] overflow-hidden">
+                          {(["compact", "spacious"] as const).map((option) => (
+                            <button key={option} onClick={() => { setDensity(option); setDensityDropdownOpen(false); }}
+                              className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 ${density === option ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted/30"}`}>
+                              {density === option ? <Check className="w-3 h-3 flex-shrink-0" /> : <span className="w-3" />}
+                              <span>{option === "compact" ? "Compact" : "Spacious"}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                <div className="flex justify-end mt-auto pt-4">
-                  <button onClick={handleSave} className="px-5 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90">Save</button>
+              </>
+            )}
+
+            {activeSection === "help" && (
+              <>
+                <div>
+                  <h3 className="text-base font-semibold text-foreground">Walkthrough</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Walk through the core Hive ideas in about a minute — queens, colonies,
+                    credentials, and the memory/skills/tools knobs that shape every queen.
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    onClose();
+                    // Let the modal's close animation start before kicking off the
+                    // spotlight so the dim layers don't fight each other on mount.
+                    window.setTimeout(() => startTour(), 120);
+                  }}
+                  className="inline-flex items-center gap-2 self-start px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors"
+                >
+                  <PlayCircle className="w-3.5 h-3.5" />
+                  Start walkthrough
+                </button>
+              </>
+            )}
+
+            {activeSection === "developer" && (
+              <>
+                <div>
+                  <h3 className="text-base font-semibold text-foreground">Developer</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Tools for inspecting Hive's internals. Off by default.
+                  </p>
+                </div>
+
+                <div className="flex items-center justify-between rounded-md border border-border/50 bg-muted/10 px-3 py-2.5">
+                  <div className="min-w-0 pr-3">
+                    <p className="text-[12px] font-medium text-foreground">Runtime logs</p>
+                    <p className="text-[11px] text-muted-foreground leading-snug">
+                      Show the floating drawer in the bottom-right that streams stdout/stderr from the Electron main process.
+                    </p>
+                  </div>
+                  <Switch checked={showRuntimeLogs} onChange={setShowRuntimeLogs} />
+                </div>
+
+                <div className="flex items-center justify-between rounded-md border border-border/50 bg-muted/10 px-3 py-2.5">
+                  <div className="min-w-0 pr-3">
+                    <p className="text-[12px] font-medium text-foreground">Adaptive worker budgets</p>
+                    <p className="text-[11px] text-muted-foreground leading-snug">
+                      Colonies learn a tool-call budget from their successful workers and wind down strugglers early.
+                      Applies to running colonies too; colonies with an explicit per-colony setting keep it.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={adaptiveBudget ?? true}
+                    disabled={adaptiveBudget === null}
+                    onChange={(next) => {
+                      setAdaptiveBudget(next);
+                      configApi
+                        .setFeatures({ adaptive_tool_budget: next })
+                        .catch(() => setAdaptiveBudget(!next));
+                    }}
+                  />
                 </div>
               </>
             )}
 
-            {activeSection === "mcp" && <McpServersPanel />}
+            {activeSection === "rate-limits" && (
+              <>
+                <div>
+                  <h3 className="text-base font-semibold text-foreground">Rate Limits</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Cap how many actions colonies can perform per platform to stay within safe usage thresholds.
+                  </p>
+                </div>
+
+                {rateLimits === null ? (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground py-4">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading limits...
+                  </div>
+                ) : rateLimits.length === 0 ? (
+                  <div className="rounded-md border border-border/50 bg-muted/10 px-3 py-4 text-center">
+                    <p className="text-xs text-muted-foreground">
+                      Could not load rate limits. Make sure the runtime is running.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    {Object.entries(
+                      rateLimits.reduce<Record<string, RateLimitEntry[]>>((acc, entry) => {
+                        (acc[entry.platform] ??= []).push(entry);
+                        return acc;
+                      }, {}),
+                    ).map(([platform, entries]) => (
+                      <div key={platform}>
+                        <p className="text-[9.5px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-1.5">
+                          {platform === "linkedin" ? "LinkedIn" : platform === "x" ? "X (Twitter)" : platform}
+                        </p>
+                        <div className="flex flex-col gap-1.5">
+                          {entries.map((entry) => {
+                            const prefix = `${entry.platform}.${entry.action_type}`;
+                            const windows = (["hourly", "daily", "weekly"] as const).filter(
+                              (w) => entry[`${w}_default` as keyof typeof entry] != null,
+                            );
+                            return (
+                              <div key={prefix} className="rounded-md border border-border/50 bg-muted/10 px-3 py-2">
+                                <p className="text-[12px] font-medium text-foreground capitalize mb-1">
+                                  {entry.action_type.replace(/_/g, " ")}
+                                </p>
+                                <div className="flex items-center gap-3 flex-wrap">
+                                  {(() => {
+                                    let anyOver = false;
+                                    const inputs = windows.map((w) => {
+                                      const key = `${prefix}.${w}`;
+                                      const val = rateLimitDirty[key] ?? (entry[w] as number);
+                                      const ceiling = entry[`${w}_max` as keyof typeof entry] as number | undefined;
+                                      const overCeiling = ceiling != null && val > ceiling;
+                                      if (overCeiling) anyOver = true;
+                                      return (
+                                        <label key={w} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                                          <span className="capitalize">{w}</span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            value={val}
+                                            onChange={(e) => {
+                                              const v = parseInt(e.target.value, 10);
+                                              if (!isNaN(v)) setRateLimitDirty((d) => ({ ...d, [key]: v }));
+                                            }}
+                                            className={`w-14 h-6 bg-muted/30 border rounded px-1.5 text-xs text-foreground text-center focus:outline-none focus:ring-1 focus:ring-primary/40 ${overCeiling ? "border-amber-500/70" : "border-border/50"}`}
+                                          />
+                                          <span className={`text-[10px] ${overCeiling ? "text-amber-500" : "text-muted-foreground/60"}`}>
+                                            / {ceiling ?? "—"}
+                                          </span>
+                                        </label>
+                                      );
+                                    });
+                                    return (
+                                      <>
+                                        {inputs}
+                                        {anyOver && (
+                                          <p className="w-full text-[10px] text-amber-500/90 mt-1">
+                                            Exceeding the recommended limit increases the risk of account restrictions or bans.
+                                          </p>
+                                        )}
+                                      </>
+                                    );
+                                  })()}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                    {Object.keys(rateLimitDirty).length > 0 && (
+                      <div className="flex items-center justify-end gap-2 pt-1">
+                        <button
+                          onClick={() => setRateLimitDirty({})}
+                          className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted/30 transition-colors"
+                        >
+                          Reset
+                        </button>
+                        <button
+                          disabled={rateLimitSaving}
+                          onClick={async () => {
+                            setRateLimitSaving(true);
+                            setRateLimitWarnings([]);
+                            try {
+                              const res = await configApi.setRateLimits(rateLimitDirty);
+                              setRateLimits(res.limits);
+                              setRateLimitDirty({});
+                              if (res.warnings?.length) setRateLimitWarnings(res.warnings);
+                            } catch {}
+                            setRateLimitSaving(false);
+                          }}
+                          className="h-7 px-3 text-xs font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 transition-colors flex items-center gap-1.5"
+                        >
+                          {rateLimitSaving && <Loader2 className="w-3 h-3 animate-spin" />}
+                          Save
+                        </button>
+                      </div>
+                    )}
+                    {rateLimitWarnings.length > 0 && (
+                      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 flex gap-2">
+                        <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+                        <div className="text-[11px] text-amber-200/90 leading-relaxed">
+                          <p className="font-medium text-amber-400 mb-0.5">Values above recommended maximums</p>
+                          {rateLimitWarnings.map((w, i) => (
+                            <p key={i}>{w}</p>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
 
             {activeSection === "byok" && (
               <>
                 <div>
-                  <h3 className="text-lg font-semibold text-foreground">Bring Your Own Key</h3>
-                  <p className="text-sm text-muted-foreground mt-1">
-                    Use your own API keys for hosted model providers. Your keys are encrypted and never shared.
+                  <h3 className="text-base font-semibold text-foreground">AI Model</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Choose the model that powers your hive. Each is optimized for a different part of the workflow.
                   </p>
                 </div>
 
-                {/* Active Model */}
-                <div>
-                  <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-3">Active Model</p>
-                  <div className="relative">
-                    <button onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
-                      className="w-full flex items-center justify-between bg-muted/30 border border-border/50 rounded-lg px-4 py-3 text-left hover:bg-muted/40">
-                      <div>
-                        <p className="text-sm font-medium text-foreground">{currentModelLabel}</p>
-                        <p className="text-xs text-muted-foreground">{currentProviderName}</p>
-                      </div>
-                      <ChevronDown className={`w-4 h-4 text-muted-foreground ${modelDropdownOpen ? "rotate-180" : ""}`} />
-                    </button>
-                    {modelDropdownOpen && (
-                      <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border/60 rounded-lg shadow-xl z-10 max-h-[280px] overflow-y-auto overscroll-contain">
-                        {selectableProviders.length === 0 ? (
-                          <p className="px-4 py-3 text-sm text-muted-foreground">Add an API key or enable a subscription to see available models.</p>
-                        ) : selectableProviders.map((provider) => (
-                          <div key={provider.id}>
-                            <p className="px-4 pt-3 pb-0.5 text-sm font-medium text-foreground">{provider.name}</p>
-                            {(availableModels[provider.id] || []).map((model: ModelOption) => {
-                              const isActive = currentProvider === provider.id && currentModel === model.id && !activeSubscription;
-                              return (
-                                <button key={model.id} onClick={() => handleSelectModel(provider.id, model.id)}
-                                  className={`w-full text-left pl-8 pr-4 py-2 text-sm flex items-center gap-2 ${isActive ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted/30"}`}>
-                                  {isActive ? <Check className="w-3 h-3 flex-shrink-0" /> : <span className="w-3" />}
-                                  <span>{model.label}</span>
-                                  {model.recommended && (
-                                    <span className="ml-auto inline-flex items-center justify-center rounded bg-primary/10 text-primary p-1 flex-shrink-0" title="Recommended">
-                                      <ThumbsUp className="w-3 h-3" />
-                                    </span>
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Subscriptions */}
-                {subscriptions.length > 0 && (
-                  <div>
-                    <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-3">Subscriptions</p>
-                    <div className="flex flex-col gap-1">
-                      {subscriptions.map((sub) => {
-                        const isDetected = detectedSubscriptions.has(sub.id);
-                        const isActive = activeSubscription === sub.id;
-                        return (
-                          <div key={sub.id} className="flex items-center gap-3 py-2.5 px-2 rounded-lg hover:bg-muted/20">
-                            <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                              <Zap className="w-4 h-4 text-primary" />
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-foreground">{sub.name}</p>
-                              <p className="text-xs text-muted-foreground truncate">{sub.description}</p>
-                            </div>
-                            {isActive ? (
-                              <StatusText icon={<Check className="w-3 h-3" />} color="green">Active</StatusText>
-                            ) : isDetected ? (
-                              <button onClick={() => handleActivateSubscription(sub.id)}
-                                className="px-3 py-1.5 rounded-md text-xs font-semibold bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25">
-                                Enable
-                              </button>
-                            ) : (
-                              <span className="text-xs text-muted-foreground/50">Not detected</span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* API Keys */}
-                <div>
-                  <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-3">API Keys</p>
-                  <div className="flex flex-col gap-1">
-                    {LLM_PROVIDERS.map((provider) => {
-                      const isConnected = connectedProviders.has(provider.id);
-                      const isEditing = editingProvider === provider.id;
-                      return (
-                        <div key={provider.id}>
-                          <div className="flex items-center gap-3 py-2.5 px-2 rounded-lg hover:bg-muted/20">
-                            <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                              <span className="text-sm font-bold text-primary">{provider.initial}</span>
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-foreground">{provider.name}</p>
-                              <p className="text-xs text-muted-foreground truncate">{provider.description}</p>
-                            </div>
-                            {isConnected && !isEditing ? (
-                              <div className="flex items-center gap-2">
-                                <ValidationBadge state={validation[provider.id]} />
-                                <button onClick={() => startEditing(provider.id)} className="p-1 rounded text-muted-foreground/40 hover:text-foreground" title="Change key">
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            ) : !isEditing ? (
-                              <button onClick={() => startEditing(provider.id)}
-                                className="px-3 py-1.5 rounded-md text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90">
-                                Add Key
-                              </button>
-                            ) : null}
-                          </div>
-                          {isEditing && (
-                            <div className="ml-12 mr-2 mb-2 flex flex-col gap-1.5">
-                              <div className="flex items-center gap-2">
-                                <div className="relative flex-1">
-                                  <input
-                                    type={showKey ? "text" : "password"} value={keyInput}
-                                    onChange={(e) => setKeyInput(e.target.value)}
-                                    placeholder={`Enter ${provider.name} API key`} autoFocus
-                                    onKeyDown={(e) => { if (e.key === "Enter") handleSaveKey(provider.id); if (e.key === "Escape") cancelEditing(); }}
-                                    className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 pr-9 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 font-mono"
-                                  />
-                                  <button onClick={() => setShowKey(!showKey)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground/50 hover:text-foreground">
-                                    {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                                  </button>
-                                </div>
-                                <button onClick={() => handleSaveKey(provider.id)} disabled={!keyInput.trim() || saving}
-                                  className="px-3 py-2 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
-                                  {saving ? "..." : "Save"}
-                                </button>
-                                <button onClick={cancelEditing} className="px-3 py-2 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30">Cancel</button>
-                              </div>
-                              {validation[provider.id] === "validating" && (
-                                <StatusText icon={<Loader2 className="w-3 h-3 animate-spin" />} color="muted">Verifying...</StatusText>
-                              )}
-                              {validation[provider.id] && typeof validation[provider.id] === "object" && (validation[provider.id] as { valid: boolean | null; message: string }).valid === false && (
-                                <StatusText icon={<AlertCircle className="w-3 h-3" />} color="red">
-                                  {(validation[provider.id] as { message: string }).message}
-                                </StatusText>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
+                <div className="flex-shrink-0 flex flex-col gap-3">
+                  <p className="text-[9.5px] font-semibold text-muted-foreground/60 uppercase tracking-wider -mb-1">
+                    Hive lineup
+                  </p>
+                  <HiveModelCard
+                    name="Hive 2.1"
+                    badge="Default"
+                    description="The core reasoning model behind every Queen Bee. Optimized for strategic planning, conversation, tool orchestration, and long-context decision-making. Best for single-agent tasks that require depth and nuance."
+                    selected={!modelDropdownOpen}
+                    onSelect={() => setModelDropdownOpen(false)}
+                  />
+                  <HiveModelCard
+                    name="Hive-Swarm"
+                    badge="Multi-Agent"
+                    description="Purpose-built for colony operations where multiple Worker Bees run in parallel. Tuned for fast, focused sub-tasks — code generation, data extraction, web scraping — with lower latency and efficient token usage across swarms."
+                    selected={modelDropdownOpen}
+                    onSelect={() => setModelDropdownOpen(true)}
+                  />
                 </div>
               </>
             )}
@@ -435,3 +664,42 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
     </div>
   );
 }
+
+function HiveModelCard({
+  name,
+  badge,
+  description,
+  selected,
+  onSelect,
+}: {
+  name: string;
+  badge: string;
+  description: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      onClick={onSelect}
+      className={`w-full text-left rounded-lg border p-3 transition-all duration-150 ${
+        selected
+          ? "border-primary/40 bg-primary/[0.05] ring-1 ring-primary/20"
+          : "border-border/60 bg-card hover:border-border hover:bg-muted/20"
+      }`}
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${selected ? "bg-primary shadow-[0_0_6px] shadow-primary/40" : "bg-muted-foreground/30"}`} />
+        <span className="text-[13px] font-semibold text-foreground">{name}</span>
+        <span className={`text-[9.5px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded ${
+          selected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+        }`}>
+          {badge}
+        </span>
+      </div>
+      <p className="text-[11.5px] leading-relaxed text-muted-foreground pl-[14px]">
+        {description}
+      </p>
+    </button>
+  );
+}
+

@@ -178,9 +178,7 @@ def _list_env_fallback_accounts() -> list[dict]:
         if spec.credential_group:
             if spec.credential_group in seen_groups:
                 continue
-            group_available = all(
-                _is_configured(n, s) for n, s in CREDENTIAL_SPECS.items() if s.credential_group == spec.credential_group
-            )
+            group_available = all(_is_configured(n, s) for n, s in CREDENTIAL_SPECS.items() if s.credential_group == spec.credential_group)
             if not group_available:
                 continue
             seen_groups.add(spec.credential_group)
@@ -353,9 +351,7 @@ or any other identifier — always use the alias exactly as shown.
             break
 
     runner.intro_message = (
-        f"Testing {provider}/{alias}{detail} — "
-        f"{len(tools)} tools loaded. "
-        "I'll suggest a read-only API call to verify the credential works."
+        f"Testing {provider}/{alias}{detail} — {len(tools)} tools loaded. I'll suggest a read-only API call to verify the credential works."
     )
 
 
@@ -397,9 +393,7 @@ directly into the session environment and tools read it automatically.
             break
 
     runner.intro_message = (
-        f"Testing {provider}/{alias}{detail} — "
-        f"{len(tools)} tools loaded. "
-        "I'll suggest a test API call to verify the credential works."
+        f"Testing {provider}/{alias}{detail} — {len(tools)} tools loaded. I'll suggest a test API call to verify the credential works."
     )
 
 
@@ -461,7 +455,7 @@ conversation_mode = "continuous"
 identity_prompt = "You are a credential tester that verifies connected accounts and API keys can make real API calls."
 loop_config = {
     "max_iterations": 50,
-    "max_tool_calls_per_turn": 30,
+    "tool_call_budget": 30,
 }
 
 # ---------------------------------------------------------------------------
@@ -546,14 +540,11 @@ class CredentialTesterAgent:
             max_tokens=self.config.max_tokens,
             loop_config={
                 "max_iterations": 50,
-                "max_tool_calls_per_turn": 30,
+                "tool_call_budget": 30,
                 "max_context_tokens": get_max_context_tokens(),
             },
             conversation_mode="continuous",
-            identity_prompt=(
-                f"You are testing the {provider}/{alias} credential. "
-                "Help the user verify it works by making real API calls."
-            ),
+            identity_prompt=(f"You are testing the {provider}/{alias} credential. Help the user verify it works by making real API calls."),
         )
 
     def _setup(self) -> None:

@@ -33,6 +33,17 @@ class RestoredState:
     recent_responses: list[str]
     recent_tool_fingerprints: list[list[tuple[str, str]]]
     pending_input: dict[str, Any] | None
+    # Whether the user explicitly clicked Stop before the process exited.
+    # Persisted because `_user_stopped` is otherwise an in-memory flag —
+    # without persistence, killing the runtime drops it, and the queen
+    # resumes after restart (the very bug the user-stop flag prevents).
+    user_stopped: bool
+    # Cumulative tool calls executed across the whole run so far. Persisted
+    # so a resumed worker's lifetime tool-call budget
+    # (LoopConfig.tool_call_lifetime_budget) is a TRUE cap across resumes
+    # rather than refilling to 0 each time the loop is re-entered. 0 when
+    # the cursor predates this field (older checkpoints).
+    tool_calls_used: int = 0
 
 
 async def restore(
@@ -102,13 +113,17 @@ async def restore(
     pending_input = cursor.get("pending_input")
     if not isinstance(pending_input, dict):
         pending_input = None
+    user_stopped = bool(cursor.get("user_stopped", False))
+    tool_calls_used = int(cursor.get("tool_calls_used", 0) or 0)
 
     logger.info(
         f"Restored event loop: iteration={start_iteration}, "
         f"messages={conversation.message_count}, "
         f"outputs={list(accumulator.values.keys())}, "
         f"stall_window={len(recent_responses)}, "
-        f"doom_window={len(recent_tool_fingerprints)}"
+        f"doom_window={len(recent_tool_fingerprints)}, "
+        f"user_stopped={user_stopped}, "
+        f"tool_calls_used={tool_calls_used}"
     )
     return RestoredState(
         conversation=conversation,
@@ -117,6 +132,8 @@ async def restore(
         recent_responses=recent_responses,
         recent_tool_fingerprints=recent_tool_fingerprints,
         pending_input=pending_input,
+        user_stopped=user_stopped,
+        tool_calls_used=tool_calls_used,
     )
 
 
@@ -130,11 +147,18 @@ async def write_cursor(
     recent_responses: list[str] | None = None,
     recent_tool_fingerprints: list[list[tuple[str, str]]] | None = None,
     pending_input: dict[str, Any] | None = None,
+    user_stopped: bool = False,
+    tool_calls_used: int = 0,
 ) -> None:
     """Write checkpoint cursor for crash recovery.
 
     Persists iteration counter, accumulator outputs, and stall/doom-loop
     detection state so that resume picks up exactly where execution stopped.
+    ``user_stopped`` carries the explicit-stop flag across restarts so a
+    user-cancelled queen doesn't auto-resume after the runtime is killed.
+    ``tool_calls_used`` carries the cumulative tool-call count so a resumed
+    worker's lifetime tool-call budget caps across resumes instead of
+    refilling.
     """
     if conversation_store:
         cursor = await conversation_store.read_cursor() or {}
@@ -143,6 +167,7 @@ async def write_cursor(
                 "iteration": iteration,
                 "node_id": ctx.agent_id,
                 "outputs": accumulator.to_dict(),
+                "tool_calls_used": tool_calls_used,
             }
         )
         # Persist stall/doom-loop detection state for reliable resume
@@ -154,6 +179,7 @@ async def write_cursor(
         # Persist blocked-input state so restored runs re-block instead of
         # manufacturing a synthetic continuation turn.
         cursor["pending_input"] = pending_input
+        cursor["user_stopped"] = user_stopped
         await conversation_store.write_cursor(cursor)
 
 
@@ -163,16 +189,24 @@ async def drain_injection_queue(
     *,
     ctx: NodeContext,
     caption_image_fn: (Callable[[str, list[dict[str, Any]]], Awaitable[tuple[str, str] | None]] | None) = None,
+    on_client_input_committed: (Callable[[int, str | None], Awaitable[None]] | None) = None,
 ) -> int:
     """Drain all pending injected events as user messages. Returns count.
 
-    ``caption_image_fn`` is the unified vision fallback hook. It takes
+    ``caption_image_fn`` is the unified vision fallback hook
+    (``caption_tool_image`` from the vision_fallback module). It takes
     ``(intent, image_content)`` and returns ``(caption, model)`` on
     success — the model id is logged so the destination is observable.
-    The user's typed ``content`` (the injected message body) is passed
-    as the intent so the captioner can answer the user's specific
-    question about the image rather than producing a generic
-    description; an empty content falls back to a generic intent.
+    Single entry point for image-to-text on text-only models; the
+    previous hidden generic chain (gpt-4o-mini / claude-3-haiku /
+    gemini-flash) was removed in favor of the configured
+    ``vision_fallback`` block so the destination is always controlled
+    by ``configuration.json``.
+
+    ``on_client_input_committed(seq, correlation_id)`` is invoked right after
+    each client-input message is added, so the caller can emit a
+    CLIENT_INPUT_COMMITTED event carrying the true injection time + conversation
+    seq. Only fired for client input (not external events).
     """
     count = 0
     logger.debug(
@@ -181,7 +215,30 @@ async def drain_injection_queue(
     )
     while not queue.empty():
         try:
-            content, is_client_input, image_content = queue.get_nowait()
+            content, is_client_input, image_content, correlation_id = queue.get_nowait()
+            # Filter out non-data-URI attachments (e.g. hive:// URLs from
+            # session replay) — only base64 data URIs can be sent to LLMs.
+            # Two shapes are accepted: legacy image_url blocks and native
+            # `file` blocks (used by the chat upload path for PDFs so
+            # LiteLLM auto-remaps per provider, and by the sidecar's PDF
+            # filter — keep these in sync).
+            if image_content:
+
+                def _is_data_uri_block(block: dict[str, Any]) -> bool:
+                    iu = block.get("image_url")
+                    if isinstance(iu, dict):
+                        url = iu.get("url")
+                        return isinstance(url, str) and url.startswith("data:")
+                    if block.get("type") == "file":
+                        file_obj = block.get("file")
+                        if isinstance(file_obj, dict):
+                            data = file_obj.get("file_data")
+                            return isinstance(data, str) and data.startswith("data:")
+                    return False
+
+                image_content = [img for img in image_content if _is_data_uri_block(img)]
+                if not image_content:
+                    image_content = None
             logger.info(
                 "[drain] injected message (client_input=%s, images=%d): %s",
                 is_client_input,
@@ -214,11 +271,15 @@ async def drain_injection_queue(
             stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
             if is_client_input:
                 stamped = f"[{stamp}] {content}" if content else f"[{stamp}]"
-                await conversation.add_user_message(
+                msg = await conversation.add_user_message(
                     stamped,
                     is_client_input=True,
                     image_content=image_content,
                 )
+                if on_client_input_committed is not None:
+                    # Announce the real injection moment + seq (this boundary
+                    # drain) so the UI can position the bubble accurately.
+                    await on_client_input_committed(msg.seq, correlation_id)
             else:
                 await conversation.add_user_message(f"[{stamp}] [External event] {content}")
             count += 1

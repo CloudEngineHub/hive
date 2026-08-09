@@ -26,6 +26,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,8 @@ from .base import CredentialError, CredentialSpec
 if TYPE_CHECKING:
     from framework.credentials import CredentialStore
 
+logger = logging.getLogger(__name__)
+
 
 # Worker profiles inject their per-provider account aliases into this
 # ContextVar before each tool turn. When a tool calls
@@ -43,9 +46,7 @@ if TYPE_CHECKING:
 # that alias for the lookup. An explicit non-empty alias on the call wins.
 # Keys are credential ids (matching ``CredentialSpec.credential_id``);
 # values are the account alias to route to.
-_active_account_overrides: ContextVar[dict[str, str] | None] = ContextVar(
-    "hive_credential_account_overrides", default=None
-)
+_active_account_overrides: ContextVar[dict[str, str] | None] = ContextVar("hive_credential_account_overrides", default=None)
 
 
 @contextmanager
@@ -64,6 +65,40 @@ def account_overrides(overrides: dict[str, str] | None):
         yield
     finally:
         _active_account_overrides.reset(token)
+
+
+# Marks the current execution as a queen turn so the credential adapter
+# refuses to silently pick an account when more than one is authorized
+# for a provider. Queens have no ``worker.json`` profile to pin a
+# default account, so the right behavior is to "pressure back" and
+# force the LLM to pass ``account=<alias>``. Workers leave this False
+# and keep their existing fallthrough semantics.
+_strict_account_mode: ContextVar[bool] = ContextVar("hive_credential_strict_account_mode", default=False)
+
+
+@contextmanager
+def queen_strict_account_mode():
+    """Enable strict-account-mode for the duration of the ``with`` block.
+
+    Queen execution paths wrap ``agent_loop.execute()`` with this so
+    multi-account ambiguity surfaces as an ``AccountSelectionRequiredError``
+    the LLM can recover from, instead of a silent first-account-wins.
+    """
+    token = _strict_account_mode.set(True)
+    try:
+        yield
+    finally:
+        _strict_account_mode.reset(token)
+
+
+def is_strict_account_mode() -> bool:
+    """True when the current task is running under queen strict mode.
+
+    Read from the parent's tool-dispatch path so it can pre-flight
+    multi-account ambiguity for OAuth tools BEFORE handing them off to
+    the stdio MCP subprocess (where this ContextVar is invisible).
+    """
+    return _strict_account_mode.get()
 
 
 # Process-wide memoization for CredentialStoreAdapter.default().
@@ -172,6 +207,57 @@ class CredentialStoreAdapter:
                     if aliased is not None:
                         return aliased
 
+            # Queen strict mode — when more than one account is authorized
+            # for this provider and no worker-profile override resolved,
+            # refuse to silently pick the first-indexed credential. The
+            # tool runner converts the raised exception into a structured
+            # ``account_selection_required`` tool result so the queen LLM
+            # can ask the user which account to use.
+            if _strict_account_mode.get():
+                spec = self._specs.get(name)
+                provider_name = getattr(spec, "aden_provider_name", "") or name
+                try:
+                    accounts = self._store.list_accounts(provider_name)
+                except Exception:
+                    # Best-effort: if listing fails we'd rather fall through
+                    # to the default lookup than hide a real error from the
+                    # LLM behind an account-selection prompt.
+                    accounts = []
+                # Collected/BYOK local accounts also count toward ambiguity —
+                # otherwise the local fallback below could silently pick one
+                # (or fail) when several exist, defeating strict mode.
+                local_accounts = []
+                try:
+                    from framework.credentials.local.registry import LocalCredentialRegistry
+
+                    local_accounts = LocalCredentialRegistry.default().list_accounts(name)
+                except Exception:
+                    local_accounts = []
+                if len(accounts) + len(local_accounts) > 1:
+                    from framework.credentials.models import (
+                        AccountSelectionRequiredError,
+                    )
+
+                    raise AccountSelectionRequiredError(
+                        credential_id=name,
+                        provider=provider_name,
+                        message=(f"Multiple {provider_name} accounts are authorized; specify which one to use via account=<alias>."),
+                        available_accounts=[
+                            {
+                                "alias": acct.get("alias", ""),
+                                "identity": acct.get("identity", {}) or {},
+                            }
+                            for acct in accounts
+                        ]
+                        + [
+                            {
+                                "alias": la.alias,
+                                "identity": la.identity.to_dict(),
+                            }
+                            for la in local_accounts
+                        ],
+                    )
+
         if account is not None:
             try:
                 from framework.credentials.local.registry import LocalCredentialRegistry
@@ -183,7 +269,7 @@ class CredentialStoreAdapter:
                 pass  # Fall through to standard store lookup
 
         try:
-            return self._store.get(name, raise_on_refresh_failure=True)
+            value = self._store.get(name, raise_on_refresh_failure=True)
         except Exception as exc:
             # CredentialExpiredError must propagate for the tool runner to
             # convert into a structured result. Only enrich help_url here
@@ -195,6 +281,30 @@ class CredentialStoreAdapter:
                 if spec is not None:
                     exc.help_url = spec.help_url
             raise
+
+        if value is None and account is None:
+            # No Aden/store credential resolved. Fall back to a single
+            # collected local account (LocalCredentialRegistry) so a provider
+            # tool that calls get(name) without an alias still resolves the
+            # one stored key. Stays None when 0 or >1 local accounts exist —
+            # the multi-account case must be disambiguated with account=.
+            local = self._single_local_account_key(name)
+            if local is not None:
+                return local
+        return value
+
+    def _single_local_account_key(self, name: str) -> str | None:
+        """Return the key of the sole local account for ``name``, else None."""
+        try:
+            from framework.credentials.local.registry import LocalCredentialRegistry
+
+            registry = LocalCredentialRegistry.default()
+            accounts = registry.list_accounts(name)
+            if len(accounts) == 1:
+                return registry.get_key(name, accounts[0].alias)
+        except Exception:
+            return None
+        return None
 
     def get_spec(self, name: str) -> CredentialSpec:
         """Get the spec for a credential."""
@@ -376,17 +486,42 @@ class CredentialStoreAdapter:
         accounts: list[dict] = []
         seen_specs: set[str] = set()
         seen_accounts: set[tuple[str, str]] = set()
+        lookup_counts: dict[str, int] = {}
 
         for name, spec in self._specs.items():
-            provider = spec.credential_id or name
-            if provider in seen_specs or not self.is_available(name):
+            cred_id = spec.credential_id or name
+            # ``_store.list_accounts`` keys by the OAuth provider name
+            # (``notion``), not the credential_id (``notion_token``).
+            # Notion is the canonical example where the two diverge —
+            # using cred_id silently returned no accounts and made
+            # Notion look permanently disconnected.
+            provider = getattr(spec, "aden_provider_name", "") or cred_id
+            if cred_id in seen_specs:
                 continue
-            seen_specs.add(provider)
-            for acct in self._store.list_accounts(provider):
+            # Isolate each provider: a single unreadable credential (e.g. a
+            # stale .enc encrypted with an old HIVE_CREDENTIAL_KEY) must not
+            # abort enumeration — otherwise one bad file blanks every account
+            # on the Integrations page / browse / queen prompt.
+            try:
+                if not self.is_available(name):
+                    continue
+                provider_accts = self._store.list_accounts(provider)
+            except Exception:
+                logger.debug("get_all_account_info: skipping unreadable provider %s", provider, exc_info=True)
+                continue
+            seen_specs.add(cred_id)
+            lookup_counts[provider] = len(provider_accts)
+            for acct in provider_accts:
                 key = (acct.get("provider", ""), acct.get("alias", ""))
                 if key not in seen_accounts:
                     seen_accounts.add(key)
                     accounts.append(acct)
+
+        # Diagnostic: per-provider account counts. A provider that should
+        # be connected but shows 0 here points at a provider-index key
+        # mismatch between the spec and what Aden returned. Debug-level
+        # since this is fired on every /credentials/oauth-status poll.
+        logger.debug("get_all_account_info: per-provider account counts=%s", lookup_counts)
 
         # Include named local API key accounts
         for acct in self.list_local_accounts():
@@ -428,6 +563,18 @@ class CredentialStoreAdapter:
             return None
         cred = self._store.get_credential_by_alias(provider_name, alias)
         if cred is None:
+            # Locally-collected accounts (LocalCredentialRegistry) live
+            # outside the Aden store index, so get_credential_by_alias misses
+            # them. Resolve directly so MCP tools that route via
+            # get_by_alias(provider, account) can use a collected key.
+            try:
+                from framework.credentials.local.registry import LocalCredentialRegistry
+
+                local_key = LocalCredentialRegistry.default().get_key(provider_name, alias)
+                if local_key is not None:
+                    return local_key
+            except Exception:
+                pass
             return None
         # Re-fetch through get_credential so refresh-on-access fires with
         # raise_on_refresh_failure semantics. Aliased lookups otherwise skip

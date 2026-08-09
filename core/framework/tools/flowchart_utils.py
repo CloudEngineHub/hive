@@ -312,9 +312,7 @@ def synthesize_draft_from_runtime(
         "edges": edges,
         "entry_node": nodes[0]["id"] if nodes else "",
         "terminal_nodes": sorted(terminal_ids),
-        "flowchart_legend": {
-            fc_type: {"shape": meta["shape"], "color": meta["color"]} for fc_type, meta in FLOWCHART_TYPES.items()
-        },
+        "flowchart_legend": {fc_type: {"shape": meta["shape"], "color": meta["color"]} for fc_type, meta in FLOWCHART_TYPES.items()},
     }
 
     return draft, fmap

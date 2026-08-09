@@ -157,9 +157,7 @@ def register_tools(mcp: FastMCP) -> None:
 
         # Grade input
         has_dev_staging = any(
-            i["severity"] in ("medium", "high")
-            and any(kw in i["subdomain"] for kw in ("staging", "dev", "test", "debug"))
-            for i in interesting
+            i["severity"] in ("medium", "high") and any(kw in i["subdomain"] for kw in ("staging", "dev", "test", "debug")) for i in interesting
         )
         has_admin = any(any(kw in i["subdomain"] for kw in ("admin", "backup")) for i in interesting)
         # "reasonable" = fewer than 50 subdomains

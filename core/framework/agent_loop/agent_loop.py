@@ -17,14 +17,15 @@ import logging
 import re
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from framework.agent_loop.conversation import ConversationStore, NodeConversation
 from framework.agent_loop.internals import types as event_loop_types
 from framework.agent_loop.internals.compaction import (
-    build_emergency_summary,
     build_llm_compaction_prompt,
     compact,
     format_messages_for_summary,
@@ -39,7 +40,6 @@ from framework.agent_loop.internals.cursor_persistence import (
     write_cursor,
 )
 from framework.agent_loop.internals.event_publishing import (
-    generate_action_plan,
     log_skip_judge,
     publish_context_usage,
     publish_iteration,
@@ -64,8 +64,11 @@ from framework.agent_loop.internals.stall_detector import (
     is_tool_doom_loop,
     ngram_similarity,
 )
+from framework.agent_loop.internals.credential_tool import build_credentials_tool
+from framework.agent_loop.internals.sentinel_tool import build_sentinel_setup_tool
 from framework.agent_loop.internals.synthetic_tools import (
     build_ask_user_tool,
+    build_collect_result_tool,
     build_escalate_tool,
     build_report_to_parent_tool,
     handle_report_to_parent,
@@ -87,6 +90,17 @@ from framework.agent_loop.internals.types import (
 from framework.agent_loop.internals.vision_fallback import (
     caption_tool_image,
     extract_intent_for_tool,
+    remap_caption_for_crop,
+)
+from framework.agent_loop.reminders import (
+    InterruptCause,
+    LoopActivity,
+    LoopSignals,
+    ParkReason,
+    Reminder,
+    ReminderHub,
+    ReminderPoint,
+    wrap_reminder,
 )
 from framework.agent_loop.types import AgentContext, AgentProtocol, AgentResult
 from framework.config import get_vision_fallback_model
@@ -95,12 +109,12 @@ from framework.llm.capabilities import filter_tools_for_model, supports_image_to
 from framework.llm.provider import Tool, ToolResult, ToolUse
 from framework.llm.stream_events import (
     FinishEvent,
+    ReasoningDeltaEvent,
     StreamErrorEvent,
     TextDeltaEvent,
     ToolCallEvent,
 )
 from framework.tracker.llm_debug_logger import log_llm_turn
-from framework.utils.task_registry import TaskRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +129,13 @@ _INTERNAL_TAGS = frozenset(
         "sentiment",
         "physical_state",
         "tone",
+        # Visible-reasoning scaffold: a persona may emit a <think>…</think>
+        # block (state calibration, addressee/boundary reasoning) before its
+        # spoken line so the grounding tokens exist in-context. It is internal —
+        # strip the WHOLE block from the client snapshot (kept in the stored
+        # part for history/analysis), never just the markers. Without this the
+        # generic pass removes only <think></think> and leaks the reasoning text.
+        "think",
     }
 )
 
@@ -132,6 +153,15 @@ _STRIP_RE = re.compile(
 # so the visible text that follows starts cleanly.
 _LABEL_STRIP_RE = re.compile(r"<(?:" + "|".join(_INTERNAL_TAGS) + r")>[^<\n]*\s*")
 
+# An OPEN <think> that hasn't closed yet (a closed block is consumed by
+# _STRIP_RE before this runs). Unlike the bare-label pillars — one-line
+# prefix labels safely handled by _LABEL_STRIP_RE — <think> wraps MULTI-LINE
+# hidden reasoning. Mid-stream, everything from the opening tag to the end
+# of the snapshot is reasoning and must be truncated; otherwise the label
+# pass strips only the `<think>` marker and the body streams out as visible
+# text (the think-leak: the bot's inner monologue sent to the group).
+_UNCLOSED_THINK_RE = re.compile(r"<think\b", re.IGNORECASE)
+
 # Matches a trailing `<` that could be the start of an internal tag.
 # We build a pattern that matches `<` followed by any prefix of any
 # internal tag name (e.g. `<rela`, `<contex`).
@@ -139,12 +169,81 @@ _PARTIAL_PREFIXES: set[str] = set()
 for _tag in _INTERNAL_TAGS:
     for _i in range(1, len(_tag) + 1):
         _PARTIAL_PREFIXES.add(_tag[:_i])
-_PARTIAL_OPEN_RE = re.compile(
-    r"<(?:" + "|".join(re.escape(p) for p in sorted(_PARTIAL_PREFIXES, key=len, reverse=True)) + r")$"
-)
+_PARTIAL_OPEN_RE = re.compile(r"<(?:" + "|".join(re.escape(p) for p in sorted(_PARTIAL_PREFIXES, key=len, reverse=True)) + r")$")
 
 _GENERIC_TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*\s*/?>")
-_GENERIC_TAG_OR_PARTIAL_RE = re.compile(r"<[a-zA-Z_]|</[a-zA-Z_]|<$")
+# `</?\s*$` also eats a bare trailing `<` or `</` — the amputated stump of a
+# closing tag (e.g. `</think>`) cut off mid-stream. Without the `/` branch a
+# lone `</` at end slipped through (the classic `…line</` leak tail).
+_GENERIC_TAG_OR_PARTIAL_RE = re.compile(r"<[a-zA-Z_]|</[a-zA-Z_]|</?\s*$")
+
+
+def _render_tool_budget_checkpoint(count: int, hard_limit: int) -> str:
+    """Body for an escalating soft tool-call budget checkpoint.
+
+    This is a *checkpoint, not a stop* — the turn-loop keeps running.
+    Its purpose is to keep a long autonomous run from becoming
+    headstrong: pause, confirm the current approach is still working,
+    and switch tactics or consult the user rather than grinding the
+    same path. The hard stop lands at ``hard_limit``.
+    """
+    return (
+        f"Tool-call checkpoint: you've made {count} tool calls in this stretch "
+        f"without yielding the turn (hard stop at {hard_limit}).\n\n"
+        "This is a checkpoint, not a stop. If you're deliberately working a "
+        "long, multi-step mission and you know where you are, keep going\n\n"
+        "But take one honest beat first. If you've been repeating similar "
+        "calls, retrying a failing approach, or have lost the thread: "
+        "Step back and either (a) try a "
+        "genuinely different approach, or (b) if you've hit real difficulty, "
+        "pause and escalate instead of grinding on."
+    )
+
+
+# Grace iteration: the set of tools dispatch will still execute once the
+# agent has exhausted ``max_iterations`` and is in its single wrap-up turn.
+# Everything else gets the neutral ``_GRACE_SKIP_MSG`` placeholder so the
+# agent knows the call landed but did not run, and is forced to spend its
+# last turn on reporting / persisting state rather than starting new work.
+#   - report_to_parent : the terminal channel; without this the queen
+#     receives no SUBAGENT_REPORT for the worker.
+#   - tracker_upsert   : durable progress channel; rows persist even when
+#     the explicit report is thin.
+#   - task_update      : worker-local task-list hygiene; cheap to allow
+#     and aligned with "wrap up" semantics.
+_GRACE_TERMINAL_TOOLS: frozenset[str] = frozenset({"report_to_parent", "tracker_upsert", "task_update"})
+
+_GRACE_SKIP_MSG = (
+    "[Skipped — this is your final (grace) iteration. Only "
+    "report_to_parent, tracker_upsert, and task_update may execute. "
+    "Call report_to_parent now with whatever status you have "
+    "(success, partial, or failed) — do not start new work.]"
+)
+
+_GRACE_REMINDER_BODY = (
+    "[final iteration] Your iteration budget is exhausted. This is your "
+    "LAST turn. Call report_to_parent(status=<success|partial|failed>, "
+    "summary=<one paragraph>, data=<optional>) NOW to deliver your "
+    "results.\n\n"
+    "If you still need to persist findings to shared state you may also "
+    "call tracker_upsert or task_update. ALL OTHER TOOLS WILL BE SKIPPED "
+    "— do not start new work; consolidate what you have and report."
+)
+
+# Variant of the grace reminder used when grace is entered early because
+# the worker exhausted its cumulative (lifetime) tool-call budget rather
+# than its iteration budget. Same wind-down contract — report and stop —
+# but framed around the tool-call budget so the model isn't confused about
+# why it still has iterations left.
+_TOOL_BUDGET_GRACE_REMINDER_BODY = (
+    "[tool-call budget reached] You have used your full tool-call budget "
+    "for this task. This is your LAST turn. Call report_to_parent("
+    "status=<success|partial|failed>, summary=<one paragraph>, "
+    "data=<optional>) NOW to deliver your partial results to the queen.\n\n"
+    "If you still need to persist findings you may also call tracker_upsert "
+    "or task_update. ALL OTHER TOOLS WILL BE SKIPPED — do not start new "
+    "work; consolidate what you have and report."
+)
 
 
 def _strip_internal_tags_from_snapshot(snapshot: str) -> str:
@@ -158,6 +257,13 @@ def _strip_internal_tags_from_snapshot(snapshot: str) -> str:
     """
     # Pass 1: closed <tag>...</tag> blocks
     cleaned = _STRIP_RE.sub("", snapshot)
+
+    # Pass 1.5: an unclosed <think> mid-stream — truncate from the tag to the
+    # end. The visible text stays frozen until the block closes; then Pass 1
+    # removes the whole block and the spoken line flows through.
+    m_think = _UNCLOSED_THINK_RE.search(cleaned)
+    if m_think:
+        cleaned = cleaned[: m_think.start()]
 
     # Pass 2: bare-label <tag> value pairs (value runs to next tag or newline)
     cleaned = _LABEL_STRIP_RE.sub("", cleaned)
@@ -179,6 +285,19 @@ def _strip_internal_tags_from_snapshot(snapshot: str) -> str:
         cleaned = cleaned[: m3.start()]
 
     return cleaned
+
+
+_THINK_REASONING_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_think_reasoning(text: str) -> str:
+    """Concatenate the content of every COMPLETE <think>…</think> block in the
+    accumulated output. This is the hidden reasoning stripped from the visible
+    snapshot; it is surfaced via the CLIENT_REASONING event so monitors can see
+    the grounding the agent did before speaking. Returns "" if no closed block yet.
+    """
+    parts = [m.strip() for m in _THINK_REASONING_RE.findall(text) if m.strip()]
+    return "\n".join(parts)
 
 
 def _vision_fallback_active(model: str | None) -> bool:
@@ -205,18 +324,15 @@ async def _captioning_chain(
     intent: str,
     image_content: list[dict[str, Any]],
 ) -> tuple[str, str] | None:
-    """Configured vision_fallback → retry → ``gemini/gemini-3-flash-preview``.
+    """Configured vision_fallback → ``gemini/gemini-3-flash-preview``.
 
     The Gemini override reuses the configured ``api_key`` / ``api_base``,
     so a Hive subscriber (whose token routes to a multi-model proxy)
     keeps coverage when their primary model glitches. Without
     configured creds litellm falls through to env-based Gemini auth;
     users with neither Hive nor a ``GEMINI_API_KEY`` simply lose the
-    third try.
+    second try.
     """
-    if result := await caption_tool_image(intent, image_content):
-        return result
-    logger.warning("vision_fallback failed; retrying configured model")
     if result := await caption_tool_image(intent, image_content):
         return result
     # Match the configured model's proxy prefix so the override is routed
@@ -231,7 +347,7 @@ async def _captioning_chain(
         override = "kimi/gemini-3-flash-preview"
     else:
         override = "gemini/gemini-3-flash-preview"
-    logger.warning("vision_fallback retry failed; trying %s", override)
+    logger.warning("vision_fallback failed; trying %s", override)
     return await caption_tool_image(intent, image_content, model_override=override)
 
 
@@ -253,18 +369,106 @@ def _is_context_too_large_error(exc: BaseException) -> bool:
     return bool(_CONTEXT_TOO_LARGE_RE.search(str(exc)))
 
 
+def _queen_account_preflight(tc: Any) -> ToolResult | None:
+    """Return an ``account_selection_required`` ToolResult, or None.
+
+    Runs in the parent process before a tool call crosses into the
+    stdio MCP subprocess. The subprocess has its own credential
+    adapter and never sees the parent's strict-mode ContextVar, so the
+    check has to happen here.
+
+    Returns None when:
+      - we're not in queen strict mode,
+      - the tool isn't tied to an OAuth credential,
+      - the LLM already supplied ``account=<alias>``,
+      - or zero/one account is authorized (no ambiguity to resolve).
+    """
+    try:
+        from aden_tools.credentials import CredentialStoreAdapter
+        from aden_tools.credentials.store_adapter import is_strict_account_mode
+    except Exception:
+        return None
+
+    if not is_strict_account_mode():
+        return None
+
+    tool_input = getattr(tc, "tool_input", None)
+    if isinstance(tool_input, dict):
+        supplied = str(tool_input.get("account", "") or "").strip()
+        if supplied:
+            return None
+    elif tool_input is not None:
+        # Non-dict input (rare) — skip the gate; tool will handle.
+        return None
+
+    tool_name = getattr(tc, "tool_name", "") or ""
+    if not tool_name:
+        return None
+
+    try:
+        adapter = CredentialStoreAdapter.default()
+    except Exception:
+        return None
+
+    cred_name = adapter.get_credential_for_tool(tool_name)
+    if cred_name is None:
+        return None  # tool isn't credential-bound, no ambiguity to check
+
+    spec = adapter._specs.get(cred_name)  # noqa: SLF001 — read-only
+    provider_name = getattr(spec, "aden_provider_name", "") or cred_name if spec is not None else cred_name
+
+    try:
+        accounts = adapter._store.list_accounts(provider_name)  # noqa: SLF001
+    except Exception:
+        return None
+
+    if len(accounts) <= 1:
+        return None
+
+    payload = {
+        "error": "account_selection_required",
+        "credential_id": cred_name,
+        "provider": provider_name,
+        "available_accounts": [
+            {
+                "alias": acct.get("alias", ""),
+                "identity": acct.get("identity", {}) or {},
+            }
+            for acct in accounts
+        ],
+        "message": (f"Multiple {provider_name} accounts are authorized; specify which one to use via account=<alias>."),
+        "instructions": (
+            "Multiple accounts are authorized for this provider. "
+            "Ask the user which one to use, then re-call this tool "
+            "with account=<alias> set to one of the listed aliases."
+        ),
+    }
+    return ToolResult(
+        tool_use_id=tc.tool_use_id,
+        content=json.dumps(payload),
+        is_error=True,
+    )
+
+
 def _build_tool_error_result(tc: Any, exc: BaseException) -> ToolResult:
     """Convert a tool exception into a ToolResult for the model.
 
-    Special-cases ``CredentialExpiredError`` so the agent receives a
-    structured ``credential_expired`` payload (with credential_id, provider,
-    alias, reauth_url) instead of an opaque error string. The agent's
-    behavior block recognizes this shape and prompts the user to reauthorize.
+    Special-cases two credential exceptions so the agent receives a
+    structured payload instead of an opaque error string:
+      - ``CredentialExpiredError`` → ``credential_expired`` (the agent's
+        behavior block prompts the user to reauthorize).
+      - ``AccountSelectionRequiredError`` → ``account_selection_required``
+        (queens with 2+ accounts on a provider; the LLM should ask the
+        user which to use and re-call with ``account=<alias>``).
     """
     try:
-        from framework.credentials.models import CredentialExpiredError
+        from framework.credentials.models import (
+            AccountSelectionRequiredError,
+            CredentialExpiredError,
+        )
     except ImportError:
         CredentialExpiredError = None  # type: ignore[assignment]
+        AccountSelectionRequiredError = None  # type: ignore[assignment]
 
     if CredentialExpiredError is not None and isinstance(exc, CredentialExpiredError):
         payload: dict[str, Any] = {
@@ -284,6 +488,25 @@ def _build_tool_error_result(tc: Any, exc: BaseException) -> ToolResult:
             is_error=True,
         )
 
+    if AccountSelectionRequiredError is not None and isinstance(exc, AccountSelectionRequiredError):
+        sel_payload: dict[str, Any] = {
+            "error": "account_selection_required",
+            "credential_id": exc.credential_id,
+            "provider": exc.provider,
+            "available_accounts": exc.available_accounts,
+            "message": str(exc),
+            "instructions": (
+                "Multiple accounts are authorized for this provider. "
+                "Ask the user which one to use, then re-call this tool "
+                "with account=<alias> set to one of the listed aliases."
+            ),
+        }
+        return ToolResult(
+            tool_use_id=tc.tool_use_id,
+            content=json.dumps(sel_payload),
+            is_error=True,
+        )
+
     return ToolResult(
         tool_use_id=tc.tool_use_id,
         content=f"Tool '{tc.tool_name}' raised: {exc}",
@@ -291,12 +514,199 @@ def _build_tool_error_result(tc: Any, exc: BaseException) -> ToolResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
+def _publish_attach_file_result(
+    result: ToolResult,
+    conversation_store: Any,
+) -> ToolResult:
+    """Post-process an ``attach_file`` ToolResult: copy each source file
+    into the session's ``data/attachments/`` directory and inject
+    ``hive_attachment_url`` into the summary JSON so the chip pipeline
+    (assistant message ``images`` field → renderer's AttachmentChip)
+    can surface a clickable chip to the user.
+
+    The framework is the **single** chip publisher — the tool no longer
+    self-publishes (its pooled MCP subprocess is queen-agnostic and
+    can't see the current session's ``$HIVE_STORAGE_PATH``). So every
+    successful attach_file call MUST reach this function for the user
+    to see a chip.
+
+    Loud-failure policy: every short-circuit logs a warning, and if we
+    can't publish at all the result is rewritten as an error so the
+    agent surfaces the failure to the user instead of riding a half-
+    success ("the file is attached" with no chip on the screen).
+    """
+    if conversation_store is None:
+        logger.error(
+            "attach_file: chip publish skipped — conversation_store is None. "
+            "User will not see a chip in chat. tool_use_id=%s",
+            result.tool_use_id,
+        )
+        return _attach_file_publish_failure(result, "no conversation store on agent loop")
+    # The store's base path is ``{session_dir}/conversations/``; the
+    # session dir itself is its parent. Other store implementations
+    # may not have ``_base`` — log loudly if so since chip publishing
+    # depends on a filesystem-backed session.
+    base = getattr(conversation_store, "_base", None)
+    if base is None:
+        logger.error(
+            "attach_file: chip publish skipped — conversation_store=%r has no `_base`. "
+            "User will not see a chip in chat.",
+            type(conversation_store).__name__,
+        )
+        return _attach_file_publish_failure(result, "conversation store has no filesystem base")
+    session_dir = Path(base).parent
+    # attach_file emits its summary as the FIRST TextContent block. The
+    # MCP executor concatenates every TextContent block in the tool's
+    # return list into a single ``result.content`` string, so the JSON
+    # summary is followed by whatever inline text content the tool
+    # produced (the file body for text-shaped formats; nothing for
+    # binary previews / blobs). Use raw_decode to peel off just the
+    # leading JSON object and ignore the trailing text.
+    content = result.content or ""
+    leading_ws_len = len(content) - len(content.lstrip())
+    leading = content[leading_ws_len:]
+    if not leading.startswith("{"):
+        logger.error(
+            "attach_file: result.content does not start with a JSON object — "
+            "cannot publish chip. content[:120]=%r",
+            content[:120],
+        )
+        return _attach_file_publish_failure(result, "tool result is not a JSON summary")
+    try:
+        payload, json_end = json.JSONDecoder().raw_decode(leading)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.error(
+            "attach_file: failed to parse summary JSON for chip publish: %s. content[:120]=%r",
+            exc,
+            content[:120],
+        )
+        return _attach_file_publish_failure(result, f"tool result JSON parse failed: {exc}")
+    if not isinstance(payload, dict):
+        logger.error("attach_file: parsed payload is %s, expected dict", type(payload).__name__)
+        return _attach_file_publish_failure(result, "tool result top-level is not an object")
+    attached = payload.get("attached")
+    if not isinstance(attached, list) or not attached:
+        # Empty `attached` is the tool's own signal that nothing was
+        # successfully attached (every path errored). The tool already
+        # populated `errors` for the agent; nothing to publish.
+        logger.info(
+            "attach_file: nothing to publish (attached=%r, errors=%r)",
+            attached,
+            payload.get("errors"),
+        )
+        return result
+    # Whatever followed the JSON envelope (the inlined text body for
+    # text-shaped attachments) is preserved verbatim — the LLM still
+    # needs to read it on the next turn.
+    trailing = leading[json_end:]
+
+    import shutil as _shutil
+
+    from aden_tools.utils.attachments import (
+        disambiguate_attachment_filename,
+        sanitize_attachment_basename,
+    )
+
+    attachments_dir = session_dir / "data" / "attachments"
+    try:
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.error("attach_file: could not create %s: %s", attachments_dir, exc)
+        return _attach_file_publish_failure(result, f"could not create attachments dir: {exc}")
+
+    logger.info(
+        "attach_file: publishing %d entr%s into %s",
+        len(attached),
+        "y" if len(attached) == 1 else "ies",
+        attachments_dir,
+    )
+    published_count = 0
+    per_entry_errors: list[str] = []
+    for entry in attached:
+        if not isinstance(entry, dict):
+            per_entry_errors.append(f"non-dict entry: {entry!r}")
+            continue
+        resolved = entry.get("resolved") or entry.get("path")
+        if not isinstance(resolved, str):
+            per_entry_errors.append(f"entry missing resolved/path: {entry!r}")
+            continue
+        source = Path(resolved)
+        if not source.is_file():
+            logger.warning("attach_file: source vanished before publish: %s", source)
+            per_entry_errors.append(f"source vanished: {source}")
+            continue
+        base_name = sanitize_attachment_basename(source.name, force_ext=source.suffix.lower())
+        dest_name = disambiguate_attachment_filename(attachments_dir, base_name)
+        dest = attachments_dir / dest_name
+        try:
+            _shutil.copyfile(source, dest)
+        except OSError as exc:
+            logger.warning("attach_file: copy %s → %s failed: %s", source, dest, exc)
+            per_entry_errors.append(f"copy failed for {source.name}: {exc}")
+            continue
+        # Point `resolved` at the copy in the session's attachments dir,
+        # not the original source path — the source (e.g. the tool's CWD)
+        # is queen/colony-agnostic and may not even exist for consumers of
+        # this summary. `hive-attachment://` + this absolute path now agree.
+        entry["resolved"] = str(dest)
+        entry["hive_attachment_url"] = f"hive-attachment://data/attachments/{dest_name}"
+        published_count += 1
+        logger.info("attach_file: published %s → %s", source.name, dest_name)
+
+    if published_count == 0:
+        logger.error(
+            "attach_file: could not publish ANY of %d entries; errors=%r",
+            len(attached),
+            per_entry_errors,
+        )
+        return _attach_file_publish_failure(
+            result,
+            "could not publish any attachment: " + "; ".join(per_entry_errors) if per_entry_errors else "could not publish any attachment",
+        )
+
+    # Re-serialize the summary; preserve the trailing inlined body
+    # (if any) so the LLM still sees the file content on the next turn.
+    return ToolResult(
+        tool_use_id=result.tool_use_id,
+        content=json.dumps(payload) + trailing,
+        is_error=result.is_error,
+        image_content=getattr(result, "image_content", None),
+        is_skill_content=getattr(result, "is_skill_content", False),
+    )
+
+
+def _attach_file_publish_failure(result: ToolResult, reason: str) -> ToolResult:
+    """Rewrite an attach_file ToolResult into a hard failure with a
+    diagnostic the agent can read.
+
+    Without this, the agent sees a "successful" tool call (it returned
+    a summary with paths) and announces the file is delivered — but
+    the user never sees a chip because chip publishing silently
+    no-op'd. That divergence is exactly the bug we're closing.
+    """
+    payload = {
+        "attached": [],
+        "errors": [
+            {
+                "error": (
+                    f"attach_file failed to publish the file as a chip: {reason}. "
+                    "The file was NOT delivered to the user. Tell the user the "
+                    "delivery failed; do not claim the file was sent."
+                ),
+            }
+        ],
+    }
+    return ToolResult(
+        tool_use_id=result.tool_use_id,
+        content=json.dumps(payload),
+        is_error=True,
+        image_content=None,
+        is_skill_content=getattr(result, "is_skill_content", False),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Judge protocol (simple 3-action interface for event loop evaluation)
+# Compatibility and control-flow helpers
 # ---------------------------------------------------------------------------
 
 
@@ -306,17 +716,12 @@ class TurnCancelled(Exception):
     pass
 
 
-# Re-export shared event-loop types from the legacy parent module.
+# Public compatibility aliases for older imports from agent_loop.py.
 SubagentJudge = SharedSubagentJudge
 LoopConfig = event_loop_types.LoopConfig
 HookContext = event_loop_types.HookContext
 HookResult = event_loop_types.HookResult
 OutputAccumulator = event_loop_types.OutputAccumulator
-
-
-# ---------------------------------------------------------------------------
-# EventLoopNode
-# ---------------------------------------------------------------------------
 
 
 class AgentLoop(AgentProtocol):
@@ -363,24 +768,103 @@ class AgentLoop(AgentProtocol):
         self._config = config or LoopConfig()
         self._tool_executor = tool_executor
         self._conversation_store = conversation_store
-        self._injection_queue: asyncio.Queue[tuple[str, bool, list[dict[str, Any]] | None]] = asyncio.Queue()
+        # Tuple: (content, is_client_input, image_content, correlation_id).
+        # correlation_id ties a queued message back to the CLIENT_INPUT_RECEIVED
+        # event emitted at receive time, so the drain can emit a matching
+        # CLIENT_INPUT_COMMITTED carrying the true injection time.
+        self._injection_queue: asyncio.Queue[
+            tuple[str, bool, list[dict[str, Any]] | None, str | None]
+        ] = asyncio.Queue()
         self._trigger_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
         # Queen input blocking state
         self._input_ready = asyncio.Event()
         self._awaiting_input = False
+        # Why the loop is parked, when it is — None when not parked. Each
+        # _await_user_input call site declares its ParkReason; this carries
+        # it to _loop_signals so the idle nudge can tell a legitimate
+        # question-park from a broken or normal-idle one.
+        self._park_reason: ParkReason | None = None
+        # The loop's authoritative top-level state. Owned exclusively by
+        # _set_activity, which announces every change via LOOP_STATE_CHANGED.
+        self._activity: LoopActivity = LoopActivity.EXECUTING
+        self._interrupt_cause: InterruptCause | None = None
+        # True after the user explicitly clicked Stop — keeps the idle nudge
+        # from auto-resuming a park the user deliberately caused.
+        self._user_stopped = False
         self._shutdown = False
+        # Set by the ask_user handler to carry the normalized question
+        # list into the post-turn blocking emit. Drained on every block.
+        self._pending_questions: list[dict] | None = None
+        # Sentinel: the questions for the *current* park (the ask_user handler
+        # drains _pending_questions before the loop parks, so the escalation
+        # source can't read them there). Captured in _await_user_input for the
+        # duration of the wait; None when not parked / no questions.
+        self._park_questions: list[dict] | None = None
+        # Sentinel: live conversation ref, set in execute(). The escalation
+        # source's park-context provider reads the conversation tail (last
+        # assistant message + recent tool errors) from here.
+        self._conversation: Any = None
+        # Sentinel: the AgentContext for this run (set in execute()), so the
+        # park-context provider can resolve session_id for the task store.
+        self._agent_ctx: Any = None
+        # Same idea for suggest_colony — carries {colony_id, reason}
+        # so the blocking path emits COLONY_SUGGESTION_REQUESTED instead
+        # of CLIENT_INPUT_REQUESTED.
+        self._pending_colony_suggestion: dict | None = None
+        # Colony-pivot variant set by the task_create(new_colony=true)
+        # synthetic intercept — carries the rich payload
+        # {goal, handoff, tasks, source_phase} so the post-turn block
+        # emits a richer COLONY_SUGGESTION_REQUESTED for the popup.
+        # Drained on every block, same as _pending_colony_suggestion.
+        self._pending_colony_pivot: dict | None = None
+        # Set by the credentials(action="collect") handler — carries the
+        # no-secret form spec {credential_id, account, title, instructions,
+        # fields, correlation_id} so the post-turn block emits
+        # CLIENT_CREDENTIAL_FORM_REQUESTED and parks for the form submit.
+        self._pending_credential_form: dict | None = None
         self._stream_task: asyncio.Task | None = None
         self._tool_task: asyncio.Task | None = None  # gather task while tools run
-        # Track which nodes already have an action plan emitted (skip on revisit)
-        self._action_plan_emitted: set[str] = set()
-        # Tracked background tasks (action plan, etc.) — prevents GC loss
-        # and surfaces unhandled exceptions via the done callback.
-        self._bg_tasks: TaskRegistry = TaskRegistry(owner="AgentLoop")
+        # Background tool calls (see _start_background_tool): handle -> entry.
+        # A backgrounded tool returns a handle immediately and runs to
+        # completion as a detached task; the agent retrieves it via the
+        # synthetic collect_result tool. Persists across iterations/turns for
+        # the life of this loop instance, so a call started in one turn can be
+        # collected later.
+        self._background_calls: dict[str, dict[str, Any]] = {}
+        self._bg_counter: int = 0
+        # Session-level idle tracking. _session_last_event_at is bumped by
+        # _mark_session_progress on every sign of forward progress; the
+        # reminder hub's IdleNudgeSource reads the derived idle time via
+        # the LoopSignals snapshot from _loop_signals(). _stream_first_event_at
+        # is promoted out of _run_turn_loop's local scope so that snapshot
+        # can distinguish slow_ttft (stream alive, no first event) from
+        # between_turns (no _stream_task at all) without poking at locals.
+        self._session_last_event_at: float = 0.0
+        self._stream_first_event_at: float | None = None
         # Monotonic counter for spillover file naming (web_search_1.txt, etc.)
         self._spill_counter: int = 0
         # Set to True by the report_to_parent synthetic tool handler so the
         # next loop iteration exits cleanly (parallel worker termination).
         self._report_terminated: bool = False
+        # Grace iteration state. ``_in_grace`` is set by the outer loop
+        # for the duration of each grace iteration so the dispatch loop
+        # in _run_turn_loop can restrict tools to ``_GRACE_TERMINAL_TOOLS``.
+        # ``_grace_announced`` makes the one-shot reminder injection
+        # idempotent across resumed iterations and inner-loop restarts.
+        self._in_grace: bool = False
+        self._grace_announced: bool = False
+        # Cumulative count of tool calls actually dispatched across the
+        # whole execute() run (all turn-loops). Drives the lifetime
+        # tool-call budget (LoopConfig.tool_call_lifetime_budget): once it
+        # reaches the budget, the loop flips into grace wind-down early.
+        # In-memory only — resets to 0 per AgentLoop (each colony worker
+        # gets a fresh one); a cursor-resume mid-run restarts the count.
+        self._tool_calls_used: int = 0
+        # Iteration index at which grace first began, under EITHER trigger
+        # (iteration- or budget-exhaustion). Used to cap the wind-down to
+        # ``grace_iterations`` turns even when budget triggers grace early
+        # while many iterations remain. None until grace starts.
+        self._grace_start_iteration: int | None = None
         # Back-reference to the Worker that owns this AgentLoop, if any.
         # Set by the Worker's __init__ so the report_to_parent handler can
         # record the explicit report payload on the owning Worker instance.
@@ -392,13 +876,73 @@ class AgentLoop(AgentProtocol):
         # dashboards can build aggregates over many runs.
         self._counters: dict[str, int] = {}
 
-        # Task-system reminder state (see framework/tasks/reminders.py).
-        # Bumped each iteration; reset whenever a task op tool was called
-        # in the iteration that just completed; nudges the agent via the
-        # injection queue when it's been silent on tasks for too long.
-        from framework.tasks.reminders import ReminderState as _RS
+        # Framework-level reminder hub (see framework/agent_loop/reminders.py).
+        # Every framework nudge flows through it via one of three trigger
+        # models: lifecycle fire() points, the temporal IDLE_TICK ticker,
+        # and reactive collect()/post(). Registered sources: task
+        # reminders, the idle-nudge watchdog, and the stream-stall
+        # continue-nudge. Observe-once-per-turn drives the task source's
+        # work-weighted counters.
+        from framework.agent_loop.active_workers_reminder import ActiveWorkersReminderSource
+        from framework.agent_loop.colony_parallel_nudge import ColonyParallelNudgeSource
+        from framework.agent_loop.colony_worker_snapshot_reminder import (
+            ColonyWorkerSnapshotReminderSource,
+        )
+        from framework.agent_loop.idle_nudge import IdleNudgeSource
+        from framework.agent_loop.stream_stall import StreamStallSource
+        from framework.agent_loop.tracker_snapshot_reminder import (
+            TrackerSnapshotReminderSource,
+            WorkerTrackerSnapshotReminderSource,
+        )
+        from framework.tasks.reminders import TaskReminderSource
 
-        self._task_reminder_state: _RS = _RS()
+        from framework.agent_loop.tool_skill_reminders import (
+            SearchableToolsReminderSource,
+            SkillsCatalogReminderSource,
+        )
+
+        self._reminder_hub = ReminderHub()
+        self._reminder_hub.register(TaskReminderSource())
+        self._reminder_hub.register(ColonyParallelNudgeSource())
+        self._reminder_hub.register(ActiveWorkersReminderSource())
+        # Queen-only: the searchable-tools manifest + skills catalog ride the
+        # conversation as <system-reminder>s Self-skip for non-queen streams.
+        self._reminder_hub.register(SearchableToolsReminderSource())
+        self._reminder_hub.register(SkillsCatalogReminderSource())
+        # Tracker snapshots fire at POST_TOOL_USE on their own cadence
+        # (queen: browser-gated; worker: tool-call count) — not the shared
+        # tool-budget checkpoint. ColonyWorkerSnapshot still rides the
+        # budget checkpoint (soft current-turn tail + hard-stop drain).
+        self._reminder_hub.register(TrackerSnapshotReminderSource())
+        self._reminder_hub.register(WorkerTrackerSnapshotReminderSource())
+        self._reminder_hub.register(ColonyWorkerSnapshotReminderSource())
+        # Kept as a direct ref: inject_event re-arms its per-variant nudge
+        # caps on a real user message ("per user-response cycle").
+        self._idle_nudge_source = IdleNudgeSource(
+            budget_seconds=self._config.session_idle_nudge_seconds,
+            max_nudges=self._config.session_idle_nudge_max_per_session,
+            awaiting_budget_seconds=self._config.session_idle_nudge_awaiting_seconds,
+            broken_budget_seconds=self._config.session_idle_nudge_broken_seconds,
+        )
+        self._reminder_hub.register(self._idle_nudge_source)
+        # Sentinel autopilot: for a colony queen whose colony has opted in,
+        # this owns the parked-queen decision (nudge / escalate-to-human).
+        # Self-skips otherwise (workers, DM queens, opt-out colonies), and the
+        # idle-nudge source self-skips when this one is active so they never
+        # double-nudge. Kept as a direct ref so inject_event re-arms it.
+        from framework.sentinel.escalation_source import EscalationSource
+
+        self._escalation_source = EscalationSource(
+            park_context_provider=self._build_sentinel_park_context,
+        )
+        self._reminder_hub.register(self._escalation_source)
+        # Kept as a direct ref too: _run_turn_loop resets its per-turn
+        # nudge counter and consults it synchronously when a stream stalls.
+        self._stream_stall_source = StreamStallSource(
+            max_per_turn=self._config.continue_nudge_max_per_turn,
+            enabled=self._config.continue_nudge_enabled,
+        )
+        self._reminder_hub.register(self._stream_stall_source)
 
     def _bump(self, key: str, by: int = 1) -> None:
         """Increment a reliability counter (creates the key on first use)."""
@@ -407,6 +951,313 @@ class AgentLoop(AgentProtocol):
     def stats(self) -> dict[str, int]:
         """Return a snapshot of reliability counters for this loop."""
         return dict(self._counters)
+
+    def _mark_session_progress(self) -> None:
+        """Bump the session-level idle clock.
+
+        Called from every site that proves the loop is making forward
+        progress: stream events, tool completions, iteration boundaries,
+        user-input arrival. Kept as a single helper so the idle-nudge
+        source's notion of "alive" is auditable from one place.
+        """
+        self._session_last_event_at = time.monotonic()
+
+    def _loop_signals(self) -> LoopSignals:
+        """Snapshot loop runtime state for the reminder hub's ticker.
+
+        Handed to temporal sources (the idle-nudge source) via
+        ``ReminderContext.signals`` so they decide without poking at loop
+        internals. ``idle_seconds`` is time since the last
+        :meth:`_mark_session_progress`.
+        """
+        now = time.monotonic()
+        idle = now - self._session_last_event_at if self._session_last_event_at else 0.0
+        stream_active = self._stream_task is not None and not self._stream_task.done()
+        return LoopSignals(
+            idle_seconds=idle,
+            awaiting_input=self._awaiting_input,
+            park_reason=self._park_reason,
+            activity=self._activity,
+            user_stopped=self._user_stopped,
+            stream_active=stream_active,
+            first_event_seen=self._stream_first_event_at is not None,
+        )
+
+    # -------------------------------------------------------------------
+    # Sentinel integration (colony-queen autopilot)
+    # -------------------------------------------------------------------
+
+    async def _build_sentinel_park_context(self) -> Any:
+        """Assemble the park context Sentinel's escalation source classifies.
+
+        Lazy — called only after the source's gates pass (so at most once per
+        stalled park-cycle). Reads the goal + open tasks from the task store
+        and the conversation tail (last assistant message + recent tool
+        errors) from the live conversation. Best-effort throughout.
+        """
+        from framework.sentinel.classifier import ParkContext
+
+        ctx = self._agent_ctx
+        session_id = getattr(ctx, "session_id", None) if ctx is not None else None
+        reason = self._park_reason
+
+        goal: str | None = None
+        open_tasks: list[str] = []
+        if session_id:
+            try:
+                from framework.tasks import get_task_store
+                from framework.tasks.models import TaskStatus
+
+                store_ = get_task_store()
+                meta = await store_.get_meta(session_id)
+                goal = meta.goal if meta is not None else None
+                records = await store_.list_tasks(session_id)
+                # Open = active and unfinished; archived tasks are parked in
+                # History, not the working plan (and archived != completed),
+                # so they must not surface here as open work.
+                open_tasks = [
+                    (getattr(r, "subject", "") or "").strip()
+                    for r in (records or [])
+                    if r.status not in (TaskStatus.COMPLETED, TaskStatus.ARCHIVED)
+                ]
+                open_tasks = [t for t in open_tasks if t]
+            except Exception:
+                logger.debug("sentinel: task-store lookup failed", exc_info=True)
+
+        last_text = ""
+        last_user_text = ""
+        recent_errors: list[str] = []
+        conv = self._conversation
+        if conv is not None:
+            try:
+                msgs = conv.messages
+                last_text, last_user_text = self._pick_park_tail(msgs)
+                recent_errors = self._scan_recent_tool_errors(msgs)
+            except Exception:
+                logger.debug("sentinel: conversation tail read failed", exc_info=True)
+
+        # Snapshot in-flight fan-out so the classifier and nudge can tell a
+        # queen that is *waiting on workers* apart from one that has genuinely
+        # stalled. Same provider the active-workers reminder uses.
+        running_workers: list[dict] = []
+        if ctx is not None:
+            try:
+                provider = getattr(ctx, "active_workers_provider", None)
+                if callable(provider):
+                    running_workers = [w for w in (provider() or []) if isinstance(w, dict)]
+            except Exception:
+                logger.debug("sentinel: active-workers snapshot failed", exc_info=True)
+
+        return ParkContext(
+            park_reason=reason.value if reason is not None else "unknown",
+            goal=goal,
+            open_tasks=open_tasks,
+            last_assistant_text=last_text,
+            recent_user_text=last_user_text,
+            pending_questions=self._park_questions,
+            recent_errors=recent_errors,
+            running_workers=running_workers,
+            # Keyword scans are noisy, so don't force-escalate on them; pass
+            # the evidence to the classifier and let it judge in context.
+            hard_blocker=False,
+        )
+
+    @staticmethod
+    def _pick_park_tail(msgs: list) -> tuple[str, str]:
+        """Return (last_assistant_text, last_human_text) from the conversation.
+
+        A single backward walk capturing the most recent assistant message and
+        the most recent *real human* message.
+
+        CRITICAL: only ``is_client_input`` messages are the human's own words.
+        User-role messages also carry framework-injected content —
+        ``<system-reminder>`` blocks (``is_system_reminder``), ``[External
+        event]`` forwards, idle nudges, trigger batches — none of which is user
+        intent. Feeding one to the classifier as "the user said" would let a
+        reminder masquerade as a steer (e.g. suppress a real escalation, or
+        resume a queen the human told to stop). This mirrors the filter
+        compaction uses to preserve the user's original words.
+        """
+        last_text = ""
+        last_user_text = ""
+        for m in reversed(msgs):
+            role = getattr(m, "role", "")
+            content = (getattr(m, "content", "") or "").strip()
+            if not content:
+                continue
+            if not last_text and role == "assistant":
+                last_text = m.content
+            elif (
+                not last_user_text
+                and role == "user"
+                and getattr(m, "is_client_input", False)
+            ):
+                last_user_text = m.content
+            if last_text and last_user_text:
+                break
+        return last_text, last_user_text
+
+    @staticmethod
+    def _scan_recent_tool_errors(msgs: list) -> list[str]:
+        """Short snippets of recent tool results that look like blockers.
+
+        Evidence for the classifier (auth/credential/crash signals), not a
+        hard escalate trigger — see the note in _build_sentinel_park_context.
+        """
+        markers = (
+            "log in",
+            "login",
+            "sign in",
+            "authenticat",
+            "unauthor",
+            "credential",
+            "expired",
+            "session expired",
+            "not logged in",
+            "captcha",
+            "permission denied",
+            "403",
+            "401",
+            "crashed",
+            "disconnected",
+            "timed out",
+        )
+        out: list[str] = []
+        tool_msgs = [m for m in msgs if getattr(m, "role", "") == "tool"][-8:]
+        for m in tool_msgs:
+            content = (getattr(m, "content", "") or "")
+            if any(k in content.lower() for k in markers):
+                out.append(content.strip()[:200])
+        return out
+
+    def _notify_sentinel_local_resume(self) -> None:
+        """Fire-and-forget: close any open escalation for this session because
+        a real reply just arrived (in-app or via a routed messaging reply)."""
+        ctx = self._agent_ctx
+        session_id = getattr(ctx, "session_id", None) if ctx is not None else None
+        if not session_id:
+            return
+        try:
+            from framework.sentinel.manager import get_sentinel_manager
+
+            mgr = get_sentinel_manager()
+            if mgr is not None:
+                asyncio.create_task(mgr.on_local_resume(session_id))
+        except Exception:
+            logger.debug("sentinel: local-resume notify failed", exc_info=True)
+
+    async def _set_activity(
+        self,
+        ctx: AgentContext,
+        activity: LoopActivity,
+        *,
+        park_reason: ParkReason | None = None,
+        interrupt_cause: InterruptCause | None = None,
+    ) -> None:
+        """Set — and announce — the loop's authoritative top-level state.
+
+        The *sole* writer of :attr:`_activity` / :attr:`_interrupt_cause`.
+        Idempotent: when nothing changed it neither re-stores nor re-emits,
+        so transition points (notably the per-iteration ``EXECUTING``
+        re-assert) may call it freely without event spam.
+
+        ``park_reason`` is *not* written here — :meth:`_await_user_input`
+        owns it — but is compared and forwarded so the announced state and
+        its sub-cause stay consistent. Emits ``LOOP_STATE_CHANGED`` so the
+        session snapshot reads the loop's own verdict instead of
+        re-deriving activity from scattered events.
+        """
+        if self._activity == activity and self._park_reason == park_reason and self._interrupt_cause == interrupt_cause:
+            return
+        self._activity = activity
+        self._interrupt_cause = interrupt_cause
+        if self._event_bus is None:
+            return
+        try:
+            await self._event_bus.emit_loop_state_changed(
+                stream_id=ctx.stream_id or ctx.agent_id,
+                node_id=ctx.agent_id,
+                activity=activity.value,
+                execution_id=ctx.execution_id or "",
+                park_reason=park_reason.value if park_reason else None,
+                interrupt_cause=interrupt_cause.value if interrupt_cause else None,
+            )
+        except Exception:
+            logger.debug("[_set_activity] emit_loop_state_changed failed", exc_info=True)
+
+    async def _drain_reminder_hub(self, conversation: NodeConversation, ctx: AgentContext) -> int:
+        """Inject reminders parked by the hub's temporal ticker.
+
+        Runs on the loop coroutine at the iteration boundary so
+        conversation writes never race the loop's own mutations.
+        Best-effort — a failed injection is logged and skipped.
+
+        Returns the number of reminders injected. Every reminder is
+        energized input: a drained reminder breaks a pending-input wait so
+        the agent acts on it instead of re-parking. (A reminder that
+        reached a parked agent without waking it would simply rot unread —
+        see ``_inject_reminder``.)
+        """
+        injected = 0
+        for reminder in self._reminder_hub.take_pending():
+            try:
+                await self._inject_reminder(reminder, conversation, ctx)
+                injected += 1
+            except Exception:  # noqa: BLE001
+                logger.debug("failed to inject reminder from %s", reminder.source, exc_info=True)
+        return injected
+
+    async def _inject_reminder(
+        self,
+        reminder: Reminder,
+        conversation: NodeConversation,
+        ctx: AgentContext,
+    ) -> None:
+        """Place a single ticker-/post()-produced reminder into the
+        conversation.
+
+        Every reminder is injected uniformly: its body is wrapped in a
+        ``<system-reminder>`` block and the message is tagged
+        ``is_system_reminder`` so the loop, the UI and compaction treat it
+        consistently. Each injection emits the ``reminder_injected``
+        telemetry event.
+        """
+        block = wrap_reminder([reminder.body])
+        if not block:
+            return
+        await conversation.add_user_message(block, is_system_reminder=True)
+        logger.info(
+            "[reminder] injected %s (%d chars)",
+            reminder.source,
+            len(reminder.body),
+        )
+        await self._emit_reminder_injected(ctx, reminder)
+
+    async def _emit_reminder_injected(self, ctx: AgentContext, reminder: Reminder) -> None:
+        """Bump counters and emit the ``reminder_injected`` event.
+
+        Single telemetry point for every hub injection — drained
+        reminders, the synchronous stream-stall nudge, and (via a
+        synthetic ``Reminder``) lifecycle blocks.
+        """
+        self._bump(f"reminder_injected_{reminder.source}")
+        # Idle nudges keep their substate-tagged counter for dashboards.
+        if reminder.source == "idle_nudge":
+            self._bump(f"session_idle_nudge_{reminder.meta.get('substate', '?')}")
+        detail = str(reminder.meta.get("substate") or reminder.meta.get("reason") or reminder.meta.get("point") or "")
+        if self._event_bus is None:
+            return
+        try:
+            await self._event_bus.emit_reminder_injected(
+                stream_id=ctx.stream_id or ctx.agent_id,
+                node_id=ctx.agent_id,
+                source=reminder.source,
+                detail=detail,
+                meta=dict(reminder.meta),
+                execution_id=ctx.execution_id or None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("failed to emit reminder_injected", exc_info=True)
 
     def _finalize_result(self, result: AgentResult, reason: str) -> AgentResult:
         """Stamp exit_reason + reliability_stats on an AgentResult before return.
@@ -417,6 +1268,7 @@ class AgentLoop(AgentProtocol):
         """
         result.exit_reason = reason
         result.reliability_stats = dict(self._counters)
+        result.tool_calls_used = self._tool_calls_used
         return result
 
     def validate_input(self, ctx: AgentContext) -> list[str]:
@@ -444,12 +1296,43 @@ class AgentLoop(AgentProtocol):
         when the implementation didn't set one explicitly. This way
         every return path in ``_execute_impl`` automatically carries
         telemetry without having to edit 13+ return sites.
+
+        Also owns the lifecycle of the reminder hub's temporal ticker
+        (idle-nudge source): it's started inside ``_execute_impl`` once
+        the conversation is ready, and stopped here in ``finally`` so
+        every return path in the impl (and every exception) tears down
+        the background ticker without leaving an orphaned task.
         """
-        result = await self._execute_impl(ctx)
+        try:
+            # Resolve which reminder sources apply to this agent before
+            # anything consults the hub (see ReminderHub.bind) — this is
+            # how one shared loop serves queens, workers, judges, etc.
+            self._reminder_hub.bind(ctx)
+            result = await self._execute_impl(ctx)
+        except Exception:
+            # The loop exited via an unhandled exception — announce
+            # INTERRUPTED/crashed before it propagates so the session
+            # snapshot never shows a dead loop as cleanly idle. Best-effort;
+            # CancelledError (deliberate shutdown) is not a crash and is
+            # left to propagate untouched.
+            try:
+                await self._set_activity(
+                    ctx,
+                    LoopActivity.INTERRUPTED,
+                    interrupt_cause=InterruptCause.CRASHED,
+                )
+            except Exception:
+                logger.debug("[execute] crash-state announce failed", exc_info=True)
+            raise
+        finally:
+            # Stop the reminder hub's temporal ticker on every exit path
+            # so no background poll task outlives the session.
+            await self._reminder_hub.stop()
         # Always refresh counters at the outermost boundary, in case a
         # nested return in _execute_impl used _finalize_result with a
         # stale copy.
         result.reliability_stats = dict(self._counters)
+        result.tool_calls_used = self._tool_calls_used
         if result.exit_reason == "?":
             # Best-effort classification from the AgentResult payload.
             # _execute_impl can (and should) set reason explicitly at
@@ -484,6 +1367,12 @@ class AgentLoop(AgentProtocol):
         stream_id = ctx.stream_id or ctx.agent_id
         node_id = ctx.agent_id
         execution_id = ctx.execution_id or ""
+        # Announce EXECUTING immediately so the SSE snapshot reflects a live
+        # loop during conversation restore / tool refresh (which can take
+        # 30-60s for large histories). If the loop then parks for pending
+        # input (cold resume), _await_user_input will override with
+        # AWAITING_USER.
+        await self._set_activity(ctx, LoopActivity.EXECUTING)
         # Store skill dirs for AS-9 file-read interception in _execute_tool
         self._skill_dirs: list[str] = ctx.skill_dirs
         logger.debug(
@@ -492,9 +1381,6 @@ class AgentLoop(AgentProtocol):
             execution_id,
             self._config.max_iterations,
         )
-
-        # DS-13: context preservation warning state
-        _context_warn_sent = False
 
         # Verdict counters for runtime logging
         _accept_count = _retry_count = _escalate_count = _continue_count = 0
@@ -539,16 +1425,40 @@ class AgentLoop(AgentProtocol):
             _restored_recent_responses = restored.recent_responses
             _restored_tool_fingerprints = restored.recent_tool_fingerprints
             _restored_pending_input = restored.pending_input
+            _is_cold_resume = True
+            # Restore the user-stop flag. __init__ defaulted it to False; if
+            # the previous process persisted user_stopped=True (cancel route
+            # set the flag and a checkpoint write captured it) the idle-nudge
+            # gate must respect that across restart. Cleared by inject_event
+            # when a real user message arrives.
+            if restored.user_stopped:
+                self._user_stopped = True
+                logger.info("[%s] restored _user_stopped=True from cursor", ctx.agent_id)
 
-            # Refresh the system prompt
+            # Restore the cumulative tool-call count so the lifetime tool-call
+            # budget (LoopConfig.tool_call_lifetime_budget) is a TRUE cap
+            # across resumes — a resumed worker continues counting toward its
+            # budget instead of getting a fresh allotment each time.
+            self._tool_calls_used = restored.tool_calls_used
+            if restored.tool_calls_used:
+                logger.info(
+                    "[%s] restored tool_calls_used=%d from cursor",
+                    ctx.agent_id,
+                    restored.tool_calls_used,
+                )
+
+            # Refresh the system prompt. Split into the cache-stable static
+            # prefix (identity / accounts / skills / protocols / memory /
+            # focus) and the per-turn dynamic suffix (narrative) so the
+            # bulk of the prompt stays warm in the provider's prompt
+            # cache across iterations.
             from framework.agent_loop.prompting import (
-                build_system_prompt_for_context,
-                stamp_prompt_datetime,
+                build_system_prompt_parts_for_context,
             )
 
-            _current_prompt = build_system_prompt_for_context(ctx)
-            if conversation.system_prompt != _current_prompt:
-                conversation.update_system_prompt(_current_prompt)
+            _static, _suffix = build_system_prompt_parts_for_context(ctx)
+            if conversation.system_prompt_static != _static or conversation.system_prompt_dynamic_suffix != _suffix:
+                conversation.update_system_prompt(_static, dynamic_suffix=_suffix)
                 logger.info("Refreshed system prompt for restored conversation")
 
             # Refresh other meta fields that may differ across runs
@@ -560,16 +1470,30 @@ class AgentLoop(AgentProtocol):
             _restored_recent_responses = []
             _restored_tool_fingerprints = []
             _restored_pending_input = None
+            _is_cold_resume = False
 
             if self._conversation_store is not None:
+                # Log before clearing so data loss is visible in diagnostics.
+                existing_parts = await self._conversation_store.read_parts()
+                if existing_parts:
+                    logger.warning(
+                        "[%s] _restore returned None but store has %d parts — clearing (possible data loss)",
+                        ctx.agent_id,
+                        len(existing_parts),
+                    )
                 await self._conversation_store.clear()
 
             from framework.agent_loop.prompting import (
-                build_system_prompt_for_context,
-                stamp_prompt_datetime,
+                build_system_prompt_parts_for_context,
             )
 
-            system_prompt = build_system_prompt_for_context(ctx)
+            # Split into static prefix (cache-stable) and dynamic suffix
+            # (narrative + timestamp). Both legs are recombined for the
+            # initial NodeConversation construction, then re-set via
+            # update_system_prompt so the conversation tracks them
+            # separately and the LLM wrapper can emit two cache-aware
+            # system content blocks.
+            system_prompt_static, system_prompt_suffix = build_system_prompt_parts_for_context(ctx)
 
             if ctx.skills_catalog_prompt:
                 logger.info(
@@ -584,16 +1508,8 @@ class AgentLoop(AgentProtocol):
                     len(ctx.protocols_prompt),
                 )
 
-            if ctx.default_skill_batch_nudge:
-                from framework.skills.defaults import is_batch_scenario as _is_batch
-
-                _input_text = (ctx.goal_context or "") + " " + " ".join(str(v) for v in ctx.input_data.values() if v)
-                if _is_batch(_input_text):
-                    system_prompt = f"{system_prompt}\n\n{ctx.default_skill_batch_nudge}"
-                    logger.info("[%s] DS-12: batch scenario detected, nudge injected", node_id)
-
             conversation = NodeConversation(
-                system_prompt=system_prompt,
+                system_prompt=system_prompt_static,
                 max_context_tokens=self._config.max_context_tokens,
                 output_keys=ctx.agent_spec.output_keys or None,
                 store=self._conversation_store,
@@ -602,6 +1518,10 @@ class AgentLoop(AgentProtocol):
                 compaction_buffer_ratio=self._config.compaction_buffer_ratio,
                 compaction_warning_buffer_tokens=(self._config.compaction_warning_buffer_tokens),
             )
+            # Promote the static/suffix split into the conversation so the
+            # LLM wrapper sends them as two cache-aware blocks.
+            if system_prompt_suffix:
+                conversation.update_system_prompt(system_prompt_static, dynamic_suffix=system_prompt_suffix)
             accumulator = OutputAccumulator(
                 store=self._conversation_store,
                 spillover_dir=self._config.spillover_dir,
@@ -611,6 +1531,16 @@ class AgentLoop(AgentProtocol):
             start_iteration = 0
 
             initial_message = self._build_initial_message(ctx)
+            # Fire SESSION_START hooks + reminders BEFORE seeding the user's
+            # first message so the situational frame (tools/skills manifest,
+            # task list, ...) precedes the user's request rather than trailing
+            # it. This mirrors the USER_PROMPT_SUBMIT ordering on every
+            # subsequent turn (see the drain block below, where the reminder
+            # fires before the injection queue is drained) — "cowork style":
+            # the queen reads the frame first, then the user's latest message.
+            await self._run_hooks("session_start", conversation, trigger=initial_message)
+            await self._fire_reminder(ReminderPoint.SESSION_START, ctx, conversation)
+
             if initial_message:
                 # Stamp with arrival time so the conversation has a
                 # temporal anchor for the first turn, matching the
@@ -618,8 +1548,6 @@ class AgentLoop(AgentProtocol):
                 # subsequent event.
                 _stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
                 await conversation.add_user_message(f"[{_stamp}] {initial_message}")
-
-            await self._run_hooks("session_start", conversation, trigger=initial_message)
 
         # 2a. Guard: ensure at least one non-system message exists.
         # A restored conversation may have 0 messages if phase_id filtering
@@ -637,15 +1565,55 @@ class AgentLoop(AgentProtocol):
 
         # 3. Build tool list: node tools + synthetic framework tools + delegate tools
         tools = list(ctx.available_tools)
+        # collect_result lets the agent retrieve results of backgrounded tools
+        # (LoopConfig.background_tools). Added whenever any background tool is
+        # configured, independent of user-IO support, since the caller — not an
+        # MCP server — handles it.
+        if getattr(self._config, "background_tools", None):
+            tools.append(build_collect_result_tool())
         if ctx.supports_direct_user_io:
             tools.append(self._build_ask_user_tool())
-        # Workers (parallel ephemeral agents) get escalate + report_to_parent.
-        # The overseer is client-facing like the queen and has neither.
-        if stream_id not in ("queen", "judge", "overseer"):
+            # Single CLI-style credentials tool — browse/collect/attach/reveal.
+            # Queen-facing: it parks the loop for the secure collect form and
+            # writes session attachments, both of which need loop internals.
+            tools.append(build_credentials_tool())
+            # Sentinel setup — store channel tokens + configure/test per-colony
+            # notifications (the desktop Sentinel connector's API), so the queen
+            # can finish a browser-driven Slack/Telegram setup without bouncing
+            # the user back to the form.
+            tools.append(build_sentinel_setup_tool())
+            # ``suggest_colony`` is queen-only AND independent-phase-only.
+            # It is sourced via the queen's dynamic_tools_provider —
+            # ``QueenPhaseState.independent_tools`` carries it, so it
+            # disappears automatically when the queen switches to colony
+            # phase. The dispatch site (search for ``suggest_colony`` in
+            # this file) enforces the same gate as defense in depth.
+        # Parallel fan-out workers (stream_id="worker:{uuid}") have NO
+        # escalation channel — per BRD they fail-fast via report_to_parent
+        # and the queen re-dispatches with different parameters or takes
+        # over. Escalate stays available to the legacy primary worker
+        # (stream_id="worker", no colon — run_agent_with_input style),
+        # which still uses it for credential / ambiguity handoffs back
+        # to the queen.
+        is_parallel_worker = isinstance(stream_id, str) and stream_id.startswith("worker:")
+        if stream_id not in ("queen", "judge", "overseer") and not is_parallel_worker:
             tools.append(self._build_escalate_tool())
         # Only parallel workers (stream_id="worker:{uuid}") get report_to_parent.
-        if isinstance(stream_id, str) and stream_id.startswith("worker:"):
-            tools.append(build_report_to_parent_tool())
+        # report_schema is optional and not present on every spec type
+        # (NodeSpec etc.), so read it defensively — absent means no schema.
+        if is_parallel_worker:
+            tools.append(build_report_to_parent_tool(getattr(ctx.agent_spec, "report_schema", None) or None))
+            # Worker-side searchable tiering: when the spawn wired a
+            # ToolTierState (keep-set configured), expose ``search_tools`` so
+            # the worker can load deferred schemas on demand — same UX as the
+            # queen's, but executed in-loop against this worker's own tier
+            # (the registry-registered search_tools closes over the QUEEN's
+            # phase_state and must not serve workers).
+            if getattr(ctx, "tool_tier_state", None) is not None:
+                from framework.tools.tool_tiers import build_search_tools
+
+                _tier_tool, self._worker_search_tools_handler = build_search_tools(ctx.tool_tier_state)
+                tools.append(_tier_tool)
 
         # Hide image-producing tools from text-only models so they never try
         # to call them. Avoids wasted turns + "screenshot failed" lessons
@@ -681,20 +1649,22 @@ class AgentLoop(AgentProtocol):
         # 4. Publish loop started
         await self._publish_loop_started(stream_id, node_id, execution_id)
 
-        # 4b. Fire-and-forget action plan generation (once per node per lifetime)
-        # Skip for queen/judge — action plans are only meaningful for worker nodes.
-        if (
-            start_iteration == 0
-            and ctx.llm
-            and self._event_bus
-            and node_id not in self._action_plan_emitted
-            and stream_id not in ("queen", "judge")
-        ):
-            self._action_plan_emitted.add(node_id)
-            self._bg_tasks.spawn(
-                self._generate_action_plan(ctx, stream_id, node_id, execution_id),
-                name=f"action_plan:{node_id}",
-            )
+        # 4a. Start the reminder hub's temporal ticker. Its IdleNudgeSource
+        # catches idle gaps the stream-level watchdog can't see — between
+        # turns (no _stream_task) and slow TTFT under the 600s ceiling.
+        # Stopped in execute()'s finally so cleanup isn't threaded through
+        # every return site. The ticker only parks reminders; the loop
+        # drains them via _drain_reminder_hub at each iteration boundary.
+        self._stream_first_event_at = None
+        self._mark_session_progress()
+        # Expose the live conversation + context to Sentinel's park-context provider.
+        self._conversation = conversation
+        self._agent_ctx = ctx
+        await self._reminder_hub.start(
+            ctx,
+            signals_provider=self._loop_signals,
+            wake=self._input_ready.set,
+        )
 
         # 5. Stall / doom loop detection state (restored from cursor if resuming)
         recent_responses: list[str] = _restored_recent_responses
@@ -703,10 +1673,113 @@ class AgentLoop(AgentProtocol):
         _consecutive_empty_turns: int = 0
 
         # 6. Main loop
-        logger.debug("[AgentLoop.execute] Entering main loop, start_iteration=%d", start_iteration)
-        for iteration in range(start_iteration, self._config.max_iterations):
+        # The loop ceiling is ``max_iterations + grace_iterations``. The
+        # grace iterations (typically 1, only set for workers) are a
+        # guaranteed wrap-up phase: dispatch is restricted to
+        # ``_GRACE_TERMINAL_TOOLS`` so the agent reports back instead of
+        # dying silently when its work budget is exhausted. Queens set
+        # grace_iterations=0 → no behavioural change.
+        _total_iterations = self._config.max_iterations + self._config.grace_iterations
+        logger.debug(
+            "[AgentLoop.execute] Entering main loop, start_iteration=%d, max_iterations=%d, grace_iterations=%d",
+            start_iteration,
+            self._config.max_iterations,
+            self._config.grace_iterations,
+        )
+        for iteration in range(start_iteration, _total_iterations):
             iter_start = time.time()
-            logger.debug("[AgentLoop.execute] iteration=%d starting", iteration)
+            # Flip into grace mode once the work budget is spent — by EITHER
+            # the iteration budget OR the cumulative (lifetime) tool-call
+            # budget (LoopConfig.tool_call_lifetime_budget; 0 disables). The
+            # dispatch loop in _run_turn_loop reads ``self._in_grace`` to gate
+            # non-terminal tools; the boundary-time reminder below tells the
+            # model what's about to happen (and which budget tripped).
+            _lifetime_budget = self._config.tool_call_lifetime_budget
+            budget_exhausted = _lifetime_budget > 0 and self._tool_calls_used >= _lifetime_budget
+            self._in_grace = iteration >= self._config.max_iterations or budget_exhausted
+            if self._in_grace and self._grace_start_iteration is None:
+                self._grace_start_iteration = iteration
+            # Cap the wind-down to ``grace_iterations`` turn(s) from whenever
+            # grace began, under either trigger. For iteration-triggered grace
+            # this is a no-op: grace_start == max_iterations, so the bound is
+            # max_iterations + grace_iterations == _total_iterations (the
+            # existing range ceiling). For budget-triggered (early) grace it
+            # stops the loop from spinning the remaining — possibly hundreds
+            # of — iterations in tool-restricted mode. Falls through to the
+            # "max iterations exhausted" exit below.
+            # ``not self._report_terminated``: if the worker already called
+            # report_to_parent during its grace turn, let the report-terminated
+            # early-exit below own the exit (success + the explicit report)
+            # rather than preempting it with the max-iterations failure path.
+            if (
+                self._grace_start_iteration is not None
+                and not self._report_terminated
+                and iteration - self._grace_start_iteration >= max(1, self._config.grace_iterations)
+            ):
+                logger.info(
+                    "[AgentLoop.execute] grace wind-down complete at iteration=%d "
+                    "(grace_start=%d, grace_iterations=%d); exiting",
+                    iteration,
+                    self._grace_start_iteration,
+                    self._config.grace_iterations,
+                )
+                break
+            logger.debug(
+                "[AgentLoop.execute] iteration=%d starting (in_grace=%s, tool_calls_used=%d)",
+                iteration,
+                self._in_grace,
+                self._tool_calls_used,
+            )
+            # Inject any reminders the hub's temporal ticker parked while
+            # the previous turn ran (idle nudges, …) — done here, on the
+            # loop coroutine, so conversation writes don't race the loop.
+            # A drained reminder counts as fresh input below (it breaks a
+            # pending-input wait), so the agent acts on it.
+            drained_reminders = await self._drain_reminder_hub(conversation, ctx)
+            # On the first grace iteration, inject the one-shot reminder
+            # explaining the restriction. Idempotent: ``_grace_announced``
+            # guards against duplicate injections if the loop ever revisits
+            # the same iteration index (resume / inner-loop restart paths).
+            # ``not self._report_terminated``: a worker whose FINAL counted
+            # call was its report (landing used == budget) is a clean
+            # self-terminated success — announcing grace here would bump
+            # tool_lifetime_budget_grace and falsely mark the result
+            # budget_limited (excluding a legitimate sample from colony
+            # budget adaptation and baiting a pointless resume). The
+            # report-terminated early-exit below owns that path.
+            if self._in_grace and not self._grace_announced and not self._report_terminated:
+                self._grace_announced = True
+                self._bump("grace_iteration_entered")
+                # Distinguish the trigger so the reminder body matches reality:
+                # a tool-call-budget wind-down (the worker still has iterations
+                # left) reads differently from an iteration-budget wind-down.
+                if budget_exhausted:
+                    self._bump("tool_lifetime_budget_grace")
+                _grace_body = _TOOL_BUDGET_GRACE_REMINDER_BODY if budget_exhausted else _GRACE_REMINDER_BODY
+                await self._inject_reminder(
+                    Reminder(
+                        source="grace_iteration",
+                        body=_grace_body,
+                        meta={
+                            "iteration": iteration,
+                            "max_iterations": self._config.max_iterations,
+                            "grace_iterations": self._config.grace_iterations,
+                            "tool_call_lifetime_budget": _lifetime_budget,
+                            "tool_calls_used": self._tool_calls_used,
+                            "trigger": "tool_call_budget" if budget_exhausted else "iterations",
+                        },
+                    ),
+                    conversation,
+                    ctx,
+                )
+            # Crossing an iteration boundary counts as progress — judge
+            # work, setup, etc. between turns shouldn't accrue idle time.
+            self._mark_session_progress()
+            # The loop is making forward progress — re-assert EXECUTING.
+            # Idempotent: only emits when transitioning back from a park or
+            # a stream stall, so this covers between-turn / judge / compaction
+            # work without spamming events.
+            await self._set_activity(ctx, LoopActivity.EXECUTING)
 
             # 6a-pre. Early exit for workers that called report_to_parent on
             # the previous turn. The report_to_parent handler sets this
@@ -758,6 +1831,16 @@ class AgentLoop(AgentProtocol):
                 )
 
             # 6b. Drain injection queue
+            # Fire USER_PROMPT_SUBMIT reminders BEFORE draining so any
+            # reminder body (active workers, task snapshot, ...) lands in
+            # the conversation as context preceding the user's message —
+            # the queen reads the situational frame first, then the user's
+            # latest request. Peek via queue.empty() instead of acting on
+            # drained_injections after the fact; the peek-then-drain
+            # ordering is async-single-loop so there is no real race.
+            will_drain = not self._injection_queue.empty()
+            if will_drain:
+                await self._fire_reminder(ReminderPoint.USER_PROMPT_SUBMIT, ctx, conversation)
             logger.debug("[AgentLoop.execute] iteration=%d: draining injection queue...", iteration)
             drained_injections = await self._drain_injection_queue(conversation, ctx)
             logger.debug(
@@ -778,7 +1861,11 @@ class AgentLoop(AgentProtocol):
             # injected yet, re-enter the wait instead of continuing the last
             # assistant turn with a synthetic prompt.
             if pending_input_state is not None:
-                if drained_injections > 0 or drained_triggers > 0:
+                _is_cold_resume = False
+                # A reminder drained this iteration is respected like fresh
+                # user input — it breaks the pending-input wait so the agent
+                # acts on the reminder instead of silently re-parking.
+                if drained_injections > 0 or drained_triggers > 0 or drained_reminders > 0:
                     pending_input_state = None
                     await self._write_cursor(
                         ctx,
@@ -798,7 +1885,9 @@ class AgentLoop(AgentProtocol):
                     )
                     got_input = await self._await_user_input(
                         ctx,
+                        reason=self._park_reason_from_cursor(pending_input_state),
                         questions=pending_input_state.get("questions"),
+                        credential_form=pending_input_state.get("credential_form"),
                         emit_client_request=bool(pending_input_state.get("emit_client_request", True)),
                     )
                     logger.info(
@@ -823,72 +1912,130 @@ class AgentLoop(AgentProtocol):
                             node_id,
                             iteration,
                         )
+                        # The request was already published on the wait we
+                        # just woke from — re-wait silently so we don't spam
+                        # duplicate CLIENT_INPUT_REQUESTED events for the one
+                        # still-open question.
+                        pending_input_state["emit_client_request"] = False
                         continue
+                    # Input arrived — clear the persisted pending-input
+                    # marker NOW. Deferring to the next iteration's 6g
+                    # checkpoint risks an early `continue` (compaction /
+                    # empty-response guard / stall handling) skipping it,
+                    # leaving a stale pending_input on disk that re-pops
+                    # the already-answered question on the next cold resume.
                     pending_input_state = None
+                    await self._write_cursor(
+                        ctx,
+                        conversation,
+                        accumulator,
+                        iteration,
+                        recent_responses=recent_responses,
+                        recent_tool_fingerprints=recent_tool_fingerprints,
+                        pending_input=None,
+                    )
                     continue
 
-            # 6b2. Dynamic tool refresh (mode switching)
-            if ctx.dynamic_tools_provider is not None:
-                _synthetic_names = {
-                    "ask_user",
-                    "escalate",
-                }
-                synthetic = [t for t in tools if t.name in _synthetic_names]
-                tools.clear()
-                tools.extend(ctx.dynamic_tools_provider())
-                tools.extend(synthetic)
+            # 6b1½. Cold-resume mid-turn guard.
+            # If the queen was mid-LLM-turn when the runtime died (no
+            # pending_input persisted), don't silently resume the in-flight
+            # work — inject a note and park until the user sends a message.
+            # Workers are excluded: they should resume autonomously.
+            if _is_cold_resume and ctx.supports_direct_user_io:
+                _is_cold_resume = False
+                if drained_injections == 0 and drained_triggers == 0:
+                    logger.info(
+                        "[%s] iter=%d: cold resume mid-turn — parking until user input",
+                        node_id,
+                        iteration,
+                    )
+                    await conversation.add_user_message(
+                        "[System] The session was interrupted (app closed or runtime "
+                        "restarted while work was in progress). Waiting for your "
+                        "next message before resuming."
+                    )
+                    pending_input_state = {
+                        "reason": ParkReason.COLD_INTERRUPTED.value,
+                        "emit_client_request": True,
+                    }
+                    await self._write_cursor(
+                        ctx,
+                        conversation,
+                        accumulator,
+                        iteration,
+                        recent_responses=recent_responses,
+                        recent_tool_fingerprints=recent_tool_fingerprints,
+                        pending_input=pending_input_state,
+                    )
+                    got_input = await self._await_user_input(
+                        ctx, reason=ParkReason.COLD_INTERRUPTED,
+                    )
+                    if not got_input:
+                        await self._publish_loop_completed(stream_id, node_id, iteration + 1, execution_id)
+                        latency_ms = int((time.time() - start_time) * 1000)
+                        return AgentResult(
+                            success=True,
+                            output=accumulator.to_dict(),
+                            tokens_used=total_input_tokens + total_output_tokens,
+                            latency_ms=latency_ms,
+                            conversation=None,
+                        )
+                    pending_input_state = None
+                    await self._write_cursor(
+                        ctx,
+                        conversation,
+                        accumulator,
+                        iteration,
+                        recent_responses=recent_responses,
+                        recent_tool_fingerprints=recent_tool_fingerprints,
+                        pending_input=None,
+                    )
+                    continue
+
+            # 6b2. Dynamic tool refresh (mode switching + mid-session loads).
+            # Mirrored inside _run_turn_loop's inner stream loop so a tool
+            # loaded via search_tools mid-turn becomes callable immediately.
+            self._refresh_dynamic_tools(ctx, tools)
 
             # 6b3. Dynamic prompt refresh (phase switching / memory refresh)
-            if (
-                ctx.dynamic_prompt_provider is not None
-                or ctx.dynamic_memory_provider is not None
-                or ctx.dynamic_skills_catalog_provider is not None
-            ):
+            if ctx.dynamic_prompt_provider is not None or ctx.dynamic_memory_provider is not None or ctx.dynamic_skills_catalog_provider is not None:
+                from framework.agent_loop.prompting import (
+                    build_system_prompt_parts_for_context,
+                )
+
                 if ctx.dynamic_prompt_provider is not None:
                     _new_prompt = ctx.dynamic_prompt_provider()
                     # When a suffix provider is also wired (Queen's
                     # static/dynamic split), keep the two pieces separate
                     # so the LLM wrapper can emit them as two system
                     # content blocks with a cache breakpoint between them.
-                    # The timestamp used to be stamped here via
-                    # stamp_prompt_datetime on every iteration — it now
-                    # lives inside the frozen dynamic suffix and is only
-                    # refreshed at user-turn boundaries, so per-iteration
-                    # stamping would both double-stamp and bust the cache.
-                    _new_suffix: str | None = None
+                    # An empty suffix is fine — the LLM wrapper falls back
+                    # to the single-block system message, which is the
+                    # byte-stable shape now that nothing per-turn (recall,
+                    # timestamps) lives in the suffix anymore. A CHANGING
+                    # suffix here would invalidate the cached history
+                    # prefix on every change, so never stamp wall-clock
+                    # time into it.
+                    _new_suffix = ""
                     if ctx.dynamic_prompt_suffix_provider is not None:
                         try:
                             _new_suffix = ctx.dynamic_prompt_suffix_provider() or ""
                         except Exception:
                             logger.debug(
-                                "[%s] dynamic_prompt_suffix_provider raised — falling back to legacy stamp",
+                                "[%s] dynamic_prompt_suffix_provider raised — treating suffix as empty",
                                 node_id,
                                 exc_info=True,
                             )
-                            _new_suffix = None
-                    if _new_suffix is None:
-                        # Legacy / fallback path: no split in use (or the
-                        # suffix provider raised). Stamp the timestamp at
-                        # the end of the single-string prompt so the model
-                        # still sees a current "now".
-                        _new_prompt = stamp_prompt_datetime(_new_prompt)
+                            _new_suffix = ""
                 else:
-                    # build_system_prompt_for_context reads dynamic_skills_catalog_provider
-                    # directly; no separate branch needed.
-                    _new_prompt = build_system_prompt_for_context(ctx)
-                    _new_suffix = None
-                if _new_suffix is not None:
-                    _combined_for_compare = f"{_new_prompt}\n\n{_new_suffix}" if _new_suffix else _new_prompt
-                    if (
-                        _combined_for_compare != conversation.system_prompt
-                        or _new_suffix != conversation.system_prompt_dynamic_suffix
-                    ):
-                        conversation.update_system_prompt(_new_prompt, dynamic_suffix=_new_suffix)
-                        logger.info("[%s] Dynamic prompt updated (split)", node_id)
-                else:
-                    if _new_prompt != conversation.system_prompt:
-                        conversation.update_system_prompt(_new_prompt)
-                        logger.info("[%s] Dynamic prompt updated", node_id)
+                    # No dynamic_prompt_provider — rebuild from context.
+                    # Use the split builder so the narrative stays outside
+                    # the cached prefix.
+                    _new_prompt, _new_suffix = build_system_prompt_parts_for_context(ctx)
+                _combined_for_compare = f"{_new_prompt}\n\n{_new_suffix}" if _new_suffix else _new_prompt
+                if _combined_for_compare != conversation.system_prompt or _new_suffix != conversation.system_prompt_dynamic_suffix:
+                    conversation.update_system_prompt(_new_prompt, dynamic_suffix=_new_suffix)
+                    logger.info("[%s] Dynamic prompt updated (split)", node_id)
 
             # 6c. Publish iteration event (with per-iteration metadata when available)
             _iter_meta = None
@@ -910,7 +2057,7 @@ class AgentLoop(AgentProtocol):
 
             conversation._max_context_tokens = _live_mct()
 
-            await self._publish_context_usage(ctx, conversation, "iteration_start")
+            await self._publish_context_usage(ctx, conversation, "iteration_start", tools=tools)
 
             # 6d. Pre-turn compaction check (tiered)
             _compacted_this_iter = False
@@ -925,17 +2072,22 @@ class AgentLoop(AgentProtocol):
                 iteration,
                 len(conversation.messages),
             )
-            logger.debug("[AgentLoop.execute] iteration=%d: entering _run_single_turn loop", iteration)
+            logger.debug("[AgentLoop.execute] iteration=%d: entering _run_turn_loop loop", iteration)
             _stream_retry_count = 0
             _capacity_retry_started_at: float | None = None
             _capacity_retry_attempt = 0
             _turn_cancelled = False
             _llm_turn_failed_waiting_input = False
+            # Set by the STOP reminder fire below when an energizing source
+            # contributed; suppresses this iteration's queen auto-block so the
+            # agent gets a turn to act on it. Reset per iteration so it can
+            # never hold the loop open across turns.
+            _stop_reminder_energized = False
             _turn_t0 = time.monotonic()
             while True:
                 try:
                     logger.debug(
-                        "[AgentLoop.execute] iteration=%d: calling _run_single_turn (retry=%d)",
+                        "[AgentLoop.execute] iteration=%d: calling _run_turn_loop (retry=%d)",
                         iteration,
                         _stream_retry_count,
                     )
@@ -950,15 +2102,20 @@ class AgentLoop(AgentProtocol):
                         request_system_prompt,
                         request_messages,
                         _,
-                    ) = await self._run_single_turn(ctx, conversation, tools, iteration, accumulator)
+                    ) = await self._run_turn_loop(ctx, conversation, tools, iteration, accumulator)
                     logger.debug(
-                        "[AgentLoop.execute] iteration=%d: _run_single_turn completed successfully",
+                        "[AgentLoop.execute] iteration=%d: _run_turn_loop completed successfully",
                         iteration,
                     )
+                    try:
+                        from framework.host.runtime_health import mark_upstream_healthy
+
+                        mark_upstream_healthy()
+                    except Exception:
+                        pass
                     _turn_ms = int((time.monotonic() - _turn_t0) * 1000)
                     logger.info(
-                        "[%s] iter=%d: LLM done (%dms) — text=%d chars, real_tools=%d, "
-                        "outputs_set=%s, tokens=%s, accumulator=%s",
+                        "[%s] iter=%d: LLM done (%dms) — text=%d chars, real_tools=%d, outputs_set=%s, tokens=%s, accumulator=%s",
                         node_id,
                         iteration,
                         _turn_ms,
@@ -971,16 +2128,32 @@ class AgentLoop(AgentProtocol):
                     total_input_tokens += turn_tokens.get("input", 0)
                     total_output_tokens += turn_tokens.get("output", 0)
 
-                    # Task-system reminder: if the model has been silent on
-                    # task ops for too long but still has open tasks, drop
-                    # a steering reminder onto the injection queue. Drained
-                    # at the next iteration's 6b so it lands as the next
-                    # user turn via the normal injection path. Best-effort
-                    # — never raises.
+                    # Reminder STOP point: the turn loop just ended on a
+                    # text-only turn (no tool result to ride a tail on),
+                    # so fire STOP as an injected message. Per-turn drift
+                    # counting happens inside _run_turn_loop, once per
+                    # inner turn. Best-effort — never raises.
                     try:
-                        await self._maybe_inject_task_reminder(ctx, logged_tool_calls)
+                        if not real_tool_results:
+                            _stop_reminder_energized = await self._fire_reminder(
+                                ReminderPoint.STOP, ctx, conversation
+                            )
                     except Exception:
-                        logger.debug("task reminder check failed", exc_info=True)
+                        logger.debug("reminder STOP fire failed", exc_info=True)
+                    # Cache-instrumentation hook: hash the system prefix /
+                    # suffix and record the rolling-breakpoint anchor index
+                    # so post-hoc analysis of events.jsonl can pinpoint
+                    # cache anomalies without re-running the session under
+                    # DEBUG. ``request_messages`` is the exact list the
+                    # provider sent (including system prepended); strip the
+                    # system message and feed the rest to the index helper
+                    # so the index matches the live request shape.
+                    _diag = self._compute_turn_diagnostics(
+                        conversation_static=conversation.system_prompt_static,
+                        conversation_suffix=conversation.system_prompt_dynamic_suffix,
+                        request_messages=request_messages,
+                        model=turn_tokens.get("model", ""),
+                    )
                     await self._publish_llm_turn_complete(
                         stream_id,
                         node_id,
@@ -991,8 +2164,13 @@ class AgentLoop(AgentProtocol):
                         cached_tokens=turn_tokens.get("cached", 0),
                         cache_creation_tokens=turn_tokens.get("cache_creation", 0),
                         cost_usd=float(turn_tokens.get("cost", 0.0) or 0.0),
+                        credits=turn_tokens.get("credits"),
                         execution_id=execution_id,
                         iteration=iteration,
+                        system_prefix_sha=_diag["system_prefix_sha"],
+                        system_suffix_sha=_diag["system_suffix_sha"],
+                        history_anchor_idx=_diag["history_anchor_idx"],
+                        message_count=_diag["message_count"],
                     )
                     log_llm_turn(
                         node_id=node_id,
@@ -1008,26 +2186,6 @@ class AgentLoop(AgentProtocol):
                         tools=tools,
                     )
 
-                    # DS-13: inject context preservation warning once when token usage
-                    # crosses warn_ratio (default 0.45), before the 0.6 framework prune
-                    if (
-                        ctx.default_skill_warn_ratio is not None
-                        and not _context_warn_sent
-                        and conversation.usage_ratio() >= ctx.default_skill_warn_ratio
-                    ):
-                        _ratio_pct = int(conversation.usage_ratio() * 100)
-                        await conversation.add_user_message(
-                            f"[CONTEXT ALERT — {_ratio_pct}% used] "
-                            "Extract all critical data to `_working_notes` and "
-                            "`_preserved_data` now — context pruning occurs at 60% usage."
-                        )
-                        _context_warn_sent = True
-                        logger.info(
-                            "[%s] DS-13: context preservation warning injected at %d%%",
-                            node_id,
-                            _ratio_pct,
-                        )
-
                     break  # success — exit retry loop
 
                 except TurnCancelled:
@@ -1037,7 +2195,7 @@ class AgentLoop(AgentProtocol):
 
                 except Exception as e:
                     logger.debug(
-                        "[AgentLoop.execute] iteration=%d: Exception in _run_single_turn: %s (%s)",
+                        "[AgentLoop.execute] iteration=%d: Exception in _run_turn_loop: %s (%s)",
                         iteration,
                         type(e).__name__,
                         str(e)[:200],
@@ -1062,8 +2220,7 @@ class AgentLoop(AgentProtocol):
                                 self._config.capacity_retry_max_delay,
                             )
                             logger.warning(
-                                "[%s] iter=%d: capacity error (%s), persistent retry "
-                                "#%d after %.1fs (elapsed %.0fs / %.0fs budget): %s",
+                                "[%s] iter=%d: capacity error (%s), persistent retry #%d after %.1fs (elapsed %.0fs / %.0fs budget): %s",
                                 node_id,
                                 iteration,
                                 type(e).__name__,
@@ -1088,6 +2245,16 @@ class AgentLoop(AgentProtocol):
                     # Retry transient errors with exponential backoff
                     if self._is_transient_error(e) and _stream_retry_count < self._config.max_stream_retries:
                         self._bump("llm_transient_retry")
+                        try:
+                            from framework.host.runtime_health import (
+                                is_upstream_network_error,
+                                mark_upstream_degraded,
+                            )
+
+                            if is_upstream_network_error(e):
+                                mark_upstream_degraded(f"{type(e).__name__}: {str(e)[:200]}")
+                        except Exception:
+                            pass
                         _stream_retry_count += 1
                         delay = min(
                             self._config.stream_retry_backoff_base * (2 ** (_stream_retry_count - 1)),
@@ -1137,9 +2304,7 @@ class AgentLoop(AgentProtocol):
                     # can retry or adjust the request.
                     if ctx.supports_direct_user_io:
                         error_msg = f"LLM call failed: {e}"
-                        _guardrail_phrase = (
-                            "no endpoints available matching your guardrail restrictions and data policy"
-                        )
+                        _guardrail_phrase = "no endpoints available matching your guardrail restrictions and data policy"
                         if _guardrail_phrase in str(e).lower():
                             error_msg += (
                                 " OpenRouter blocked this model under current privacy settings. "
@@ -1175,7 +2340,7 @@ class AgentLoop(AgentProtocol):
                                 inner_turn=0,
                             )
                         await conversation.add_assistant_message(visible_error)
-                        await self._await_user_input(ctx)
+                        await self._await_user_input(ctx, reason=ParkReason.LLM_ERROR)
                         _llm_turn_failed_waiting_input = True
                         break  # exit retry loop, continue outer iteration
 
@@ -1224,7 +2389,26 @@ class AgentLoop(AgentProtocol):
             if _turn_cancelled:
                 logger.info("[%s] iter=%d: turn cancelled by user", node_id, iteration)
                 if ctx.supports_direct_user_io:
-                    await self._await_user_input(ctx)
+                    # Persist the user-stop park BEFORE we block. Without
+                    # this, killing the runtime mid-wait loses both the
+                    # park reason and ``_user_stopped`` (they only live in
+                    # memory), and the queen would silently auto-resume on
+                    # reload. The persisted ``pending_input`` mirrors the
+                    # other park sites (line 2498) and replays through the
+                    # restored-wait branch at line 1442 on restart.
+                    await self._write_cursor(
+                        ctx,
+                        conversation,
+                        accumulator,
+                        iteration,
+                        recent_responses=recent_responses,
+                        recent_tool_fingerprints=recent_tool_fingerprints,
+                        pending_input={
+                            "reason": ParkReason.USER_STOPPED.value,
+                            "emit_client_request": True,
+                        },
+                    )
+                    await self._await_user_input(ctx, reason=ParkReason.USER_STOPPED)
                 continue  # back to top of for-iteration loop
 
             # Queen non-transient LLM failures wait for user input and then
@@ -1232,16 +2416,28 @@ class AgentLoop(AgentProtocol):
             if _llm_turn_failed_waiting_input:
                 continue
 
-            # 6e'. Feed actual API token count back for accurate estimation
-            turn_input = turn_tokens.get("input", 0)
-            if turn_input > 0:
-                conversation.update_token_count(turn_input)
+            # 6e'. (Removed: feeding turn_tokens["input"] — the cumulative
+            # billing sum across all inner LLM calls — into the conversation
+            # was the source of fictional 1000%+ usage ratios. The single-
+            # prompt size is now reported by the FinishEvent handler inside
+            # _run_turn_loop, per LLM call, which is the unit
+            # ``max_context_tokens`` and ``usage_ratio()`` actually mean.)
 
             # 6e''. Post-turn compaction check (catches tool-result bloat).
             # Skip if pre-turn already compacted this iteration — two compactions
             # in one iteration produce back-to-back spillover files and leave the
             # agent disoriented on the very next turn.
-            if not _compacted_this_iter and conversation.needs_compaction():
+            #
+            # Also skip when the turn requested user/queen input. Otherwise a
+            # large LLM compaction (multi-minute on heavily over-budget
+            # conversations) sits between ask_user and the
+            # CLIENT_INPUT_REQUESTED emit, so the UI shows nothing for the
+            # whole compaction window — looks frozen, the human types
+            # something to "wake it up", and that input is then consumed as
+            # an answer to a question that was never displayed. The next
+            # iteration's pre-turn compaction handles the bloat once the
+            # user has actually responded.
+            if not _compacted_this_iter and not user_input_requested and not queen_input_requested and conversation.needs_compaction():
                 await self._compact(ctx, conversation, accumulator)
 
             # Reset auto-block grace streak when real work happens
@@ -1254,17 +2450,9 @@ class AgentLoop(AgentProtocol):
             # outputs are already set, accept immediately.  This prevents
             # wasted iterations when the LLM has genuinely finished its
             # work (e.g. after calling set_output in a previous turn).
-            truly_empty = (
-                not assistant_text
-                and not real_tool_results
-                and not outputs_set
-                and not user_input_requested
-                and not queen_input_requested
-            )
+            truly_empty = not assistant_text and not real_tool_results and not outputs_set and not user_input_requested and not queen_input_requested
             if truly_empty and accumulator is not None:
-                missing = self._get_missing_output_keys(
-                    accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys
-                )
+                missing = self._get_missing_output_keys(accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys)
                 # Only accept on empty response if the node actually has
                 # output_keys that are all satisfied.  Nodes with NO
                 # output_keys (e.g. the forever-alive queen) should never
@@ -1301,11 +2489,7 @@ class AgentLoop(AgentProtocol):
                     )
                     if _consecutive_empty_turns >= self._config.stall_detection_threshold:
                         # Persistent ghost stream — fail the node.
-                        error_msg = (
-                            f"Ghost empty stream: {_consecutive_empty_turns} "
-                            f"consecutive empty responses with missing "
-                            f"outputs {missing}"
-                        )
+                        error_msg = f"Ghost empty stream: {_consecutive_empty_turns} consecutive empty responses with missing outputs {missing}"
                         latency_ms = int((time.time() - start_time) * 1000)
                         if ctx.runtime_logger:
                             ctx.runtime_logger.log_node_complete(
@@ -1355,13 +2539,11 @@ class AgentLoop(AgentProtocol):
                             iteration,
                             _consecutive_empty_turns,
                         )
-                        await self._await_user_input(ctx)
+                        await self._await_user_input(ctx, reason=ParkReason.EMPTY_RESPONSES)
                         _consecutive_empty_turns = 0
                     else:
                         await conversation.add_user_message(
-                            "[System: Your response was empty. Review the "
-                            "conversation and respond to the user or take "
-                            "action with your tools.]"
+                            "[System: Your response was empty. Review the conversation and respond to the user or take action with your tools.]"
                         )
                     continue
             else:
@@ -1428,11 +2610,10 @@ class AgentLoop(AgentProtocol):
             mcp_tool_calls = [
                 tc
                 for tc in logged_tool_calls
-                if tc.get("tool_name")
-                not in (
-                    "ask_user",
-                    "escalate",
-                )
+                # Exempt tools that legitimately repeat identical calls (polls,
+                # idempotent reads, synthetics) — single source of truth in
+                # LoopConfig.replay_exempt_tools, shared with the replay breaker.
+                if tc.get("tool_name") not in self._config.replay_exempt_tools
             ]
             if mcp_tool_calls:
                 fps = self._fingerprint_tool_calls(mcp_tool_calls)
@@ -1471,14 +2652,12 @@ class AgentLoop(AgentProtocol):
                             execution_id=execution_id,
                             request_id=uuid.uuid4().hex,
                         )
-                        await conversation.add_user_message(
-                            "[SYSTEM] Escalated tool doom loop to queen for intervention."
-                        )
+                        await conversation.add_user_message("[SYSTEM] Escalated tool doom loop to queen for intervention.")
                         recent_tool_fingerprints.clear()
                         recent_responses.clear()
                     elif ctx.supports_direct_user_io:
                         await conversation.add_user_message(warning_msg)
-                        await self._await_user_input(ctx)
+                        await self._await_user_input(ctx, reason=ParkReason.DOOM_LOOP)
                         recent_tool_fingerprints.clear()
                         recent_responses.clear()
                     else:
@@ -1526,24 +2705,39 @@ class AgentLoop(AgentProtocol):
                 pending_input=None,
             )
 
-            # 6h. Worker auto-escalation on text-only turns
+            # 6h. Worker stall detection on text-only turns
             #
             # Workers that produce text without tool calls or set_output
-            # get a grace period to plan/think, then auto-escalate to the
-            # queen so the worker doesn't spin uselessly.  Sets
-            # queen_input_requested so the existing 6h'' block handles
-            # blocking and resumption.
-            _is_worker = (
-                stream_id not in ("queen", "judge")
-                and not False
-                and not ctx.supports_direct_user_io
-                and self._event_bus is not None
-            )
-            _worker_no_tool_turn = (
-                not real_tool_results and not outputs_set and not queen_input_requested and not user_input_requested
-            )
+            # get a grace period to plan/think, then are auto-failed.
+            # Two paths diverge after grace:
+            #   (a) Parallel workers (stream_id="worker:*"): synthesize
+            #       report_to_parent(status='failed', summary=…) and
+            #       exit cleanly. Per BRD fail-fast model — queen reads
+            #       the failure as a [WORKER_REPORT] and re-dispatches.
+            #       NO escalation event, NO synchronous wait.
+            #   (b) Legacy primary worker (stream_id="worker", no colon):
+            #       fall back to the pre-BRD escalation behavior — emit
+            #       ESCALATION_REQUESTED and pause for queen guidance.
+            #       Kept so existing run_agent_with_input flows that
+            #       depend on credential/ambiguity handoffs don't break.
+            _is_worker = stream_id not in ("queen", "judge") and not False and not ctx.supports_direct_user_io and self._event_bus is not None
+            _is_parallel_worker = isinstance(stream_id, str) and stream_id.startswith("worker:")
+            _worker_no_tool_turn = not real_tool_results and not outputs_set and not queen_input_requested and not user_input_requested
             if _is_worker and _worker_no_tool_turn:
                 _worker_text_only_streak += 1
+                # INFO on each grace turn so observability sees the
+                # streak climbing before any auto-fail fires. Useful
+                # for tuning worker_escalation_grace_turns (if these
+                # land for healthy workers, grace is too tight).
+                logger.info(
+                    "[%s] stall-grace iter=%d streak=%d/%d stream=%s text_preview=%r",
+                    node_id,
+                    iteration,
+                    _worker_text_only_streak,
+                    self._config.worker_escalation_grace_turns,
+                    stream_id,
+                    (assistant_text or "")[:120],
+                )
                 if _worker_text_only_streak <= self._config.worker_escalation_grace_turns:
                     _continue_count += 1
                     if ctx.runtime_logger:
@@ -1553,11 +2747,7 @@ class AgentLoop(AgentProtocol):
                             node_type="event_loop",
                             step_index=iteration,
                             verdict="CONTINUE",
-                            verdict_feedback=(
-                                "Worker auto-escalation grace"
-                                f" ({_worker_text_only_streak}"
-                                f"/{self._config.worker_escalation_grace_turns})"
-                            ),
+                            verdict_feedback=(f"Worker stall grace ({_worker_text_only_streak}/{self._config.worker_escalation_grace_turns})"),
                             tool_calls=logged_tool_calls,
                             llm_text=assistant_text,
                             input_tokens=turn_tokens.get("input", 0),
@@ -1565,13 +2755,88 @@ class AgentLoop(AgentProtocol):
                             latency_ms=iter_latency_ms,
                         )
                     continue
-                # Grace exhausted — auto-escalate to queen
-                logger.info(
-                    "[%s] iter=%d: worker text-only streak %d > grace %d, auto-escalating",
+
+                # Grace exhausted.
+                if _is_parallel_worker:
+                    # Path (a): fail-fast via synthetic report_to_parent.
+                    # Build the same payload the LLM would have built,
+                    # run it through the same handler, record on the
+                    # owning Worker, set _report_terminated. The next
+                    # iteration's 6a-pre exits cleanly with success=True
+                    # (the worker terminated cleanly — its REPORT just
+                    # says status='failed').
+                    _preview = (assistant_text or "").strip()
+                    if len(_preview) > 1500:
+                        _preview = _preview[:1500] + "…"
+                    _summary = (
+                        f"Auto-failed: {_worker_text_only_streak} consecutive "
+                        "text-only turns (no tool calls, no set_output, no "
+                        "ask_user). Worker stalled — re-dispatch with "
+                        "different parameters or take over." + (f" Last text excerpt: {_preview}" if _preview else "")
+                    )
+                    # WARNING: a parallel worker is being terminated for
+                    # stalling. Loud enough to surface in default
+                    # production logs since this is real worker failure
+                    # (the queen will need to re-dispatch).
+                    logger.warning(
+                        "[%s] AUTO-FAIL iter=%d stream=%s exec=%s — parallel worker stalled %d/%d "
+                        "consecutive text-only turns; synthesizing report_to_parent(status='failed') "
+                        "and terminating. text_preview=%r",
+                        node_id,
+                        iteration,
+                        stream_id,
+                        execution_id,
+                        _worker_text_only_streak,
+                        self._config.worker_escalation_grace_turns,
+                        _preview[:240] if _preview else "",
+                    )
+                    _synthetic_input: dict[str, Any] = {
+                        "status": "failed",
+                        "summary": _summary,
+                        "data": {"auto_fail_reason": "stall_text_only"},
+                        "tool_use_id": f"auto_fail_{uuid.uuid4().hex[:12]}",
+                    }
+                    handle_report_to_parent(_synthetic_input)
+                    _normalised = _synthetic_input.get("_normalised", {})
+                    _owner = getattr(self, "_owner_worker", None)
+                    if _owner is not None:
+                        _owner.record_explicit_report(
+                            status=_normalised.get("status", "failed"),
+                            summary=_normalised.get("summary", _summary),
+                            data=_normalised.get("data", {}),
+                        )
+                    self._report_terminated = True
+                    if ctx.runtime_logger:
+                        iter_latency_ms = int((time.time() - iter_start) * 1000)
+                        ctx.runtime_logger.log_step(
+                            node_id=node_id,
+                            node_type="event_loop",
+                            step_index=iteration,
+                            verdict="FAIL",
+                            verdict_feedback=(f"Auto-failed: stall {_worker_text_only_streak}/{self._config.worker_escalation_grace_turns}"),
+                            tool_calls=logged_tool_calls,
+                            llm_text=assistant_text,
+                            input_tokens=turn_tokens.get("input", 0),
+                            output_tokens=turn_tokens.get("output", 0),
+                            latency_ms=iter_latency_ms,
+                        )
+                    continue
+
+                # Path (b): legacy primary worker — keep escalation.
+                # WARNING for symmetry with the parallel-worker path:
+                # this is a real intervention (worker is being paused
+                # waiting for the queen) and should be visible.
+                logger.warning(
+                    "[%s] AUTO-ESCALATE iter=%d stream=%s exec=%s — legacy worker stalled %d/%d "
+                    "consecutive text-only turns; emitting ESCALATION_REQUESTED and pausing for "
+                    "queen guidance. text_preview=%r",
                     node_id,
                     iteration,
+                    stream_id,
+                    execution_id,
                     _worker_text_only_streak,
                     self._config.worker_escalation_grace_turns,
+                    (assistant_text or "")[:240],
                 )
                 await self._event_bus.emit_escalation_requested(
                     stream_id=stream_id,
@@ -1604,12 +2869,25 @@ class AgentLoop(AgentProtocol):
             if ctx.supports_direct_user_io:
                 if user_input_requested:
                     _cf_block = True
-                elif stream_id == "queen" and not real_tool_results and not outputs_set:
+                elif (
+                    stream_id == "queen"
+                    and not real_tool_results
+                    and not outputs_set
+                    and not _stop_reminder_energized
+                ):
                     # Auto-block: only for the queen (conversational node).
                     # Workers are autonomous — they block only on explicit
                     # ask_user().  Turns without tool calls or set_output
                     # (including empty ghost streams) are not work — block
                     # and wait for user input.
+                    #
+                    # Unless the STOP reminder just injected an energizing
+                    # body: parking would leave it unread until the user next
+                    # speaks, which for a reminder about something only the
+                    # AGENT can do means it never gets read at all. Give the
+                    # turn back instead. Bounded — the source's own rate limit
+                    # means the next STOP won't re-energize, so this can add
+                    # one turn, not a loop.
                     _cf_block = True
                     _cf_auto = True
 
@@ -1645,9 +2923,7 @@ class AgentLoop(AgentProtocol):
                                     node_type="event_loop",
                                     step_index=iteration,
                                     verdict="CONTINUE",
-                                    verdict_feedback=(
-                                        f"Auto-block grace ({_cf_text_only_streak}/{self._config.cf_grace_turns})"
-                                    ),
+                                    verdict_feedback=(f"Auto-block grace ({_cf_text_only_streak}/{self._config.cf_grace_turns})"),
                                     tool_calls=logged_tool_calls,
                                     llm_text=assistant_text,
                                     input_tokens=turn_tokens.get("input", 0),
@@ -1710,10 +2986,32 @@ class AgentLoop(AgentProtocol):
                 # handler (a 1-item list for a single question, 2-8 for a
                 # batch). None for auto-block turns with no explicit ask.
                 pending_qs = getattr(self, "_pending_questions", None)
+                pending_colony = getattr(self, "_pending_colony_suggestion", None)
+                pending_pivot = getattr(self, "_pending_colony_pivot", None)
+                pending_credential_form = getattr(self, "_pending_credential_form", None)
                 self._pending_questions = None
+                self._pending_colony_suggestion = None
+                self._pending_colony_pivot = None
+                self._pending_credential_form = None
+                # _cf_auto marks an auto-block: a clean text-only queen turn
+                # with no explicit ask — a *successful end of turn*, parked
+                # for the next user message. An explicit ask_user turn
+                # (_cf_auto False) carries a real pending question.
+                if pending_colony or pending_pivot:
+                    _ask_reason = ParkReason.COLONY_SUGGESTION
+                elif pending_credential_form:
+                    _ask_reason = ParkReason.CREDENTIAL_FORM
+                elif _cf_auto:
+                    _ask_reason = ParkReason.TURN_DONE
+                else:
+                    _ask_reason = ParkReason.ASK_USER
                 pending_input_state = {
                     "questions": pending_qs,
+                    "colony_suggestion": pending_colony,
+                    "colony_pivot": pending_pivot,
+                    "credential_form": pending_credential_form,
                     "emit_client_request": True,
+                    "reason": _ask_reason.value,
                 }
                 await self._write_cursor(
                     ctx,
@@ -1726,21 +3024,12 @@ class AgentLoop(AgentProtocol):
                 )
                 got_input = await self._await_user_input(
                     ctx,
+                    reason=_ask_reason,
                     questions=pending_qs,
+                    colony_suggestion=pending_colony,
+                    colony_pivot=pending_pivot,
+                    credential_form=pending_credential_form,
                 )
-                # Emit deferred tool_call_completed for ask_user
-                deferred = getattr(self, "_deferred_tool_complete", None)
-                if deferred:
-                    self._deferred_tool_complete = None
-                    await self._publish_tool_completed(
-                        deferred["stream_id"],
-                        deferred["node_id"],
-                        deferred["tool_use_id"],
-                        deferred["tool_name"],
-                        deferred["content"],
-                        deferred["is_error"],
-                        deferred["execution_id"],
-                    )
                 logger.info("[%s] iter=%d: unblocked, got_input=%s", node_id, iteration, got_input)
                 if not got_input:
                     await self._publish_loop_completed(stream_id, node_id, iteration + 1, execution_id)
@@ -1790,11 +3079,31 @@ class AgentLoop(AgentProtocol):
                         node_id,
                         iteration,
                     )
+                    # Request already published — the next iteration re-enters
+                    # the restored-wait path above, which must re-wait silently
+                    # rather than re-emit a duplicate for the same question.
+                    pending_input_state["emit_client_request"] = False
                     continue
 
                 pending_input_state = None
 
                 recent_responses.clear()
+
+                # Input arrived — clear the persisted pending-input marker
+                # NOW rather than deferring to this iteration's 6g cursor
+                # checkpoint, which an early `continue` (post-turn
+                # compaction / empty-response guard / stall handling) can
+                # skip. A stale pending_input on disk re-pops the
+                # already-answered question on the next cold resume.
+                await self._write_cursor(
+                    ctx,
+                    conversation,
+                    accumulator,
+                    iteration,
+                    recent_responses=recent_responses,
+                    recent_tool_fingerprints=recent_tool_fingerprints,
+                    pending_input=None,
+                )
 
                 # -- Judge-skip decision after queen blocking --
                 #
@@ -1883,6 +3192,7 @@ class AgentLoop(AgentProtocol):
                     "options": None,
                     "questions": None,
                     "emit_client_request": False,
+                    "reason": ParkReason.AWAITING_QUEEN.value,
                 }
                 await self._write_cursor(
                     ctx,
@@ -1893,7 +3203,7 @@ class AgentLoop(AgentProtocol):
                     recent_tool_fingerprints=recent_tool_fingerprints,
                     pending_input=pending_input_state,
                 )
-                got_input = await self._await_user_input(ctx, emit_client_request=False)
+                got_input = await self._await_user_input(ctx, reason=ParkReason.AWAITING_QUEEN, emit_client_request=False)
                 logger.info(
                     "[%s] iter=%d: queen wait unblocked, got_input=%s",
                     node_id,
@@ -1977,9 +3287,7 @@ class AgentLoop(AgentProtocol):
 
             # 6i. Judge evaluation
             should_judge = (
-                False
-                or (iteration + 1) % self._config.judge_every_n_turns == 0
-                or not real_tool_results  # no real tool calls = natural stop
+                False or (iteration + 1) % self._config.judge_every_n_turns == 0 or not real_tool_results  # no real tool calls = natural stop
             )
 
             logger.info("[%s] iter=%d: 6i should_judge=%s", node_id, iteration, should_judge)
@@ -2030,13 +3338,10 @@ class AgentLoop(AgentProtocol):
 
             if verdict.action == "ACCEPT":
                 # Check for missing output keys
-                missing = self._get_missing_output_keys(
-                    accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys
-                )
+                missing = self._get_missing_output_keys(accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys)
                 if missing and self._judge is not None:
                     hint = (
-                        f"Task incomplete. Required outputs not yet produced: {missing}. "
-                        f"Follow your system prompt instructions to complete the work."
+                        f"Task incomplete. Required outputs not yet produced: {missing}. Follow your system prompt instructions to complete the work."
                     )
                     logger.info(
                         "[%s] iter=%d: ACCEPT but missing keys %s",
@@ -2214,6 +3519,7 @@ class AgentLoop(AgentProtocol):
         *,
         is_client_input: bool = False,
         image_content: list[dict[str, Any]] | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         """Inject an external event or user input into the running loop.
 
@@ -2231,6 +3537,10 @@ class AgentLoop(AgentProtocol):
                 (e.g. worker question forwarded by the frontend).  Controls
                 message formatting in _drain_injection_queue, not wake behavior.
             image_content: Optional list of OpenAI-style image blocks to attach.
+            correlation_id: Optional id linking this message to the
+                CLIENT_INPUT_RECEIVED event already emitted for it, so the
+                drain can emit a matching CLIENT_INPUT_COMMITTED (true
+                injection time) the UI can reconcile against.
         """
         logger.debug(
             "[AgentLoop.inject_event] content_len=%d, is_client_input=%s, has_images=%s, queue_size_before=%d",
@@ -2239,8 +3549,20 @@ class AgentLoop(AgentProtocol):
             bool(image_content),
             self._injection_queue.qsize() if hasattr(self._injection_queue, "qsize") else -1,
         )
+        # Real input arriving lifts an explicit user-stop — the loop is about
+        # to run a turn on this message, so it is no longer "stopped".
+        self._user_stopped = False
+        # A real user message starts a fresh response cycle: re-arm the
+        # idle-nudge per-variant caps so each may nudge again.
+        if is_client_input:
+            self._idle_nudge_source.reset()
+            # Sentinel: re-arm the escalation source's per-park de-dup, and
+            # close any open escalation for this session — the user just
+            # answered (in-app or via a routed messaging reply).
+            self._escalation_source.reset()
+            self._notify_sentinel_local_resume()
         try:
-            await self._injection_queue.put((content, is_client_input, image_content))
+            await self._injection_queue.put((content, is_client_input, image_content, correlation_id))
             logger.debug("[AgentLoop.inject_event] Message queued successfully")
         except Exception as e:
             logger.exception("[AgentLoop.inject_event] Failed to queue message: %s", e)
@@ -2270,39 +3592,146 @@ class AgentLoop(AgentProtocol):
         self._shutdown = True
         self._input_ready.set()
 
-    def cancel_current_turn(self) -> None:
+    @property
+    def activity(self) -> LoopActivity:
+        """The loop's current top-level activity state.
+
+        Public read surface so callers (e.g. the queen orchestrator's
+        background recall injection) can tell whether the loop is mid-turn
+        without reaching into ``_activity`` directly.
+        """
+        return self._activity
+
+    @property
+    def tool_calls_used(self) -> int:
+        """Cumulative tool calls dispatched across this execute() run.
+
+        Public read surface for the run-level counter so callers
+        (Worker's cancel/crash result paths, colony budget adaptation)
+        never reach into ``_tool_calls_used`` directly.
+        """
+        return self._tool_calls_used
+
+    def apply_lifetime_budget_cap(self, new_budget: int) -> bool:
+        """Shrink this loop's lifetime tool-call budget mid-run.
+
+        The ONE sanctioned post-spawn LoopConfig mutation, and deliberately
+        narrow: shrink-only, single field. The grace-flip check re-reads
+        ``self._config.tool_call_lifetime_budget`` at every iteration
+        boundary (see execute()'s main loop), so the clamp takes effect on
+        the next turn and rides the existing budget-grace wind-down
+        (one-shot reminder → report_to_parent). Do NOT extend this pattern
+        to LoopConfig fields that are cached at spawn (e.g. the
+        orchestrator node-worker path caches its budget) — those are not
+        boundary-safe.
+
+        Note: the dispatch loop captures the budget into a local at the
+        start of each tool batch, so a clamp landing mid-batch takes
+        effect one batch late. That staleness is intended — do not "fix"
+        it into a mid-batch race.
+
+        No-ops (returns False) when:
+        - ``new_budget <= 0`` (0 means "disabled"; never disable via cap),
+        - the current budget is 0 (an unlimited loop stays unlimited),
+        - ``new_budget`` would not shrink the current budget,
+        - ``grace_iterations == 0`` (a capped worker without a declared
+          wind-down phase is not a colony worker — don't clamp it).
+        """
+        current = self._config.tool_call_lifetime_budget
+        if new_budget <= 0 or current <= 0 or new_budget >= current:
+            return False
+        if self._config.grace_iterations <= 0:
+            return False
+        self._config.tool_call_lifetime_budget = new_budget
+        logger.info(
+            "[AgentLoop] lifetime tool-call budget capped %d -> %d (used so far: %d)",
+            current,
+            new_budget,
+            self._tool_calls_used,
+        )
+        return True
+
+    def cancel_current_turn(self) -> list[asyncio.Task]:
         """Cancel the current LLM streaming turn or in-progress tool calls instantly.
 
         Unlike signal_shutdown() which permanently stops the event loop,
         this only kills the in-progress HTTP stream or tool gather task.
         The queen stays alive for the next user message.
+
+        Returns the cancelled tasks so callers can `await` them and confirm
+        the cancellation actually took effect before responding to the user.
         """
+        cancelled: list[asyncio.Task] = []
         if self._stream_task and not self._stream_task.done():
             self._stream_task.cancel()
+            cancelled.append(self._stream_task)
         if self._tool_task and not self._tool_task.done():
             self._tool_task.cancel()
+            cancelled.append(self._tool_task)
+        return cancelled
+
+    def mark_user_stopped(self) -> None:
+        """Record that the user explicitly stopped the agent.
+
+        Set by the cancel-queen route before ``cancel_current_turn()`` so
+        the idle-nudge gate sees the flag from the very first tick after
+        the cancelled turn parks the loop. Cleared *only* by
+        ``inject_event`` (a real user message). Chat re-entry no longer
+        lifts this flag — the user must send a message to resume.
+        """
+        self._user_stopped = True
+
+    @staticmethod
+    def _park_reason_from_cursor(pending: dict[str, Any]) -> ParkReason:
+        """Recover the :class:`ParkReason` for a restored pending-input wait.
+
+        Cursors written before park reasons existed carry no ``reason`` —
+        fall back to the question/questionless split they did record.
+        """
+        raw = pending.get("reason")
+        if raw:
+            try:
+                return ParkReason(raw)
+            except ValueError:
+                pass
+        return ParkReason.ASK_USER if pending.get("questions") else ParkReason.TURN_DONE
 
     async def _await_user_input(
         self,
         ctx: AgentContext,
         *,
+        reason: ParkReason = ParkReason.UNKNOWN,
         questions: list[dict] | None = None,
+        colony_suggestion: dict | None = None,
+        colony_pivot: dict | None = None,
+        credential_form: dict | None = None,
         emit_client_request: bool = True,
     ) -> bool:
         """Block until user input arrives or shutdown is signaled.
 
         Called in two situations:
-        - The LLM explicitly calls ask_user().
+        - The LLM explicitly calls ask_user() or suggest_colony().
         - Auto-block: any text-only turn (no real tools, no set_output)
           from the queen node — ensures the user sees and responds
           before the judge runs.
 
         Args:
+            reason: Why the loop is parking — see :class:`ParkReason`.
+                Recorded in ``self._park_reason`` for the duration of the
+                wait so the idle nudge can tell a legitimate question-park
+                from a broken or normal-idle one. Each call site declares
+                its own; ``UNKNOWN`` flags a site that forgot to.
             questions: Optional list of question dicts from ask_user. Each
                 dict has id, prompt, and optional options. Passed through to
                 the CLIENT_INPUT_REQUESTED event so the frontend can render
                 the appropriate widget (QuestionWidget for one, else
                 MultiQuestionWidget).
+            colony_suggestion: Optional payload from suggest_colony with
+                ``colony_id`` and optional ``reason``. When set, the
+                COLONY_SUGGESTION_REQUESTED event is emitted in place of
+                CLIENT_INPUT_REQUESTED so the frontend opens the
+                "Create Colony" popup pre-filled. Mutually exclusive with
+                ``questions`` (the queen calls one or the other per turn).
             emit_client_request: When False, wait silently without publishing
                 CLIENT_INPUT_REQUESTED. Used for worker waits where input is
                 expected from the queen via inject_message().
@@ -2328,28 +3757,138 @@ class AgentLoop(AgentProtocol):
             return True
 
         if emit_client_request and self._event_bus:
-            await self._event_bus.emit_client_input_requested(
-                stream_id=ctx.stream_id or ctx.agent_id,
-                node_id=ctx.agent_id,
-                execution_id=ctx.execution_id or "",
-                questions=questions,
-            )
+            if colony_pivot is not None:
+                # The colony-pivot popup variant — slug field starts
+                # blank for the user to fill in, and the popup shows the
+                # queen-authored goal + handoff so the user can review
+                # what's being handed over before confirming.
+                tasks_in = colony_pivot.get("tasks") or []
+                await self._event_bus.emit_colony_suggestion_requested(
+                    stream_id=ctx.stream_id or ctx.agent_id,
+                    node_id=ctx.agent_id,
+                    execution_id=ctx.execution_id or "",
+                    colony_id="",
+                    source_session_id=ctx.session_id,
+                    source_phase=colony_pivot.get("source_phase", "colony"),
+                    goal=colony_pivot.get("goal"),
+                    handoff=colony_pivot.get("handoff"),
+                    task_count=len(tasks_in) if isinstance(tasks_in, list) else 0,
+                )
+            elif colony_suggestion is not None:
+                await self._event_bus.emit_colony_suggestion_requested(
+                    stream_id=ctx.stream_id or ctx.agent_id,
+                    node_id=ctx.agent_id,
+                    execution_id=ctx.execution_id or "",
+                    colony_id=colony_suggestion.get("colony_id", ""),
+                    reason=colony_suggestion.get("reason"),
+                )
+            elif credential_form is not None:
+                await self._event_bus.emit_credential_form_requested(
+                    stream_id=ctx.stream_id or ctx.agent_id,
+                    node_id=ctx.agent_id,
+                    execution_id=ctx.execution_id or "",
+                    form=credential_form,
+                )
+            else:
+                await self._event_bus.emit_client_input_requested(
+                    stream_id=ctx.stream_id or ctx.agent_id,
+                    node_id=ctx.agent_id,
+                    execution_id=ctx.execution_id or "",
+                    questions=questions,
+                    park_reason=reason.value,
+                )
 
         if not self._injection_queue.empty() or not self._trigger_queue.empty():
             return True
 
         self._awaiting_input = True
+        # Record why the loop is parked for the duration of the wait. A
+        # question-park (ask_user / colony suggestion) is legitimate; a
+        # broken or questionless park is what the idle nudge re-engages.
+        self._park_reason = reason
+        # Sentinel: stash this park's questions so the escalation source can
+        # render them (the ask_user handler already drained _pending_questions).
+        self._park_questions = questions
+        # Announce the park's authoritative state — AWAITING_USER for a
+        # deliberate end-of-turn park, INTERRUPTED for a broken / stopped /
+        # unknown one. ParkReason.activity is the single classifier.
+        await self._set_activity(ctx, reason.activity, park_reason=reason)
         try:
             await self._input_ready.wait()
         finally:
             self._awaiting_input = False
+            self._park_reason = None
+            self._park_questions = None
+            # User input just arrived (or wait was cancelled) — count it
+            # as progress so the session-idle watchdog's clock starts
+            # fresh from this moment instead of inheriting whatever the
+            # pre-wait timestamp was.
+            self._mark_session_progress()
+            # Back to EXECUTING — unless the loop is shutting down, in which
+            # case leave the last announced state alone.
+            if not self._shutdown:
+                await self._set_activity(ctx, LoopActivity.EXECUTING)
         return not self._shutdown
+
+    # Synthetic framework tools that are appended directly to the loop's
+    # ``tools`` list (not sourced from ``dynamic_tools_provider``). They must
+    # survive a dynamic refresh, so the refresh preserves them by name.
+    _DYNAMIC_REFRESH_SYNTHETIC_NAMES = frozenset(
+        {
+            "ask_user",
+            "credentials",
+            "sentinel_setup",
+            "escalate",
+            "collect_result",
+            # Worker synthetics: report_to_parent and the worker-side
+            # search_tools are appended directly to the loop's list, so a
+            # dynamic refresh (now wired for tiered workers too) must
+            # preserve them or the worker loses its report channel mid-turn.
+            "report_to_parent",
+            "search_tools",
+        }
+    )
+
+    def _refresh_dynamic_tools(self, ctx: AgentContext, tools: list[Tool]) -> None:
+        """Re-pull the phase-aware dynamic tool list into ``tools`` in place.
+
+        For the queen, ``ctx.dynamic_tools_provider`` is
+        ``QueenPhaseState.get_current_tools`` — the set of tools currently
+        callable for the active phase, which GROWS when ``search_tools`` loads
+        a searchable tool mid-session. Mutating ``tools`` in place (rather than
+        rebinding) is required: ``_run_turn_loop``'s inner-stream closure holds
+        this exact list object by reference.
+
+        Called from TWO sites that must stay in lockstep:
+          * step 6b2 in :meth:`execute` (once per outer iteration), and
+          * the top of the inner stream loop in :meth:`_run_turn_loop`.
+        The inner-loop call is the load-bearing one: a tool loaded by a
+        ``search_tools`` call earlier in the SAME turn-loop would otherwise not
+        reach the model until the inner loop yields on a tool-free response —
+        which never happens while the model keeps emitting tool calls trying to
+        use the tool it cannot yet see (a deadlock). Refreshing here makes the
+        freshly-loaded tool callable on the very next step, exactly as the
+        ``search_tools`` "callable from your next step" note promises.
+
+        No-op when no provider is wired (non-queen nodes), so those paths keep
+        their static tool list untouched.
+        """
+        if ctx.dynamic_tools_provider is None:
+            return
+        provided = list(ctx.dynamic_tools_provider())
+        # Dedupe by name: the queen's provider includes the registry-registered
+        # search_tools, which is ALSO in the synthetic-preserve set (for the
+        # worker path, where it is loop-appended) — without the check it would
+        # appear twice in the wire list.
+        provided_names = {t.name for t in provided}
+        synthetic = [t for t in tools if t.name in self._DYNAMIC_REFRESH_SYNTHETIC_NAMES and t.name not in provided_names]
+        tools[:] = provided + synthetic
 
     # -------------------------------------------------------------------
     # Single LLM turn with caller-managed tool orchestration
     # -------------------------------------------------------------------
 
-    async def _run_single_turn(
+    async def _run_turn_loop(
         self,
         ctx: AgentContext,
         conversation: NodeConversation,
@@ -2368,7 +3907,10 @@ class AgentLoop(AgentProtocol):
         list[dict[str, Any]],
         bool,
     ]:
-        """Run a single LLM turn with streaming and tool execution.
+        """Run the agent's turn loop: stream the model, execute its tool
+        calls, re-stream — repeating until the model produces a tool-free
+        response. One pass of the inner loop is a single turn; this runs
+        as many turns as the model needs before yielding control back.
 
         Returns (assistant_text, real_tool_results, outputs_set, token_counts, logged_tool_calls,
         user_input_requested, queen_input_requested, system_prompt, messages, reported_to_parent).
@@ -2384,18 +3926,33 @@ class AgentLoop(AgentProtocol):
         ``escalate`` and should wait for queen guidance before judge
         evaluation.
 
-        ``logged_tool_calls`` accumulates ALL tool calls across inner iterations
-        (real tools, set_output, and discarded calls) for L3 logging.  Unlike
-        ``real_tool_results`` which resets each inner iteration, this list grows
-        across the entire turn.
+        ``logged_tool_calls`` accumulates ALL tool calls across the loop's
+        inner turns (real tools, set_output, and discarded calls) for L3
+        logging.  Unlike ``real_tool_results`` which resets each inner turn,
+        this list grows across the whole loop.
         """
         stream_id = ctx.stream_id or ctx.agent_id
         node_id = ctx.agent_id
         execution_id = ctx.execution_id or ""
         # Mixed-type dict: int token counts + str stop_reason/model + float cost.
+        # ``credits`` stays ``None`` until at least one FinishEvent in this turn
+        # carries an upstream ``usage.credits`` (Hive-aliased models only).
         # Typed loosely to avoid churn in the many call sites that read from it.
-        token_counts: dict[str, Any] = {"input": 0, "output": 0, "cached": 0, "cache_creation": 0, "cost": 0.0}
+        token_counts: dict[str, Any] = {
+            "input": 0,
+            "output": 0,
+            "cached": 0,
+            "cache_creation": 0,
+            "cost": 0.0,
+            "credits": None,
+        }
+        # Running tool-call count for this turn-loop (one judge
+        # iteration). Drives both the soft checkpoint reminders and the
+        # hard stop; resets here, per turn-loop. `soft_budget_reminders`
+        # tracks how many soft checkpoints have already been emitted so
+        # each budget multiple fires its reminder at most once.
         tool_call_count = 0
+        soft_budget_reminders = 0
         final_text = ""
         final_system_prompt = conversation.system_prompt
         final_messages: list[dict[str, Any]] = []
@@ -2412,19 +3969,32 @@ class AgentLoop(AgentProtocol):
         # frontend and the second call's text silently replaces the first.
         inner_turn = 0
         logger.debug(
-            "[_run_single_turn] node_id=%s, tools_count=%d, execution_id=%s",
+            "[_run_turn_loop] node_id=%s, tools_count=%d, execution_id=%s",
             node_id,
             len(tools),
             execution_id,
         )
 
-        # Continue-nudge counter: how many times we've re-streamed within this
-        # _run_single_turn because the idle/TTFT watchdog fired. Caps to avoid
-        # nudging forever when the endpoint is genuinely dead.
-        _nudge_count_this_turn = 0
+        # Reset the stream-stall source's per-turn nudge counter. It caps
+        # how many times we re-stream within this _run_turn_loop when the
+        # idle/TTFT watchdog fires, so a genuinely dead endpoint eventually
+        # surfaces as an error instead of nudging forever.
+        self._stream_stall_source.reset_turn()
 
         # Inner tool loop: stream may produce tool calls requiring re-invocation
         while True:
+            # Mid-turn dynamic tool refresh. The outer loop's 6b2 refresh runs
+            # only once per iteration, BEFORE this inner loop — but a
+            # search_tools call here loads a tool into the phase state mid-loop.
+            # Re-pull before each stream so the freshly-loaded tool reaches the
+            # model on its very next step; without this the inner loop (which
+            # only exits on a tool-free response) deadlocks: the model keeps
+            # emitting tool calls trying to use a tool that is never injected
+            # into the request's tool schema. In-place mutation keeps the
+            # _do_stream closure's `tools` reference valid. No-op (skipped)
+            # for nodes without a dynamic_tools_provider.
+            self._refresh_dynamic_tools(ctx, tools)
+
             # Pre-send guard: if context is at or over budget, compact before
             # calling the LLM — prevents API context-length errors.
             if conversation.usage_ratio() >= 1.0:
@@ -2455,13 +4025,18 @@ class AgentLoop(AgentProtocol):
             accumulated_text = ""
             tool_calls: list[ToolCallEvent] = []
             _stream_error: StreamErrorEvent | None = None
+            # Reasoning/`thinking` blocks for this turn — captured from the
+            # FinishEvent and stored on the assistant message so they are
+            # echoed back on every follow-up request (reasoning models 400
+            # otherwise). See Message.thinking_blocks.
+            _thinking_blocks: list[dict[str, Any]] = []
 
             # Gap 1 - Streaming tool execution. Any tool flagged as
             # concurrency_safe is kicked off the moment its ToolCallEvent
             # arrives in the stream, instead of waiting for the full
             # assistant message stop event. The dispatch phase below
-            # reuses these already-running tasks so read_file / grep /
-            # glob overlap with whatever text the model is still
+            # reuses these already-running tasks so terminal_rg / terminal_glob
+            # reads overlap with whatever text the model is still
             # generating. Unsafe tools (bash, edits, browser actions)
             # still wait for FinishEvent so we don't race a write
             # against a decision the model hasn't finished making.
@@ -2482,13 +4057,13 @@ class AgentLoop(AgentProtocol):
                 return _r, _iso, _dur
 
             logger.debug(
-                "[_run_single_turn] inner_turn=%d: Starting LLM stream with %d messages, %d tools",
+                "[_run_turn_loop] inner_turn=%d: Starting LLM stream with %d messages, %d tools",
                 inner_turn,
                 len(messages),
                 len(tools),
             )
             logger.debug(
-                "[_run_single_turn] inner_turn=%d: request context node=%s roles=%s system_chars=%d max_tokens=%d",
+                "[_run_turn_loop] inner_turn=%d: request context node=%s roles=%s system_chars=%d max_tokens=%d",
                 inner_turn,
                 node_id,
                 [m.get("role") for m in messages],
@@ -2497,7 +4072,7 @@ class AgentLoop(AgentProtocol):
             )
             if not messages:
                 logger.warning(
-                    "[_run_single_turn] inner_turn=%d: no non-system conversation messages "
+                    "[_run_turn_loop] inner_turn=%d: no non-system conversation messages "
                     "before LLM call for node=%s model=%s api_base=%s. "
                     "This will produce a system-only payload, which some providers reject.",
                     inner_turn,
@@ -2518,6 +4093,11 @@ class AgentLoop(AgentProtocol):
             # local models legitimately take minutes to first token. Once
             # any event has been observed, tight inter-event idle applies.
             _first_event_at: float | None = None
+            # Reset the instance-level mirror so the session-idle watchdog
+            # sees this stream as freshly-opened (substate=slow_ttft until
+            # the first event arrives, then no double-fire while it's
+            # producing).
+            self._stream_first_event_at = None
             # Partial tool_calls accumulated so far, as OpenAI-format dicts
             # ready for persistence if the stream is cut short.
             _partial_tc_dicts: list[dict[str, Any]] = []
@@ -2532,8 +4112,33 @@ class AgentLoop(AgentProtocol):
                 _partial_dicts: list[dict[str, Any]] = _partial_tc_dicts,  # noqa: B006,B008
             ) -> None:
                 nonlocal accumulated_text, _stream_error, _stream_last_event_at
-                nonlocal _first_event_at
+                nonlocal _first_event_at, _thinking_blocks
                 _clean_snapshot = ""  # visible-only text for the frontend
+                _reasoning_emitted = ""  # last reasoning emitted via CLIENT_REASONING (dedup)
+                _reasoning_native = ""  # accumulated native reasoning-delta text (thinking models)
+
+                async def _flush_reasoning() -> None:
+                    """Surface reasoning to monitors once per turn (deduped).
+
+                    Prefers the model's native reasoning stream (glm/deepseek
+                    reasoning_content, Anthropic thinking blocks) captured via
+                    ReasoningDeltaEvent; falls back to an inline <think> block
+                    when a non-thinking model uses the persona scaffold.
+                    """
+                    nonlocal _reasoning_emitted
+                    if not (self._event_bus and ctx.emits_client_io):
+                        return
+                    _reason = _reasoning_native or _extract_think_reasoning(accumulated_text)
+                    if _reason and _reason != _reasoning_emitted:
+                        _reasoning_emitted = _reason
+                        await self._event_bus.emit_client_reasoning(
+                            stream_id=stream_id,
+                            node_id=node_id,
+                            reasoning=_reason,
+                            execution_id=execution_id,
+                            iteration=iteration,
+                            inner_turn=inner_turn,
+                        )
 
                 # Split-prompt path: pass STATIC and DYNAMIC tail separately
                 # so the LLM wrapper can emit them as two Anthropic system
@@ -2551,8 +4156,23 @@ class AgentLoop(AgentProtocol):
                     _stream_last_event_at = time.monotonic()
                     if _first_event_at is None:
                         _first_event_at = _stream_last_event_at
-                    if isinstance(event, TextDeltaEvent):
+                        self._stream_first_event_at = _first_event_at
+                    # Mirror progress to the session-level clock so the
+                    # outer watchdog stays quiet during a productive stream.
+                    self._mark_session_progress()
+                    if isinstance(event, ReasoningDeltaEvent):
+                        # Native reasoning stream from a thinking model
+                        # (glm/deepseek reasoning_content, Anthropic thinking).
+                        # Accumulate; flushed to monitors when the first visible
+                        # text arrives (or at FinishEvent for tool-only turns).
+                        _reasoning_native += event.content
+
+                    elif isinstance(event, TextDeltaEvent):
                         accumulated_text = event.snapshot
+                        # Surface reasoning (native stream or inline <think>)
+                        # just before the first visible text, so monitors see
+                        # the grounding that precedes the spoken line.
+                        await _flush_reasoning()
                         # Strip internal reasoning tags from the full
                         # snapshot, then diff against what we already
                         # emitted to get the new visible delta.
@@ -2580,7 +4200,7 @@ class AgentLoop(AgentProtocol):
                             )
                         except Exception as _cp_err:  # noqa: BLE001
                             logger.debug(
-                                "[_run_single_turn] partial checkpoint failed: %s",
+                                "[_run_turn_loop] partial checkpoint failed: %s",
                                 _cp_err,
                             )
 
@@ -2607,38 +4227,88 @@ class AgentLoop(AgentProtocol):
                             )
                         except Exception as _cp_err:  # noqa: BLE001
                             logger.debug(
-                                "[_run_single_turn] partial checkpoint failed: %s",
+                                "[_run_turn_loop] partial checkpoint failed: %s",
                                 _cp_err,
                             )
                         # Gap 1: start concurrency-safe tools immediately
                         # while the rest of the stream is still arriving,
                         # so read-heavy turns don't stall after the last
                         # text delta. Unsafe tools wait for FinishEvent.
-                        if (
-                            event.tool_name in _safe_names
-                            and "_raw" not in event.tool_input
-                            and event.tool_use_id not in _tasks
-                        ):
+                        if event.tool_name in _safe_names and "_raw" not in event.tool_input and event.tool_use_id not in _tasks:
                             _tasks[event.tool_use_id] = asyncio.create_task(_exec_fn(event))
 
                     elif isinstance(event, FinishEvent):
+                        # Reasoning-only or tool-only turns produce no text
+                        # delta; flush any accumulated reasoning here so it
+                        # still reaches monitors.
+                        await _flush_reasoning()
                         token_counts["input"] += event.input_tokens
                         token_counts["output"] += event.output_tokens
                         token_counts["cached"] += event.cached_tokens
                         token_counts["cache_creation"] += event.cache_creation_tokens
                         token_counts["cost"] = token_counts.get("cost", 0.0) + event.cost_usd
+                        # Credits are cumulative-per-request from the proxy.
+                        # Each FinishEvent represents one request, so sum
+                        # across them. Skip events with no credits (direct
+                        # provider models) so we don't false-zero a turn that
+                        # had at least one Hive-aliased call.
+                        logger.info(
+                            "[credits] agent_loop FinishEvent: credits=%r model=%s",
+                            event.credits,
+                            event.model,
+                        )
+                        if event.credits is not None:
+                            token_counts["credits"] = (token_counts.get("credits") or 0.0) + event.credits
                         token_counts["stop_reason"] = event.stop_reason
                         token_counts["model"] = event.model
 
+                        # Capture reasoning blocks so the assistant turn can
+                        # echo them back next request. Each FinishEvent is one
+                        # LLM call; the last call's blocks belong to the turn
+                        # being persisted, so overwrite rather than extend.
+                        if event.thinking_blocks:
+                            _thinking_blocks = list(event.thinking_blocks)
+
+                        # Tell the conversation the size of THIS request's
+                        # prompt. ``max_context_tokens`` is a single-prompt
+                        # budget; ``usage_ratio()`` compares this field
+                        # against it. ``token_counts["input"]`` above is a
+                        # billing sum across all inner LLM calls in this
+                        # turn — feeding the sum into the conversation
+                        # would make usage_ratio compare billing to a
+                        # request budget and report fictional 1000%+
+                        # ratios. Stay strictly per-call here.
+                        if event.input_tokens > 0:
+                            conversation.update_token_count(event.input_tokens)
+
                     elif isinstance(event, StreamErrorEvent):
                         if not event.recoverable:
+                            # Surface billing-gate errors as a dedicated
+                            # SSE so the desktop client can reopen the
+                            # upgrade popup without parsing the failure
+                            # string. The execution_failed event still
+                            # fires downstream as usual.
+                            if event.error_type == "payment_required" and self._event_bus is not None:
+                                try:
+                                    await self._event_bus.emit_payment_required(
+                                        stream_id=stream_id,
+                                        execution_id=execution_id or None,
+                                        message=event.error,
+                                        upstream_status=event.upstream_status,
+                                    )
+                                except Exception:
+                                    logger.exception("Failed to emit payment_required event")
                             raise RuntimeError(f"Stream error: {event.error}")
                         _stream_error = event
                         logger.warning("Recoverable stream error: %s", event.error)
 
+            # About to stream — the loop is executing. Idempotent; this is
+            # also the recovery point after a stream-stall nudge re-streams,
+            # flipping the loop back out of INTERRUPTED.
+            await self._set_activity(ctx, LoopActivity.EXECUTING)
             _llm_stream_t0 = time.monotonic()
             self._stream_task = asyncio.create_task(_do_stream())
-            logger.debug("[_run_single_turn] inner_turn=%d: Stream task created, waiting...", inner_turn)
+            logger.debug("[_run_turn_loop] inner_turn=%d: Stream task created, waiting...", inner_turn)
 
             # Watchdog budgets — see LoopConfig docstring for rationale.
             _ttft_limit = self._config.llm_stream_ttft_timeout_seconds
@@ -2695,13 +4365,21 @@ class AgentLoop(AgentProtocol):
 
                 if _watchdog_verdict != "ok":
                     logger.warning(
-                        "[_run_single_turn] inner_turn=%d: watchdog=%s %.0fs >= %.0fs — cancelling stream",
+                        "[_run_turn_loop] inner_turn=%d: watchdog=%s %.0fs >= %.0fs — cancelling stream",
                         inner_turn,
                         _watchdog_verdict,
                         _watchdog_elapsed,
                         _watchdog_limit,
                     )
                     self._bump(f"stream_watchdog_{_watchdog_verdict}")
+                    # The stream stalled — announce INTERRUPTED. A nudge
+                    # re-stream (or the next iteration) flips it back to
+                    # EXECUTING; an unrecoverable stall raises and parks.
+                    await self._set_activity(
+                        ctx,
+                        LoopActivity.INTERRUPTED,
+                        interrupt_cause=InterruptCause.STREAM_STALL,
+                    )
                     self._stream_task.cancel()
                     try:
                         await self._stream_task
@@ -2713,17 +4391,67 @@ class AgentLoop(AgentProtocol):
                     # ``await`` is the cheapest way to surface its exception.
                     await self._stream_task
                     logger.debug(
-                        "[_run_single_turn] inner_turn=%d: Stream task completed normally",
+                        "[_run_turn_loop] inner_turn=%d: Stream task completed normally",
                         inner_turn,
                     )
             except asyncio.CancelledError:
-                logger.debug("[_run_single_turn] inner_turn=%d: Stream task cancelled", inner_turn)
+                logger.debug("[_run_turn_loop] inner_turn=%d: Stream task cancelled", inner_turn)
                 if accumulated_text or _partial_tc_dicts:
                     await conversation.add_assistant_message(
                         content=accumulated_text,
                         tool_calls=_partial_tc_dicts or None,
                         truncated=True,
                     )
+                # Persist the cancelled turn so events.jsonl and the LLM
+                # debug log show what was in flight when the user hit
+                # stop. Mirrors the success-path emit + log at 1141/1159
+                # but stamps stop_reason="cancelled" so subscribers can
+                # filter (e.g. the frontend skips the pending-queue
+                # flush — handleCancelQueen already drained one).
+                # Also flushes accumulated client_output_delta snapshots
+                # for this stream via the LLM_TURN_COMPLETE handler in
+                # the event bus.
+                try:
+                    _cancelled_counts = {**token_counts, "stop_reason": "cancelled"}
+                    _cancel_diag = self._compute_turn_diagnostics(
+                        conversation_static=conversation.system_prompt_static,
+                        conversation_suffix=conversation.system_prompt_dynamic_suffix,
+                        request_messages=final_messages,
+                        model=_cancelled_counts.get("model", ""),
+                    )
+                    await self._publish_llm_turn_complete(
+                        stream_id,
+                        node_id,
+                        stop_reason="cancelled",
+                        model=_cancelled_counts.get("model", ""),
+                        input_tokens=_cancelled_counts.get("input", 0),
+                        output_tokens=_cancelled_counts.get("output", 0),
+                        cached_tokens=_cancelled_counts.get("cached", 0),
+                        cache_creation_tokens=_cancelled_counts.get("cache_creation", 0),
+                        cost_usd=float(_cancelled_counts.get("cost", 0.0) or 0.0),
+                        credits=_cancelled_counts.get("credits"),
+                        execution_id=execution_id,
+                        iteration=iteration,
+                        system_prefix_sha=_cancel_diag["system_prefix_sha"],
+                        system_suffix_sha=_cancel_diag["system_suffix_sha"],
+                        history_anchor_idx=_cancel_diag["history_anchor_idx"],
+                        message_count=_cancel_diag["message_count"],
+                    )
+                    log_llm_turn(
+                        node_id=node_id,
+                        stream_id=stream_id,
+                        execution_id=execution_id,
+                        iteration=iteration,
+                        system_prompt=final_system_prompt,
+                        messages=final_messages,
+                        assistant_text=accumulated_text,
+                        tool_calls=logged_tool_calls + list(_partial_tc_dicts or []),
+                        tool_results=[],
+                        token_counts=_cancelled_counts,
+                        tools=tools,
+                    )
+                except Exception:
+                    logger.debug("cancel-turn telemetry failed", exc_info=True)
                 # Gap 1: kill any early-dispatched tool tasks too.
                 # Without this, a safe tool started during streaming
                 # would leak past cancellation and keep running.
@@ -2741,7 +4469,7 @@ class AgentLoop(AgentProtocol):
                     raise
                 raise TurnCancelled() from None
             except Exception as e:
-                logger.exception("[_run_single_turn] inner_turn=%d: Stream task failed: %s", inner_turn, e)
+                logger.exception("[_run_turn_loop] inner_turn=%d: Stream task failed: %s", inner_turn, e)
                 # Don't orphan early tool tasks on a stream failure
                 # either - the outer retry loop will re-emit the tool
                 # calls on the next attempt.
@@ -2775,11 +4503,6 @@ class AgentLoop(AgentProtocol):
                         truncated=True,
                     )
 
-                reason_label = (
-                    "no tokens before TTFT budget"
-                    if _watchdog_verdict == "ttft"
-                    else "stream went silent after producing events"
-                )
                 if self._event_bus:
                     if _watchdog_verdict == "ttft":
                         await self._event_bus.emit_stream_ttft_exceeded(
@@ -2798,41 +4521,47 @@ class AgentLoop(AgentProtocol):
                             execution_id=execution_id,
                         )
 
-                nudge_enabled = self._config.continue_nudge_enabled
-                nudge_cap = self._config.continue_nudge_max_per_turn
-                if nudge_enabled and _nudge_count_this_turn < nudge_cap:
-                    _nudge_count_this_turn += 1
-                    nudge_msg = (
-                        f"[System: the previous stream stalled ({reason_label}, "
-                        f"{_watchdog_elapsed:.0f}s). Continue from the last tool "
-                        "result already in this conversation. Do NOT repeat tool "
-                        "calls whose results are visible above — reuse them and "
-                        "move to the next step.]"
-                    )
+                # Consult the stream-stall reminder source synchronously —
+                # it owns the nudge text and the per-turn cap. A returned
+                # reminder is injected inline: we re-stream this same turn,
+                # so it cannot be deferred to the iteration-boundary drain.
+                stall_reminders = await self._reminder_hub.collect(
+                    ReminderPoint.STREAM_STALLED,
+                    ctx,
+                    signals=LoopSignals(
+                        stall_reason=_watchdog_verdict,
+                        stall_elapsed=_watchdog_elapsed,
+                    ),
+                )
+                if stall_reminders:
+                    nudge = stall_reminders[0]
                     await conversation.add_user_message(
-                        nudge_msg,
-                        is_system_nudge=True,
+                        wrap_reminder([nudge.body]) or nudge.body,
+                        is_system_reminder=True,
                     )
+                    await self._emit_reminder_injected(ctx, nudge)
                     if self._event_bus:
+                        # Diagnostic counterpart, kept alongside the generic
+                        # reminder_injected event.
                         await self._event_bus.emit_stream_nudge_sent(
                             stream_id=stream_id,
                             node_id=node_id,
                             reason=_watchdog_verdict,
-                            nudge_count=_nudge_count_this_turn,
+                            nudge_count=int(nudge.meta.get("nudge_count", 0)),
                             execution_id=execution_id,
                         )
                     logger.info(
-                        "[%s] continue-nudge sent (count=%d/%d, reason=%s)",
+                        "[%s] continue-nudge sent (count=%s/%s, reason=%s)",
                         node_id,
-                        _nudge_count_this_turn,
-                        nudge_cap,
+                        nudge.meta.get("nudge_count"),
+                        nudge.meta.get("cap"),
                         _watchdog_verdict,
                     )
                     # Reset the outer _turn_t0 timer so the "LLM done in
                     # Xms" log line reflects real work not the nudge cycle.
                     _llm_stream_ms = int((time.monotonic() - _llm_stream_t0) * 1000)
                     logger.debug(
-                        "[_run_single_turn] inner_turn=%d: nudge restart after %dms",
+                        "[_run_turn_loop] inner_turn=%d: nudge restart after %dms",
                         inner_turn,
                         _llm_stream_ms,
                     )
@@ -2841,8 +4570,7 @@ class AgentLoop(AgentProtocol):
                 # existing retry path so a truly dead endpoint eventually
                 # surfaces as an error.
                 raise ConnectionError(
-                    f"LLM stream {_watchdog_verdict} for {_watchdog_elapsed:.0f}s "
-                    f"(limit {_watchdog_limit:.0f}s) — nudge cap reached"
+                    f"LLM stream {_watchdog_verdict} for {_watchdog_elapsed:.0f}s (limit {_watchdog_limit:.0f}s) — nudge cap reached"
                 )
 
             _llm_stream_ms = int((time.monotonic() - _llm_stream_t0) * 1000)
@@ -2889,7 +4617,15 @@ class AgentLoop(AgentProtocol):
                 await conversation.add_assistant_message(
                     content=accumulated_text,
                     tool_calls=tc_dicts,
+                    thinking_blocks=_thinking_blocks or None,
                 )
+
+            # Reminder bookkeeping: one inner turn = one model stream +
+            # its tool batch — the standard "turn". Counted here, per
+            # inner turn, so the drift counter tracks real model activity
+            # rather than the coarse outer judge-cycle iteration. The hub
+            # swallows source errors internally.
+            self._reminder_hub.observe_turn([tc.tool_name for tc in tool_calls])
 
             # If no tool calls, turn is complete
             if not tool_calls:
@@ -2909,33 +4645,72 @@ class AgentLoop(AgentProtocol):
             # Priority drain: if user sent a message while the LLM was
             # streaming, inject it into the conversation NOW -- before tool
             # execution.  The LLM will see it on the next inner turn.
+            # Mirrors drain_injection_queue() in cursor_persistence.py:
+            # same timestamp prefix, is_client_input, and image_content
+            # so steered messages enter the conversation identically to
+            # messages drained at the outer-loop boundary.
             if not self._injection_queue.empty():
                 while not self._injection_queue.empty():
-                    _inj_content, _inj_client, _inj_images = self._injection_queue.get_nowait()
+                    _inj_content, _inj_client, _inj_images, _inj_corr = self._injection_queue.get_nowait()
+                    _inj_stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
                     if _inj_client:
-                        await conversation.add_user_message(_inj_content)
+                        _inj_stamped = f"[{_inj_stamp}] {_inj_content}" if _inj_content else f"[{_inj_stamp}]"
+                    else:
+                        _inj_stamped = f"[{_inj_stamp}] [External event] {_inj_content}"
+                    _inj_msg = await conversation.add_user_message(
+                        _inj_stamped,
+                        is_client_input=_inj_client,
+                        image_content=_inj_images if _inj_images else None,
+                    )
+                    if _inj_client:
                         logger.info(
                             "[%s] Priority-injected user message mid-turn (%d chars)",
                             node_id,
                             len(_inj_content),
                         )
-                    else:
-                        await conversation.add_user_message(_inj_content)
+                        # The message truly enters the conversation HERE (mid-turn,
+                        # before tool execution), not at receive time. Announce the
+                        # real injection moment + seq so the UI can place the bubble
+                        # after the in-flight turn's deltas. See emit docstring.
+                        if self._event_bus and ctx.emits_client_io:
+                            await self._event_bus.emit_client_input_committed(
+                                stream_id=stream_id,
+                                node_id=node_id,
+                                execution_id=execution_id,
+                                seq=_inj_msg.seq,
+                                correlation_id=_inj_corr,
+                            )
 
             # Execute tool calls -- framework tools (set_output, ask_user)
             # run inline; real MCP tools run in parallel.
             real_tool_results: list[dict] = []
             limit_hit = False
+            # True when the deferral was caused by the cumulative (lifetime)
+            # budget rather than the per-turn hard stop — so the advisory can
+            # name the right cause (and point at the grace wind-down).
+            lifetime_limit_hit = False
             executed_in_batch = 0
-            # hard_limit <= 0 disables the per-turn cap entirely. Some
-            # models routinely emit 50+ tool calls per turn during wide
-            # fan-out scenarios (browser exploration, bulk code reads);
-            # capping them strands work mid-turn and the next turn just
-            # re-emits the discarded calls, which is strictly worse.
-            if self._config.max_tool_calls_per_turn > 0:
-                hard_limit = int(self._config.max_tool_calls_per_turn * (1 + self._config.tool_call_overflow_margin))
+            # Calls skipped because we're in the grace iteration and they
+            # weren't in ``_GRACE_TERMINAL_TOOLS``. Handled symmetrically
+            # with ``limit_hit`` after Phase 3: each gets a neutral
+            # placeholder so the conversation stays consistent and the
+            # judge sees the attempt.
+            grace_skipped: list[ToolCallEvent] = []
+            # Tool-call pacing budget. `soft_interval` is the cadence at
+            # which we ride an escalating *checkpoint* reminder on the
+            # tool-result tail (a nudge to reassess, never a stop);
+            # `hard_limit` is where the turn-loop actually stops and
+            # defers remaining calls. soft_interval <= 0 disables both.
+            soft_interval = self._config.tool_call_budget
+            if soft_interval > 0:
+                hard_limit = soft_interval * max(1, self._config.tool_call_hard_multiple)
             else:
                 hard_limit = 0  # disabled
+            # Cumulative (lifetime) tool-call budget across the whole run.
+            # Unlike `hard_limit` (per turn-loop), this reads the run-level
+            # `self._tool_calls_used`. Hitting it mid-batch defers the rest;
+            # the next iteration boundary flips into grace wind-down. 0 = off.
+            lifetime_budget = self._config.tool_call_lifetime_budget
 
             # Phase 1: triage — handle framework tools immediately,
             # queue real tools for parallel execution.
@@ -2956,15 +4731,61 @@ class AgentLoop(AgentProtocol):
             # tool call before dispatch; see tool_input_coercer module.
             _tool_by_name = {t.name: t for t in tools}
 
+            # Pre-batch duplicate scan for the hard-breaker variant of the
+            # replay detector. Counts (name, canonical-args) within this
+            # LLM response so an in-batch loop (e.g. 25 identical parallel
+            # tool calls in one response) trips the breaker even though
+            # each call has no completed prior in the conversation yet.
+            def _canonical_args(_inp: Any) -> str:
+                try:
+                    return json.dumps(_inp, sort_keys=True, default=str)
+                except (TypeError, ValueError):
+                    return str(_inp)
+
+            batch_dup_count: Counter[tuple[str, str]] = Counter((tc.tool_name, _canonical_args(tc.tool_input)) for tc in tool_calls)
+
             for tc in tool_calls:
                 _tool_schema = _tool_by_name.get(tc.tool_name)
                 if _tool_schema is not None:
                     coerce_tool_input(_tool_schema, tc.tool_input)
+                # Grace iteration: skip dispatch for non-terminal tools.
+                # The skipped call gets a neutral placeholder appended
+                # alongside the limit_hit handling below (same shape:
+                # is_error=False, tool result in conversation, entry in
+                # real_tool_results / logged_tool_calls). Does not count
+                # against the per-turn tool-call budget — these calls
+                # never actually executed.
+                if self._in_grace and tc.tool_name not in _GRACE_TERMINAL_TOOLS:
+                    grace_skipped.append(tc)
+                    continue
                 tool_call_count += 1
                 if hard_limit > 0 and tool_call_count > hard_limit:
                     limit_hit = True
                     break
+                # Lifetime (cumulative) budget hard stop — mirrors the
+                # per-turn hard stop above, but on the run-level counter.
+                # Reads the pre-increment total so the worker executes
+                # exactly `lifetime_budget` calls then defers the rest; the
+                # next iteration boundary flips into grace wind-down.
+                #
+                # Skip this once we're already in grace: grace dispatch is
+                # restricted to _GRACE_TERMINAL_TOOLS (everything else was
+                # grace-skipped above), and those terminal tools
+                # (report_to_parent / tracker_upsert / task_update) are the
+                # wind-down channel itself — deferring them here would trap
+                # the worker, unable to report or persist, so it could only
+                # die silently at max_iterations. Grace's own restriction +
+                # the grace_iterations ceiling bound the work instead.
+                if lifetime_budget > 0 and not self._in_grace and self._tool_calls_used >= lifetime_budget:
+                    limit_hit = True
+                    lifetime_limit_hit = True
+                    break
                 executed_in_batch += 1
+                # Count only calls that pass both gates and proceed to
+                # execution — grace-skipped (continue above) and
+                # limit-deferred (break above) calls are excluded, so the
+                # lifetime budget reflects work actually done.
+                self._tool_calls_used += 1
 
                 await self._publish_tool_started(
                     stream_id,
@@ -3054,11 +4875,7 @@ class AgentLoop(AgentProtocol):
                     if not questions:
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
-                            content=(
-                                "ERROR: no valid question objects in "
-                                "'questions'. Each entry must be an "
-                                "object with 'id' and 'prompt'."
-                            ),
+                            content=("ERROR: no valid question objects in 'questions'. Each entry must be an object with 'id' and 'prompt'."),
                             is_error=True,
                         )
                         results_by_id[tc.tool_use_id] = result
@@ -3088,12 +4905,7 @@ class AgentLoop(AgentProtocol):
                     # chat message so the user sees it. Widget-rendered
                     # cases (single-with-options, multi) draw their own
                     # question text, so no text delta is needed.
-                    if (
-                        len(questions) == 1
-                        and "options" not in questions[0]
-                        and questions[0]["prompt"]
-                        and ctx.emits_client_io
-                    ):
+                    if len(questions) == 1 and "options" not in questions[0] and questions[0]["prompt"] and ctx.emits_client_io:
                         _q_text = questions[0]["prompt"]
                         await self._publish_text_delta(
                             stream_id,
@@ -3117,6 +4929,356 @@ class AgentLoop(AgentProtocol):
                     )
                     results_by_id[tc.tool_use_id] = result
 
+                elif tc.tool_name == "credentials":
+                    # --- Single CLI-style credentials tool ---
+                    # All actions except `collect` are non-blocking and
+                    # resolve synchronously via credential_tool helpers.
+                    # `collect` stashes a no-secret form spec and parks the
+                    # loop (mirrors ask_user) so the user can submit secrets
+                    # that go straight to the encrypted store.
+                    from framework.agent_loop.internals import (
+                        credential_tool as _credtool,
+                    )
+
+                    _ci = tc.tool_input if isinstance(tc.tool_input, dict) else {}
+                    _action = str(_ci.get("action", "") or "help").strip().lower()
+                    _cred_id = str(_ci.get("credential_id", "") or "")
+                    _cred_account = str(_ci.get("account", "") or "")
+
+                    if _action == "collect":
+                        _payload, _err = _credtool.validate_collect_input(_ci)
+                        if _err:
+                            results_by_id[tc.tool_use_id] = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                content=f"ERROR: {_err}",
+                                is_error=True,
+                            )
+                            continue
+                        _payload["correlation_id"] = uuid.uuid4().hex
+                        self._pending_credential_form = _payload
+                        user_input_requested = True
+                        _field_names = ", ".join(f["name"] for f in _payload["fields"])
+                        results_by_id[tc.tool_use_id] = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                f"Showing the user a secure form for "
+                                f"'{_payload['credential_id']}' (account "
+                                f"'{_payload['account']}', fields: {_field_names}). "
+                                "Waiting for them to submit — the values are "
+                                "stored securely and are not shown to you."
+                            ),
+                            is_error=False,
+                        )
+                    else:
+                        if _action in ("", "help"):
+                            _content = _credtool.render_help()
+                        elif _action == "browse":
+                            _content = _credtool.browse(_ci.get("query"))
+                        elif _action == "inspect":
+                            _content = _credtool.inspect(_cred_id, _cred_account)
+                        elif _action == "reveal":
+                            _content = _credtool.reveal(
+                                _cred_id,
+                                _cred_account,
+                                str(_ci.get("key", "") or ""),
+                            )
+                        elif _action == "attach":
+                            _content = _credtool.add_attachment(ctx.session_id, _cred_id, _cred_account)
+                        elif _action == "detach":
+                            _content = _credtool.remove_attachment(ctx.session_id, _cred_id, _cred_account)
+                        else:
+                            _content = f"ERROR: unknown credentials action '{_action}'. Call credentials() with no arguments for usage."
+                        results_by_id[tc.tool_use_id] = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=_content,
+                            is_error=_content.startswith("ERROR:"),
+                        )
+
+                elif tc.tool_name == "sentinel_setup":
+                    # --- Sentinel (Slack/Telegram) setup tool ---
+                    # Stores channel tokens + writes per-colony notifications
+                    # config in-process (same store/config the desktop UI uses).
+                    # configure/test default to the colony bound to this session.
+                    from framework.agent_loop.internals import (
+                        sentinel_tool as _sentineltool,
+                    )
+
+                    _binding = None
+                    _prov = getattr(ctx, "colony_binding_provider", None)
+                    if callable(_prov):
+                        try:
+                            _binding = _prov()
+                        except Exception:
+                            _binding = None
+                    _content = await _sentineltool.handle(
+                        tc.tool_input if isinstance(tc.tool_input, dict) else {},
+                        default_colony_id=getattr(_binding, "name", None),
+                    )
+                    results_by_id[tc.tool_use_id] = ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        content=_content,
+                        is_error=_content.startswith("ERROR:"),
+                    )
+
+                elif tc.tool_name == "suggest_colony":
+                    # --- Framework-level suggest_colony handling ---
+                    # Mirrors ask_user: stash a payload, set
+                    # user_input_requested=True, and rely on the
+                    # post-turn block to emit the
+                    # COLONY_SUGGESTION_REQUESTED event and wait for the
+                    # frontend to either drive the colony fork (POST
+                    # /api/sessions with colony_id + source_session_id)
+                    # or inject a dismissal message back into this
+                    # session.
+                    import re as _re
+
+                    _COLONY_NAME_RE = _re.compile(r"^[a-z0-9_]+$")
+
+                    if stream_id != "queen":
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=("ERROR: suggest_colony is queen-only. Workers fan out via run_worker inside an existing colony."),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    # Phase gate (defense in depth). Mirrors the
+                    # tool-list partition: ``suggest_colony`` is wired
+                    # into the queen's INDEPENDENT-phase tool list only
+                    # (see queen_orchestrator._phase_tools), so a
+                    # colony-mode queen shouldn't see it. Defense in
+                    # depth: re-check the same precondition (phase ==
+                    # "independent") at dispatch, the way ``escalate``
+                    # re-checks ``stream_id`` even though the tool is
+                    # already filtered out for queen/judge streams. The
+                    # phase reads through ``iteration_metadata_provider``
+                    # — the same callback the loop already uses for the
+                    # per-iteration event payload — so this stays
+                    # decoupled from QueenPhaseState's API.
+                    _phase: str | None = None
+                    if ctx.iteration_metadata_provider is not None:
+                        try:
+                            _phase = (ctx.iteration_metadata_provider() or {}).get("phase")
+                        except Exception:
+                            _phase = None
+                    if _phase is not None and _phase != "independent":
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                "ERROR: suggest_colony is only available "
+                                "in the independent (DM) phase. You are "
+                                "already inside a colony — fan out with "
+                                "run_worker, schedule recurring "
+                                "runs with set_trigger, or share protocol "
+                                "with workers via write_skill."
+                            ),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    raw_name = tc.tool_input.get("colony_id", "")
+                    cn = str(raw_name or "").strip()
+                    if not _COLONY_NAME_RE.match(cn):
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                "ERROR: colony_id must be lowercase "
+                                "alphanumeric with underscores (e.g. "
+                                "'morning_hn_digest'). The popup is "
+                                "pre-filled with this slug, so make it "
+                                "user-friendly."
+                            ),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    raw_reason = tc.tool_input.get("reason", "")
+                    reason = str(raw_reason or "").strip() or None
+
+                    user_input_requested = True
+                    self._pending_colony_suggestion = {
+                        "colony_id": cn,
+                        "reason": reason,
+                    }
+
+                    result = ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        content=(
+                            "Colony creation popup opened with "
+                            f"colony_id='{cn}'. Waiting for the user "
+                            "to confirm or dismiss. If they confirm, "
+                            "this session will lock and you'll be "
+                            "compacted into the new colony's queen "
+                            "seed. If they dismiss, you'll receive a "
+                            "follow-up message and can continue."
+                        ),
+                        is_error=False,
+                    )
+                    results_by_id[tc.tool_use_id] = result
+
+                elif tc.tool_name == "task_create" and tc.tool_input.get("new_colony") is True:
+                    # --- Framework-level task_create(new_colony=true) intercept ---
+                    # The colony-pivot path needs to BLOCK until the user
+                    # confirms or dismisses the popup, which can take many
+                    # minutes — far longer than ``tool_call_timeout_seconds``
+                    # (60s). Doing the wait inside the registered task_create
+                    # executor causes ``asyncio.wait_for`` in
+                    # tool_result_handler.execute_tool to cancel the call and
+                    # surface a "tool timed out" error to the queen (observed
+                    # in linkedin_4 session 20260519: queen called the pivot
+                    # correctly, framework cancelled at 60s, queen fell back
+                    # to doing the off-goal work inline). The fix: intercept
+                    # here BEFORE execute_tool runs, mirror the suggest_colony
+                    # pattern — stash the rich payload, set user_input_requested,
+                    # return a synthetic "popup opened" result, and let the
+                    # post-turn block park on _input_ready. Accept/dismiss
+                    # routes wake the loop via inject_event.
+
+                    if stream_id != "queen":
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=("ERROR: task_create(new_colony=true) is queen-only. Workers don't spawn colonies."),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    # Phase gate — defense in depth; the schema only
+                    # exposes new_colony to colony-phase queens, but a
+                    # mid-session switch_to_independent could leave a
+                    # stale field reachable.
+                    _phase: str | None = None
+                    if ctx.iteration_metadata_provider is not None:
+                        try:
+                            _phase = (ctx.iteration_metadata_provider() or {}).get("phase")
+                        except Exception:
+                            _phase = None
+                    if _phase is not None and _phase != "colony":
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                f"ERROR: task_create(new_colony=true) is colony-only (currently '{_phase}'). "
+                                "In DM, use new_session for unrelated work, or suggest_colony to spawn the first colony."
+                            ),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    goal_in = tc.tool_input.get("goal")
+                    handoff_in = tc.tool_input.get("handoff")
+                    tasks_in = tc.tool_input.get("tasks")
+                    goal = (goal_in or "").strip() if isinstance(goal_in, str) else ""
+                    handoff = (handoff_in or "").strip() if isinstance(handoff_in, str) else ""
+                    if not goal:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                "ERROR: task_create(new_colony=true) requires a `goal` — state the new colony's "
+                                "purpose in one sentence, in the user's terms. The new colony anchors on this."
+                            ),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+                    if not handoff:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                "ERROR: task_create(new_colony=true) requires a `handoff`. The new colony inherits "
+                                "NOTHING from this conversation; without a handoff its queen starts blind. Write a "
+                                "complete, objective brief: user goal in their terms, concrete data (names, URLs, "
+                                "IDs, file paths, account to use, exact requirements), decisions made and options "
+                                "ruled out, constraints, what 'done' looks like."
+                            ),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+                    if not isinstance(tasks_in, list) or not tasks_in:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=("ERROR: task_create(new_colony=true) requires a non-empty `tasks` array — the plan that gets seeded into the new colony."),
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    pivot_payload = {
+                        "goal": goal,
+                        "handoff": handoff,
+                        "tasks": list(tasks_in),
+                        "source_phase": "colony",
+                    }
+
+                    # Sink runs FIRST so the orchestrator can veto on
+                    # state agent_loop doesn't know about (e.g. a freshly
+                    # forked colony whose kickoff turn must not re-pivot,
+                    # signalled via session.fork_kickoff_pending). The
+                    # sink returns None to accept, or an error string to
+                    # reject; we propagate the string as an is_error
+                    # tool result and skip the popup entirely.
+                    sink = getattr(ctx, "pivot_payload_sink", None)
+                    sink_error: str | None = None
+                    if callable(sink):
+                        try:
+                            sink_result = sink(pivot_payload)
+                            if isinstance(sink_result, str) and sink_result.strip():
+                                sink_error = sink_result.strip()
+                        except Exception:
+                            logger.warning(
+                                "[%s] pivot_payload_sink raised — popup may render without rich payload",
+                                node_id,
+                                exc_info=True,
+                            )
+                    if sink_error:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=f"ERROR: {sink_error}",
+                            is_error=True,
+                        )
+                        results_by_id[tc.tool_use_id] = result
+                        user_input_requested = False
+                        continue
+
+                    # Stash the rich payload on self so the post-turn
+                    # block emits a rich COLONY_SUGGESTION_REQUESTED.
+                    # The popup renders goal + handoff + task_count
+                    # inline so the user can review what's being handed
+                    # over before confirming.
+                    self._pending_colony_pivot = pivot_payload
+                    user_input_requested = True
+
+                    result = ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        content=(
+                            "Colony pivot popup opened (goal: "
+                            f"{goal[:80]}). Waiting for the user to "
+                            "confirm a slug and create the new colony, "
+                            "or dismiss. If they confirm, the new colony "
+                            "is spawned with this handoff + task plan "
+                            "and they navigate there; you stay here "
+                            "idle on this colony's existing plan. If "
+                            "they dismiss, you'll receive a follow-up "
+                            "message instructing you to call ask_user "
+                            "for explicit direction. End your turn now "
+                            "and wait for the user."
+                        ),
+                        is_error=False,
+                    )
+                    results_by_id[tc.tool_use_id] = result
+
                 elif tc.tool_name == "escalate":
                     # --- Framework-level escalate handling ---
                     reason = str(tc.tool_input.get("reason", "")).strip()
@@ -3125,9 +5287,7 @@ class AgentLoop(AgentProtocol):
                     if stream_id in ("queen", "judge"):
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
-                            content=(
-                                "ERROR: escalate is only available to worker nodes/sub-agents, not queen/judge streams."
-                            ),
+                            content=("ERROR: escalate is only available to worker nodes/sub-agents, not queen/judge streams."),
                             is_error=True,
                         )
                         results_by_id[tc.tool_use_id] = result
@@ -3219,27 +5379,78 @@ class AgentLoop(AgentProtocol):
                         )
                         results_by_id[tc.tool_use_id] = result
                     else:
-                        # Replay detector: flag re-executions of recent
-                        # successful calls. We still run the tool (some
-                        # are legitimately repeated, e.g. screenshots and
-                        # read-only evaluates) but prepend a terse steer
-                        # onto the stored result so the model sees the
-                        # signal on its next turn.
-                        if self._config.replay_detector_enabled:
-                            prior = conversation.find_completed_tool_call(
+                        # Replay detector — two-tier:
+                        #   * Below ``tool_doom_loop_threshold`` consecutive
+                        #     identical occurrences: soft-prepend a steer
+                        #     onto the stored result and still execute
+                        #     (back-compat with screenshots/evaluates that
+                        #     are legitimately repeated).
+                        #   * At/above the threshold: trip the breaker —
+                        #     refuse to execute, stub the offending and
+                        #     sibling calls, park the loop as
+                        #     ParkReason.DOOM_LOOP. The streak counts both
+                        #     duplicates **within this batch** (catches a
+                        #     single LLM response with N identical
+                        #     parallel calls) and across **recent
+                        #     completed assistant turns**.
+                        # Skip the replay breaker for tools that legitimately
+                        # repeat identical calls — polls (collect_result,
+                        # terminal_job_logs), idempotent reads/observers
+                        # (a hive-browser screenshot, …), and synthetics. Single source
+                        # of truth: LoopConfig.replay_exempt_tools (shared with
+                        # the doom-loop fingerprint above). Without this, e.g. a
+                        # 3-minute image poll trips the breaker at 3 polls.
+                        if (
+                            self._config.replay_detector_enabled
+                            and tc.tool_name not in self._config.replay_exempt_tools
+                        ):
+                            canonical = _canonical_args(tc.tool_input)
+                            in_batch_dup = batch_dup_count[(tc.tool_name, canonical)]
+                            prior_streak = conversation.count_consecutive_completed_tool_calls(
                                 tc.tool_name,
                                 tc.tool_input,
                                 within_last_turns=self._config.replay_detector_within_last_turns,
+                                skip_most_recent_assistant=True,
                             )
-                            if prior is not None:
+                            streak = prior_streak + in_batch_dup
+                            threshold = self._config.tool_doom_loop_threshold
+
+                            if streak >= threshold:
+                                await self._trip_tool_breaker(
+                                    ctx=ctx,
+                                    conversation=conversation,
+                                    stream_id=stream_id,
+                                    node_id=node_id,
+                                    execution_id=execution_id,
+                                    offending_tc=tc,
+                                    pending_real=pending_real,
+                                    tool_calls=tool_calls,
+                                    results_by_id=results_by_id,
+                                    streak=streak,
+                                    prior_streak=prior_streak,
+                                    in_batch_dup=in_batch_dup,
+                                )
+                                # _trip_tool_breaker raises TurnCancelled.
+
+                            prior = (
+                                conversation.find_completed_tool_call(
+                                    tc.tool_name,
+                                    tc.tool_input,
+                                    within_last_turns=self._config.replay_detector_within_last_turns,
+                                )
+                                if prior_streak > 0
+                                else None
+                            )
+                            if prior is not None or in_batch_dup > 1:
                                 logger.warning(
-                                    "[%s] replay detected: %s matches prior seq=%d — executing anyway",
+                                    "[%s] replay detected: %s prior_streak=%d in_batch_dup=%d — executing anyway",
                                     node_id,
                                     tc.tool_name,
-                                    prior.seq,
+                                    prior_streak,
+                                    in_batch_dup,
                                 )
                                 self._bump("tool_call_replay_detected")
-                                if self._event_bus:
+                                if self._event_bus and prior is not None:
                                     await self._event_bus.emit_tool_call_replay_detected(
                                         stream_id=stream_id,
                                         node_id=node_id,
@@ -3249,8 +5460,10 @@ class AgentLoop(AgentProtocol):
                                     )
                                 replay_prefixes_by_id[tc.tool_use_id] = (
                                     f"[Replay detected: {tc.tool_name} matches "
-                                    f"seq={prior.seq}. Result still produced below — "
-                                    "consider whether the retry was necessary.]\n"
+                                    f"{prior_streak} prior consecutive turn(s) + "
+                                    f"{max(0, in_batch_dup - 1)} duplicate(s) in this batch. "
+                                    "Result still produced below — consider whether the "
+                                    "retry was necessary.]\n"
                                 )
                         pending_real.append(tc)
 
@@ -3443,6 +5656,60 @@ class AgentLoop(AgentProtocol):
                     )
                     caption_tasks[tc.tool_use_id] = asyncio.create_task(_captioning_chain(intent, res.image_content))
 
+            # Reminder POST_TOOL_USE point: ride the tail of this batch's
+            # last real tool result so the model sees fresh state right
+            # where it's working (see framework.agent_loop.reminders).
+            # Best-effort — a reminder failure must never break the turn.
+            _task_tail: str | None = None
+            _tail_target_id: str | None = None
+            try:
+                _batch_tool_names = [tc.tool_name for tc in tool_calls[:executed_in_batch]]
+                _task_tail = await self._reminder_hub.fire(
+                    ReminderPoint.POST_TOOL_USE, ctx, tool_names=_batch_tool_names
+                )
+            except Exception:
+                logger.debug("reminder POST_TOOL_USE failed", exc_info=True)
+
+            # Soft tool-call budget checkpoint. Each time the running
+            # count crosses a new budget multiple (below the hard stop)
+            # we ride one escalating checkpoint reminder on the tail.
+            # `crossed` is capped at hard_multiple - 1 so the soft
+            # checkpoint never doubles up with the hard-stop advisory.
+            #
+            # Additional sources fire at TOOL_BUDGET_CHECKPOINT (tracker
+            # snapshot, colony fleet snapshot, …); their bodies are merged
+            # into the same <system-reminder> block so the model sees one
+            # consolidated checkpoint, not a wall of sibling blocks.
+            _budget_tail: str | None = None
+            if soft_interval > 0 and hard_limit > 0:
+                crossed = min(
+                    tool_call_count // soft_interval,
+                    max(1, self._config.tool_call_hard_multiple) - 1,
+                )
+                if crossed > soft_budget_reminders:
+                    soft_budget_reminders = crossed
+                    self._bump("tool_budget_soft_reminder")
+                    _checkpoint_bodies = [_render_tool_budget_checkpoint(tool_call_count, hard_limit)]
+                    try:
+                        _extra_items = await self._reminder_hub.collect(ReminderPoint.TOOL_BUDGET_CHECKPOINT, ctx)
+                    except Exception:
+                        logger.debug(
+                            "reminder TOOL_BUDGET_CHECKPOINT (soft) failed",
+                            exc_info=True,
+                        )
+                        _extra_items = []
+                    _checkpoint_bodies.extend(r.body for r in _extra_items)
+                    _budget_tail = wrap_reminder(_checkpoint_bodies)
+
+            # One combined tail block — task reminders and the budget
+            # checkpoint both ride the last real tool result.
+            _combined_tail = "\n\n".join(t for t in (_task_tail, _budget_tail) if t) or None
+            if _combined_tail:
+                for _tc in reversed(tool_calls[:executed_in_batch]):
+                    if _tc.tool_name not in ("ask_user", "escalate"):
+                        _tail_target_id = _tc.tool_use_id
+                        break
+
             for tc in tool_calls[:executed_in_batch]:
                 result = results_by_id.get(tc.tool_use_id)
                 if result is None:
@@ -3474,10 +5741,14 @@ class AgentLoop(AgentProtocol):
                     caption_result = await caption_tasks.pop(tc.tool_use_id)
                     if caption_result:
                         caption, vision_model = caption_result
+                        # If the captioned image was a crop (zoom / clipped
+                        # screenshot), the subagent's (fx,fy) labels are
+                        # crop-relative — remap them to viewport fractions
+                        # so a coordinate click off this caption lands right.
+                        caption = remap_caption_for_crop(caption, result.content)
                         vision_fallback_marker = f"[vision-fallback caption]\n{caption}"
                         logger.info(
-                            "vision_fallback: captioned %d image(s) for tool '%s' "
-                            "(main model '%s' routed through fallback model '%s')",
+                            "vision_fallback: captioned %d image(s) for tool '%s' (main model '%s' routed through fallback model '%s')",
                             len(image_content),
                             tc.tool_name,
                             ctx.llm.model if ctx.llm else "?",
@@ -3486,8 +5757,7 @@ class AgentLoop(AgentProtocol):
                     else:
                         vision_fallback_marker = "[image stripped — vision fallback exhausted]"
                         logger.info(
-                            "vision_fallback: exhausted; stripping %d image(s) from "
-                            "tool '%s' result without caption (model '%s')",
+                            "vision_fallback: exhausted; stripping %d image(s) from tool '%s' result without caption (model '%s')",
                             len(image_content),
                             tc.tool_name,
                             ctx.llm.model if ctx.llm else "?",
@@ -3508,70 +5778,189 @@ class AgentLoop(AgentProtocol):
                 if vision_fallback_marker:
                     stored_content = f"{stored_content or ''}\n\n{vision_fallback_marker}"
 
+                # Append the task / budget reminder tail to this
+                # batch's last real tool result.
+                if _combined_tail and tc.tool_use_id == _tail_target_id:
+                    stored_content = f"{stored_content or ''}\n\n{_combined_tail}"
+
                 await conversation.add_tool_result(
                     tool_use_id=tc.tool_use_id,
                     content=stored_content,
                     is_error=result.is_error,
                     image_content=image_content,
                     is_skill_content=result.is_skill_content,
+                    # Out-of-band recovery pointer so microcompaction/prune can
+                    # cite where this result's full content lives on disk even
+                    # when it was small enough to be inlined without a header.
+                    spillover_path=getattr(result, "spillover_path", None),
                 )
-                if tc.tool_name == "ask_user" and user_input_requested and not result.is_error:
-                    # Defer tool_call_completed until after user responds
-                    self._deferred_tool_complete = {
-                        "stream_id": stream_id,
-                        "node_id": node_id,
+                # Publish tool_call_completed immediately for every tool,
+                # including ask_user. ask_user returns synchronously
+                # ("Waiting for user input...") — its completion event
+                # carries that same content whether emitted now or after
+                # the user answers, so deferring it only left the tool
+                # pill spinning indefinitely (and orphaned on restart).
+                # The "awaiting input" UX is driven separately by the
+                # CLIENT_INPUT_REQUESTED event / question widget.
+                await self._publish_tool_completed(
+                    stream_id,
+                    node_id,
+                    tc.tool_use_id,
+                    tc.tool_name,
+                    result.content,
+                    result.is_error,
+                    execution_id,
+                )
+
+                # Real-time context-usage update after this individual tool
+                # result lands in the conversation. The debug panel reads
+                # this stream to show "size of the prompt that will go out
+                # next" — granularity is per-tool-call, including content
+                # for the just-added result, all tool args, system prompt,
+                # and tool definitions.
+                await self._publish_context_usage(ctx, conversation, "post_tool_call", tools=tools)
+
+            # Grace iteration: append placeholders for every non-terminal
+            # call that was skipped above. Same shape as the limit_hit
+            # branch — keeps the conversation's tool_use/tool_result pairs
+            # balanced so the next model turn doesn't repeat them, and
+            # puts the entries into real_tool_results / logged_tool_calls
+            # so the implicit judge sees them as attempted (RETRY path).
+            # We deliberately do NOT short-circuit return here: terminal
+            # tools (e.g. report_to_parent) that *did* dispatch in this
+            # same batch still need their handlers to run normally so
+            # _report_terminated can be set.
+            if grace_skipped:
+                logger.info(
+                    "Grace iteration: skipped %d non-terminal call(s) (whitelist=%s): %s",
+                    len(grace_skipped),
+                    sorted(_GRACE_TERMINAL_TOOLS),
+                    ", ".join(tc.tool_name for tc in grace_skipped),
+                )
+                self._bump("grace_iteration_skipped", len(grace_skipped))
+                for tc in grace_skipped:
+                    await conversation.add_tool_result(
+                        tool_use_id=tc.tool_use_id,
+                        content=_GRACE_SKIP_MSG,
+                        is_error=False,
+                    )
+                    skip_entry = {
                         "tool_use_id": tc.tool_use_id,
                         "tool_name": tc.tool_name,
-                        "content": result.content,
-                        "is_error": result.is_error,
-                        "execution_id": execution_id,
+                        "tool_input": tc.tool_input,
+                        "content": _GRACE_SKIP_MSG,
+                        "is_error": False,
                     }
-                else:
-                    await self._publish_tool_completed(
-                        stream_id,
-                        node_id,
-                        tc.tool_use_id,
-                        tc.tool_name,
-                        result.content,
-                        result.is_error,
-                        execution_id,
-                    )
+                    real_tool_results.append(skip_entry)
+                    logged_tool_calls.append(skip_entry)
 
-            # If the limit was hit, add error results for every remaining
-            # tool call so the conversation stays consistent.  Without this,
-            # the assistant message contains tool_calls that have no
-            # corresponding tool results, causing the LLM to repeat them
-            # in the next turn (infinite loop).
+            # If the limit was hit, add a result for every remaining tool
+            # call so the conversation stays consistent. Without this, the
+            # assistant message contains tool_calls that have no matching
+            # tool results, causing the LLM to repeat them in the next
+            # turn (infinite loop). The deferred calls are NOT errors —
+            # nothing was attempted and nothing failed — so each result
+            # is a neutral advisory (is_error=False) and the overflow is
+            # surfaced once as a <system-reminder>, not as N tool errors.
             if limit_hit:
                 skipped = tool_calls[executed_in_batch:]
-                logger.warning(
-                    "Hard tool call limit (%d) exceeded — discarding %d remaining call(s): %s",
+                logger.info(
+                    "Tool-call budget hard stop (%d) reached — deferring %d remaining call(s) with an advisory (not an error): %s",
                     hard_limit,
                     len(skipped),
                     ", ".join(tc.tool_name for tc in skipped),
                 )
-                discard_msg = (
-                    f"Tool call discarded: hard limit of {hard_limit} tool calls "
-                    f"per turn exceeded. Consolidate your work and "
-                    f"use fewer tool calls."
-                )
+                self._bump("tool_budget_deferred", len(skipped))
+                if lifetime_limit_hit:
+                    defer_msg = (
+                        "[Not executed — you reached your cumulative tool-call "
+                        "budget for this task. This is not an error and the call "
+                        "did not fail. You are out of work budget: next turn winds "
+                        "down — report_to_parent now (tracker_upsert / task_update "
+                        "also allowed) instead of re-issuing this call.]"
+                    )
+                else:
+                    defer_msg = (
+                        "[Not executed — the tool-call budget hard stop was reached "
+                        "before this call. This is not an error and the call did "
+                        "not fail; re-issue it on the next turn if still needed.]"
+                    )
                 for tc in skipped:
                     await conversation.add_tool_result(
                         tool_use_id=tc.tool_use_id,
-                        content=discard_msg,
-                        is_error=True,
+                        content=defer_msg,
+                        is_error=False,
                     )
-                    # Discarded calls go into real_tool_results so the
-                    # caller sees they were attempted (for judge context).
-                    discard_entry = {
+                    # Deferred calls go into real_tool_results so the judge
+                    # sees they were attempted — as non-errors.
+                    defer_entry = {
                         "tool_use_id": tc.tool_use_id,
                         "tool_name": tc.tool_name,
                         "tool_input": tc.tool_input,
-                        "content": discard_msg,
-                        "is_error": True,
+                        "content": defer_msg,
+                        "is_error": False,
                     }
-                    real_tool_results.append(discard_entry)
-                    logged_tool_calls.append(discard_entry)
+                    real_tool_results.append(defer_entry)
+                    logged_tool_calls.append(defer_entry)
+                # One consolidated advisory for the whole overflow, posted
+                # to the reminder hub as a reactive reminder — drained
+                # (and <system-reminder>-wrapped) at the next iteration
+                # boundary like every other hub reminder.
+                #
+                # TOOL_BUDGET_CHECKPOINT sources (tracker snapshot, fleet
+                # snapshot) also fire here. Unlike the soft path — which
+                # rides the *current* turn's tool_result tail — the hard
+                # stop is forcibly ending the turn, and its advisory is
+                # already next-turn (via ``post()``). We merge the source
+                # bodies into the SAME posted reminder so the model sees
+                # one consolidated "you hit the wall, here's what was
+                # deferred, here's the state of the world" block on its
+                # next turn — not the advisory in one block and the
+                # snapshot in another.
+                if lifetime_limit_hit:
+                    _hard_stop_bodies = [
+                        f"{len(skipped)} tool call(s) were deferred: you reached "
+                        f"your cumulative tool-call budget of {lifetime_budget} "
+                        "for this whole task (not a per-turn cap). Nothing failed "
+                        "— the deferred calls are listed above with a neutral "
+                        "result.\n\n"
+                        "You are out of work budget. Next turn is a wind-down: "
+                        "dispatch is restricted to report_to_parent / "
+                        "tracker_upsert / task_update. Consolidate what you have "
+                        "and call report_to_parent now — do not start new work."
+                    ]
+                else:
+                    _hard_stop_bodies = [
+                        f"{len(skipped)} tool call(s) were deferred: you hit the "
+                        f"tool-call budget hard stop of {hard_limit} calls for this "
+                        "turn-loop. Nothing failed — the deferred calls are listed "
+                        "above with a neutral result.\n\n"
+                        "Hitting the hard stop is a strong signal to step back, not "
+                        "to plough on. Next turn: consolidate (batch related work, "
+                        "drop redundant calls), and if the current approach isn't "
+                        "converging, switch to a different approach or consult the "
+                        "user rather than re-issuing the same calls."
+                    ]
+                try:
+                    _hard_extra = await self._reminder_hub.collect(ReminderPoint.TOOL_BUDGET_CHECKPOINT, ctx)
+                except Exception:
+                    logger.debug(
+                        "reminder TOOL_BUDGET_CHECKPOINT (hard) failed",
+                        exc_info=True,
+                    )
+                    _hard_extra = []
+                _hard_stop_bodies.extend(r.body for r in _hard_extra)
+                self._reminder_hub.post(
+                    Reminder(
+                        source="tool_budget",
+                        body="\n\n".join(_hard_stop_bodies),
+                        meta={
+                            "deferred": len(skipped),
+                            "cause": "lifetime_budget" if lifetime_limit_hit else "per_turn_hard_stop",
+                            "limit": lifetime_budget if lifetime_limit_hit else hard_limit,
+                        },
+                    )
+                )
                 # Prune old tool results NOW to prevent context bloat on the
                 # next turn.  The char-based token estimator underestimates
                 # actual API tokens, so the standard compaction check in the
@@ -3603,7 +5992,7 @@ class AgentLoop(AgentProtocol):
                 )
 
             # --- Image eviction: strip old screenshot image_content ---
-            # Screenshots from browser_screenshot are inlined as base64
+            # Screenshots from hive-browser screenshot are inlined as base64
             # data URLs in message.image_content. Each screenshot costs
             # ~250k tokens when the provider counts base64 as text
             # (gemini, most non-Anthropic providers). Four screenshots
@@ -3634,11 +6023,28 @@ class AgentLoop(AgentProtocol):
                         conversation.usage_ratio() * 100,
                     )
 
-            await self._publish_context_usage(ctx, conversation, "post_tool_results")
+            await self._publish_context_usage(ctx, conversation, "post_tool_results", tools=tools)
 
             # If the turn requested external input (ask_user or queen handoff),
             # return immediately so the outer loop can block before judge eval.
             if user_input_requested or queen_input_requested:
+                return (
+                    final_text,
+                    real_tool_results,
+                    outputs_set_this_turn,
+                    token_counts,
+                    logged_tool_calls,
+                    user_input_requested,
+                    queen_input_requested,
+                    final_system_prompt,
+                    final_messages,
+                    False,
+                )
+
+            # Worker called report_to_parent — bail out of the inner loop now
+            # so we don't burn an extra LLM call before the outer for-loop's
+            # _report_terminated check at the top of the next iteration fires.
+            if self._report_terminated:
                 return (
                     final_text,
                     real_tool_results,
@@ -3721,10 +6127,7 @@ class AgentLoop(AgentProtocol):
                         )
                         return JudgeVerdict(
                             action="ACCEPT",
-                            feedback=(
-                                f"[judge unavailable after {max_attempts} attempts: "
-                                f"{type(e).__name__}; accepting to avoid stalling the loop]"
-                            ),
+                            feedback=(f"[judge unavailable after {max_attempts} attempts: {type(e).__name__}; accepting to avoid stalling the loop]"),
                         )
                     # Non-transient — re-raise so the caller sees it.
                     raise
@@ -3869,19 +6272,236 @@ class AgentLoop(AgentProtocol):
             enabled=self._config.tool_doom_loop_enabled,
         )
 
-    async def _execute_tool(self, tc: ToolCallEvent) -> ToolResult:
-        """Execute a tool call, handling both sync and async executors.
+    async def _trip_tool_breaker(
+        self,
+        *,
+        ctx: AgentContext,
+        conversation: NodeConversation,
+        stream_id: str,
+        node_id: str,
+        execution_id: str,
+        offending_tc: ToolCallEvent,
+        pending_real: list[ToolCallEvent],
+        tool_calls: list[ToolCallEvent],
+        results_by_id: dict[str, ToolResult],
+        streak: int,
+        prior_streak: int,
+        in_batch_dup: int,
+    ) -> None:
+        """Hard-breaker variant of the replay detector.
 
-        Applies ``tool_call_timeout_seconds`` from LoopConfig to prevent
-        hung MCP servers from blocking the event loop indefinitely.
-        The initial executor call is offloaded to a thread pool so that
-        sync executors (MCP STDIO tools that block on ``future.result()``)
-        don't freeze the event loop.
+        Refuses the offending tool call, stubs every sibling pending-or-
+        already-queued call in the same batch (so the conversation has no
+        dangling ``tool_use`` blocks), emits the doom-loop event, injects a
+        ``[SYSTEM]`` user message, and parks the loop as
+        ``ParkReason.DOOM_LOOP`` — which maps to
+        ``LoopActivity.INTERRUPTED``. Always raises :class:`TurnCancelled`
+        so the outer execute loop continues cleanly.
+
+        Called *before* ``pending_real.append(tc)``, so the offending tool
+        never executes. Callers should not assume control returns.
+        """
+        description = (
+            f"Tool breaker tripped: {offending_tc.tool_name} reached "
+            f"{streak} consecutive identical call(s) "
+            f"(prior_streak={prior_streak}, in_batch_dup={in_batch_dup}, "
+            f"threshold={self._config.tool_doom_loop_threshold})"
+        )
+        logger.warning("[%s] %s", node_id, description)
+        self._bump("tool_call_breaker_tripped")
+
+        # Stub the offending call.
+        offending_stub = (
+            f"[Breaker tripped: {offending_tc.tool_name} has been called "
+            f"{streak} times in a row with identical arguments. This call "
+            "was NOT executed. Take a different action or produce a "
+            "text-only turn to clear the streak.]"
+        )
+        await conversation.add_tool_result(
+            tool_use_id=offending_tc.tool_use_id,
+            content=offending_stub,
+            is_error=True,
+        )
+        await self._publish_tool_completed(
+            stream_id,
+            node_id,
+            offending_tc.tool_use_id,
+            offending_tc.tool_name,
+            offending_stub,
+            is_error=True,
+            execution_id=execution_id,
+        )
+
+        # Stub every sibling tool in this batch that doesn't already have
+        # a result (framework-tools like ask_user have already populated
+        # results_by_id; pending_real entries are queued real tools that
+        # haven't run yet; later-in-list entries haven't been visited).
+        sibling_stub = (
+            "[Tool call cancelled — breaker tripped on a sibling tool call "
+            "in the same response. Re-issue with a different argument or "
+            "a different approach.]"
+        )
+        offending_id = offending_tc.tool_use_id
+        # Track which tool_use_ids already have a result in the conversation
+        # so we don't double-stub framework tools that wrote their result
+        # earlier in the dispatch loop. add_tool_result has its own dedup
+        # guard as a backstop.
+        already_resulted: set[str] = set()
+        for m in conversation.messages:
+            if m.role == "tool" and m.tool_use_id is not None:
+                already_resulted.add(m.tool_use_id)
+        for sibling in tool_calls:
+            if sibling.tool_use_id == offending_id:
+                continue
+            if sibling.tool_use_id in results_by_id:
+                continue
+            if sibling.tool_use_id in already_resulted:
+                continue
+            await conversation.add_tool_result(
+                tool_use_id=sibling.tool_use_id,
+                content=sibling_stub,
+                is_error=True,
+            )
+            await self._publish_tool_completed(
+                stream_id,
+                node_id,
+                sibling.tool_use_id,
+                sibling.tool_name,
+                sibling_stub,
+                is_error=True,
+                execution_id=execution_id,
+            )
+        pending_real.clear()
+
+        # Telemetry — reuse the existing doom-loop event so the UI banner
+        # is identical to the turn-level detector's.
+        if self._event_bus:
+            await self._event_bus.emit_tool_doom_loop(
+                stream_id=stream_id,
+                node_id=node_id,
+                description=description,
+                execution_id=execution_id,
+            )
+
+        # System message so the model sees the reason on resume.
+        await conversation.add_user_message(
+            f"[SYSTEM] {description}. You are repeating the same tool "
+            "calls with identical arguments. Try a different approach or "
+            "different arguments."
+        )
+
+        # Park the loop as INTERRUPTED via ParkReason.DOOM_LOOP, then
+        # raise TurnCancelled so the outer execute loop continues.
+        await self._await_user_input(ctx, reason=ParkReason.DOOM_LOOP)
+        raise TurnCancelled()
+
+    def _resolve_tool_timeout(self, tool_name: str) -> float:
+        """Effective per-call timeout: longest matching prefix override wins.
+
+        ``tool_timeout_overrides`` exists because the flat 60s default is
+        wrong for browser tools — heavy-page evaluates legitimately run
+        long, and on the shared per-server MCP client a call queued behind
+        a slow one needs the same headroom (a false timeout used to
+        force-disconnect the shared transport for every worker).
+        """
+        overrides = getattr(self._config, "tool_timeout_overrides", None) or {}
+        best = ""
+        for prefix in overrides:
+            if tool_name.startswith(prefix) and len(prefix) > len(best):
+                best = prefix
+        return overrides[best] if best else self._config.tool_call_timeout_seconds
+
+    async def _execute_tool(self, tc: ToolCallEvent) -> ToolResult:
+        """Execute a tool call. Three paths:
+
+        * ``collect_result`` — the synthetic poll tool for backgrounded calls;
+          handled here, never dispatched to an MCP server.
+        * a tool in ``LoopConfig.background_tools`` — dispatched as a detached
+          task; a handle is returned IMMEDIATELY so a call that can run for
+          minutes (e.g. image generation) never blocks the loop or trips the
+          per-call timeout. The agent retrieves it via ``collect_result``.
+        * everything else — runs inline via ``_execute_tool_inner`` with the
+          resolved per-tool timeout.
+        """
+        if tc.tool_name == "collect_result":
+            return await self._collect_background_result(tc)
+
+        # Worker-side tool tiering. Two branches, both scoped to streams that
+        # carry a ToolTierState (queens keep theirs in QueenPhaseState and hit
+        # neither):
+        #   * ``search_tools`` executes in-loop against THIS worker's tier —
+        #     the registry-registered handler closes over the queen's state.
+        #   * a searchable-but-not-loaded name is refused with an instructive
+        #     error instead of executing. Dispatch is registry-membership only,
+        #     so without this gate a deferred tool would silently run even
+        #     though its schema was never advertised. The log line doubles as
+        #     the telemetry counter for wrongly-deferred tools.
+        _tier = getattr(getattr(self, "_agent_ctx", None), "tool_tier_state", None)
+        if _tier is not None:
+            if tc.tool_name == "search_tools":
+                _handler = getattr(self, "_worker_search_tools_handler", None)
+                if _handler is not None:
+                    try:
+                        _payload = await _handler(**(tc.tool_input or {}))
+                    except TypeError as e:
+                        _payload = json.dumps({"error": f"search_tools: {e}"})
+                    return ToolResult(tool_use_id=tc.tool_use_id, content=_payload)
+            elif tc.tool_name in _tier.searchable_names():
+                logger.info(
+                    "[tool-tier] blocked not-loaded tool call: %s (stream=%s)",
+                    tc.tool_name,
+                    getattr(getattr(self, "_agent_ctx", None), "stream_id", "?"),
+                )
+                return ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    content=json.dumps(
+                        {
+                            "error": (
+                                f"Tool '{tc.tool_name}' is available but its schema is not loaded yet. "
+                                f'Call search_tools(query="select:{tc.tool_name}") first, then retry — '
+                                "it stays loaded for the rest of the session."
+                            )
+                        }
+                    ),
+                    is_error=True,
+                )
+
+        # Bridge multi-tenant routing: for AstrBot-proxied tools (astrbot__*),
+        # inject the current run's session_id so the AstrBot side can route the
+        # tool's side effects (e.g. a generated image) back to the correct QQ chat.
+        if tc.tool_name.startswith("astrbot__"):
+            try:
+                _sid = getattr(getattr(self, "_agent_ctx", None), "session_id", None)
+                if _sid and isinstance(tc.tool_input, dict):
+                    tc.tool_input["_hive_session"] = _sid
+            except Exception:
+                pass
+
+        # Queen strict-account preflight. The MCP tools run in a stdio
+        # subprocess with its own CredentialStoreAdapter that can't see the
+        # parent's ``_strict_account_mode`` ContextVar, so the check happens
+        # here: block OAuth calls that omit ``account=`` when >1 account is
+        # authorized, returning the ``account_selection_required`` payload.
+        preflight = _queen_account_preflight(tc)
+        if preflight is not None:
+            return preflight
+
+        if tc.tool_name in (getattr(self._config, "background_tools", None) or set()):
+            return self._start_background_tool(tc)
+
+        return await self._execute_tool_inner(tc, self._resolve_tool_timeout(tc.tool_name))
+
+    async def _execute_tool_inner(self, tc: ToolCallEvent, timeout: float) -> ToolResult:
+        """Run a tool to completion with ``timeout`` (the non-background path).
+
+        The initial executor call is offloaded to a thread pool so that sync
+        executors (MCP STDIO tools that block on ``future.result()``) don't
+        freeze the event loop. Also runs the attach_file chip-publish post-step.
         """
         result = await execute_tool(
             tool_executor=self._tool_executor,
             tc=tc,
-            timeout=self._config.tool_call_timeout_seconds,
+            timeout=timeout,
             skill_dirs=getattr(self, "_skill_dirs", []),
         )
         # Cheap post-hoc classification: the timeout handler in
@@ -3892,7 +6512,113 @@ class AgentLoop(AgentProtocol):
             self._bump("tool_call_timeout")
         elif result.is_error:
             self._bump("tool_error")
+        # attach_file post-process: the tool runs in a queen-agnostic
+        # pooled MCP subprocess and can't see HIVE_STORAGE_PATH, so the
+        # tool returns plain entries with `resolved` paths. The framework
+        # is the SINGLE chip-publishing path — copy the bytes here and
+        # inject `hive_attachment_url` into the result summary so the
+        # chip pipeline (add_assistant_message → msg.images → renderer's
+        # AttachmentChip) can surface it. If publish fails for any reason
+        # `_publish_attach_file_result` rewrites the result into an
+        # is_error so the agent surfaces failure instead of fake success.
+        if tc.tool_name == "attach_file" and not result.is_error:
+            try:
+                result = _publish_attach_file_result(result, self._conversation_store)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("attach_file chip publish raised: %s", exc)
+                result = _attach_file_publish_failure(result, f"unexpected error: {exc}")
         return result
+
+    def _start_background_tool(self, tc: ToolCallEvent) -> ToolResult:
+        """Start a background tool's real call as a detached task and return a
+        handle. The agent collects the outcome later via ``collect_result``."""
+        self._bg_counter += 1
+        handle = f"bg_{self._bg_counter}"
+        timeout = float(getattr(self._config, "background_tool_timeout_seconds", 235.0))
+        task = asyncio.create_task(self._execute_tool_inner(tc, timeout))
+
+        def _retrieve(t: asyncio.Task) -> None:
+            # Retrieve any exception so a never-collected task doesn't log
+            # "exception was never retrieved"; the awaited path in
+            # collect_result surfaces real failures to the agent.
+            if not t.cancelled():
+                t.exception()
+
+        task.add_done_callback(_retrieve)
+        self._background_calls[handle] = {
+            "task": task,
+            "tool": tc.tool_name,
+            "started": time.time(),
+        }
+        logger.info("[AgentLoop] backgrounded tool '%s' as %s", tc.tool_name, handle)
+        payload = {
+            "status": "started",
+            "handle": handle,
+            "tool": tc.tool_name,
+            "note": (
+                f"'{tc.tool_name}' is running in the background (can take a few "
+                f'minutes). Call collect_result(handle="{handle}") to fetch it; '
+                'it returns {"status":"pending"} until done, then the real result.'
+            ),
+        }
+        return ToolResult(tool_use_id=tc.tool_use_id, content=json.dumps(payload), is_error=False)
+
+    async def _collect_background_result(self, tc: ToolCallEvent) -> ToolResult:
+        """Handle the synthetic ``collect_result`` poll for a backgrounded tool."""
+        tool_input = tc.tool_input or {}
+        handle = tool_input.get("handle")
+        entry = self._background_calls.get(handle) if isinstance(handle, str) else None
+        if entry is None:
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                content=json.dumps(
+                    {
+                        "error": (
+                            f"Unknown or already-collected handle: {handle!r}. It may "
+                            "have been collected already, or never started."
+                        )
+                    }
+                ),
+                is_error=True,
+            )
+        try:
+            wait_seconds = int(tool_input.get("wait_seconds", 30))
+        except (TypeError, ValueError):
+            wait_seconds = 30
+        wait_seconds = max(1, min(wait_seconds, 45))
+        task: asyncio.Task = entry["task"]
+        try:
+            # shield: a poll-wait timeout must not cancel the in-flight work.
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+        except asyncio.TimeoutError:
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                content=json.dumps(
+                    {
+                        "status": "pending",
+                        "handle": handle,
+                        "elapsed_seconds": int(time.time() - entry["started"]),
+                    }
+                ),
+                is_error=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._background_calls.pop(handle, None)
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                content=json.dumps({"error": f"Background tool '{entry['tool']}' failed: {exc}"}),
+                is_error=True,
+            )
+        # Done — hand back the tool's real result, re-attached to THIS
+        # collect_result call so the conversation pairs request/result correctly.
+        self._background_calls.pop(handle, None)
+        return ToolResult(
+            tool_use_id=tc.tool_use_id,
+            content=result.content,
+            is_error=result.is_error,
+            image_content=getattr(result, "image_content", None),
+            is_skill_content=getattr(result, "is_skill_content", False),
+        )
 
     def _next_spill_filename(self, tool_name: str) -> str:
         """Return a short, monotonic filename for a tool result spill."""
@@ -3953,7 +6679,6 @@ class AgentLoop(AgentProtocol):
         - Small results (≤ limit): full content kept + file annotation
         - Large results (> limit): preview + file reference
         - Errors: pass through unchanged
-        - read_file results: truncate with pagination hint (no re-spill)
 
         For large results this does a synchronous JSON round-trip
         (``json.loads`` + pretty-print ``json.dumps(indent=2)``) plus a
@@ -4000,15 +6725,17 @@ class AgentLoop(AgentProtocol):
     ) -> None:
         """Compact conversation history to stay within token budget.
 
+        0. Microcompaction — count-based clearing of old compactable tool results.
         1. Prune old tool results (always, free).
-        2. Structure-preserving compaction (standard, free) — removes freeform text
-           to spillover files, retains tool-call structure.
-        3. LLM summary compaction — generates a summary and places it as the first
-           message, replacing old messages. Used whenever structural compaction
-           does not fully resolve the budget.
-        4. Emergency deterministic summary only if LLM failed or unavailable.
+        2. LLM summary compaction — generates a summary and places it as the first
+           message, replacing old messages. Used whenever pruning alone does not
+           fully resolve the budget.
+        3. Emergency deterministic summary only if LLM failed or unavailable.
         """
-        return await compact(
+        # Reminder hook: let sources re-assert context that compaction
+        # would otherwise summarize away (e.g. the open task list).
+        await self._fire_reminder(ReminderPoint.PRE_COMPACT, ctx, conversation)
+        result = await compact(
             ctx=ctx,
             conversation=conversation,
             accumulator=accumulator,
@@ -4017,6 +6744,12 @@ class AgentLoop(AgentProtocol):
             char_limit=self._LLM_COMPACT_CHAR_LIMIT,
             max_depth=self._LLM_COMPACT_MAX_DEPTH,
         )
+        # After compaction: re-announce surfaces the model can't see unless
+        # told (deferred-tool manifest, skills catalog). Placed into the fresh
+        # post-summary context so the first post-compact turn has them — the
+        # summary itself does not faithfully reproduce a tool/skill listing.
+        await self._fire_reminder(ReminderPoint.POST_COMPACT, ctx, conversation)
+        return result
 
     # --- LLM compaction with binary-search splitting ----------------------
 
@@ -4065,22 +6798,6 @@ class AgentLoop(AgentProtocol):
             max_context_tokens=self._config.max_context_tokens,
         )
 
-    def _build_emergency_summary(
-        self,
-        ctx: AgentContext,
-        accumulator: OutputAccumulator | None = None,
-        conversation: NodeConversation | None = None,
-    ) -> str:
-        """Build a structured emergency compaction summary.
-
-        Unlike normal/aggressive compaction which uses an LLM summary,
-        emergency compaction cannot afford an LLM call (context is already
-        way over budget).  Instead, build a deterministic summary from the
-        node's known state so the LLM can continue working after
-        compaction without losing track of its task and inputs.
-        """
-        return build_emergency_summary(ctx, accumulator, conversation, self._config)
-
     # -------------------------------------------------------------------
     # Persistence: restore, cursor, injection, pause
     # -------------------------------------------------------------------
@@ -4116,6 +6833,9 @@ class AgentLoop(AgentProtocol):
 
         Persists iteration counter, accumulator outputs, and stall/doom-loop
         detection state so that resume picks up exactly where execution stopped.
+        Always includes ``self._user_stopped`` so an explicit user-stop
+        survives runtime restart — without this, killing the app would let
+        a cancelled queen auto-resume on reload.
         """
         return await write_cursor(
             conversation_store=self._conversation_store,
@@ -4126,15 +6846,35 @@ class AgentLoop(AgentProtocol):
             recent_responses=recent_responses,
             recent_tool_fingerprints=recent_tool_fingerprints,
             pending_input=pending_input,
+            user_stopped=self._user_stopped,
+            tool_calls_used=self._tool_calls_used,
         )
 
     async def _drain_injection_queue(self, conversation: NodeConversation, ctx: AgentContext) -> int:
         """Drain all pending injected events as user messages. Returns count."""
+        on_committed = None
+        if self._event_bus is not None and ctx.emits_client_io:
+            stream_id = ctx.stream_id or ctx.agent_id
+            node_id = ctx.agent_id
+            execution_id = ctx.execution_id or ""
+
+            async def on_committed(seq: int, correlation_id: str | None) -> None:
+                # Emit the true injection time + seq for this boundary drain so
+                # the UI places the user bubble where the conversation has it.
+                await self._event_bus.emit_client_input_committed(
+                    stream_id=stream_id,
+                    node_id=node_id,
+                    execution_id=execution_id,
+                    seq=seq,
+                    correlation_id=correlation_id,
+                )
+
         return await drain_injection_queue(
             queue=self._injection_queue,
             conversation=conversation,
             ctx=ctx,
             caption_image_fn=_captioning_chain,
+            on_client_input_committed=on_committed,
         )
 
     async def _drain_trigger_queue(self, conversation: NodeConversation) -> int:
@@ -4179,92 +6919,45 @@ class AgentLoop(AgentProtocol):
             execution_id=execution_id,
         )
 
-    async def _generate_action_plan(
+    async def _fire_reminder(
         self,
+        point: ReminderPoint,
         ctx: AgentContext,
-        stream_id: str,
-        node_id: str,
-        execution_id: str,
-    ) -> None:
-        """Generate a brief action plan via LLM and emit it as an SSE event.
+        conversation: NodeConversation,
+    ) -> bool:
+        """Fire a reminder lifecycle point that injects as a user message.
 
-        Runs as a fire-and-forget task so it never blocks the main loop.
+        Used for SESSION_START / USER_PROMPT_SUBMIT / PRE_COMPACT / STOP —
+        the points with no tool result to ride. POST_TOOL_USE is handled
+        separately (it appends to a tool result's tail). Best-effort —
+        never raises.
+
+        Returns True when an injected source declared itself *energizing*
+        (:attr:`ReminderSource.energizes`) — the STOP call site reads this to
+        keep the loop awake for one more turn instead of parking on a
+        reminder the agent would not read until the user next speaks.
         """
-        return await generate_action_plan(
-            event_bus=self._event_bus,
-            ctx=ctx,
-            stream_id=stream_id,
-            node_id=node_id,
-            execution_id=execution_id,
-        )
-
-    async def _maybe_inject_task_reminder(
-        self,
-        ctx: AgentContext,
-        logged_tool_calls: list[dict[str, Any]] | None,
-    ) -> None:
-        """Layer 3 task-system steering — periodic reminder injection.
-
-        Called once per iteration after the LLM turn completes. If the
-        model has been silent on task ops for a while AND there are open
-        tasks on its session list, queue a system-style reminder onto
-        the injection queue so the next iteration drains it as a user
-        turn. Idempotent / safe to call always — gates internally.
-
-        ``logged_tool_calls`` is a list of dicts with at least a "name"
-        key, as accumulated by ``_run_single_turn``. Names like
-        ``task_create``, ``task_update``, ``colony_template_*`` reset
-        the counter (see ``framework.tasks.reminders.TASK_OP_TOOL_NAMES``).
-        """
-        from framework.tasks import get_task_store
-        from framework.tasks.models import TaskStatus
-        from framework.tasks.reminders import build_reminder, saw_task_op
-
-        state = self._task_reminder_state
-
-        # 1. Update counters based on this turn's tool calls.
-        names: list[str] = []
-        for call in logged_tool_calls or []:
-            try:
-                name = call.get("name") or call.get("tool_name")
-                if name:
-                    names.append(name)
-            except (AttributeError, TypeError):
-                continue
-        if saw_task_op(names):
-            state.on_task_op()
-        state.on_iteration()
-
-        # 2. Resolve the agent's task list. Skip if context isn't wired yet.
-        list_id = getattr(ctx, "task_list_id", None)
-        if not list_id:
-            return
-
-        # 3. Read the open-task snapshot. Best-effort.
         try:
-            store = get_task_store()
-            records = await store.list_tasks(list_id)
+            block, energized = await self._reminder_hub.fire_energized(point, ctx)
+            if block:
+                await conversation.add_user_message(block)
+                self._bump("reminders_injected")
+                logger.info("[reminder] injected %s block (%d chars)", point, len(block))
+                # Surface lifecycle reminders on the same telemetry event
+                # as the rest of the hub. fire() merges sources into one
+                # block, so the producer is the point, not a named source.
+                await self._emit_reminder_injected(
+                    ctx,
+                    Reminder(
+                        body=block,
+                        source=f"point:{point}",
+                        meta={"point": str(point)},
+                    ),
+                )
+                return energized
         except Exception:
-            return
-        open_tasks = [r for r in records if r.status != TaskStatus.COMPLETED]
-        if not state.should_remind(bool(open_tasks)):
-            return
-
-        body = build_reminder(records)
-        if not body:
-            return
-
-        # 4. Enqueue. Drained at the next iteration's 6b drain step and
-        # rendered as a user turn (with the "[External event]" prefix).
-        await self._injection_queue.put((body, False, None))
-        state.on_reminder_sent()
-        logger.info(
-            "[task-reminder] queued nudge for %s (open=%d, silent_turns=%d)",
-            list_id,
-            len(open_tasks),
-            state.turns_since_task_op,
-        )
-        self._bump("task_reminders_sent")
+            logger.debug("reminder fire failed at %s", point, exc_info=True)
+        return False
 
     async def _run_hooks(
         self,
@@ -4292,13 +6985,21 @@ class AgentLoop(AgentProtocol):
         ctx: AgentContext,
         conversation: NodeConversation,
         trigger: str,
+        *,
+        tools: list | None = None,
     ) -> None:
-        """Emit a CONTEXT_USAGE_UPDATED event with current context window state."""
+        """Emit a CONTEXT_USAGE_UPDATED event with current context window state.
+
+        Pass ``tools`` when available so the estimate includes the JSON
+        tool-definitions size — for queens with many tools registered this
+        is a non-trivial component of the actual prompt sent to the LLM.
+        """
         return await publish_context_usage(
             event_bus=self._event_bus,
             ctx=ctx,
             conversation=conversation,
             trigger=trigger,
+            tools=tools,
         )
 
     async def _publish_iteration(
@@ -4318,6 +7019,65 @@ class AgentLoop(AgentProtocol):
             extra_data=extra_data,
         )
 
+    def _compute_turn_diagnostics(
+        self,
+        *,
+        conversation_static: str,
+        conversation_suffix: str,
+        request_messages: list[dict] | None,
+        model: str,
+    ) -> dict:
+        """Compute per-turn cache-diagnostic fingerprints for events.jsonl.
+
+        Cheap (sha256 of ~15KB is microseconds). Always on — the diagnostic
+        value of having post-mortem-debuggable fingerprints on every
+        production turn outweighs the negligible overhead, and the fields
+        are omitted from the event payload when None so legacy consumers
+        see no schema change.
+
+        Returns a dict with four keys:
+        * ``system_prefix_sha``: 12-char hex sha256 of the static system
+          prefix that carries ``cache_control: ephemeral``. Drives
+          cross-turn cache-stability analysis.
+        * ``system_suffix_sha``: 12-char hex sha256 of the dynamic
+          suffix (narrative, when present; empty for most agents now that
+          timestamps and recall ride the conversation instead). Useful to
+          confirm the split is being emitted at all.
+        * ``history_anchor_idx``: index in ``request_messages`` where
+          the rolling history breakpoint was placed, or ``-1`` if none.
+        * ``message_count``: length of ``request_messages`` (system
+          included), or ``None`` when the request wasn't captured.
+        """
+        import hashlib
+
+        def _sha(s: str) -> str:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+        prefix_sha = _sha(conversation_static or "")
+        suffix_sha = _sha(conversation_suffix or "")
+
+        anchor_idx: int = -1
+        msg_count: int | None = None
+        if request_messages is not None:
+            msg_count = len(request_messages)
+            # request_messages includes the system message at index 0
+            # when one was prepended. Strip it before asking the helper
+            # so the returned index matches the OUTGOING messages list
+            # the provider actually sent (caller-friendly indexing).
+            try:
+                from framework.llm.litellm import _history_cache_breakpoint_index
+
+                anchor_idx = _history_cache_breakpoint_index(request_messages, model)
+            except Exception:
+                anchor_idx = -1
+
+        return {
+            "system_prefix_sha": prefix_sha,
+            "system_suffix_sha": suffix_sha,
+            "history_anchor_idx": anchor_idx,
+            "message_count": msg_count,
+        }
+
     async def _publish_llm_turn_complete(
         self,
         stream_id: str,
@@ -4329,8 +7089,13 @@ class AgentLoop(AgentProtocol):
         cached_tokens: int = 0,
         cache_creation_tokens: int = 0,
         cost_usd: float = 0.0,
+        credits: float | None = None,
         execution_id: str = "",
         iteration: int | None = None,
+        system_prefix_sha: str | None = None,
+        system_suffix_sha: str | None = None,
+        history_anchor_idx: int | None = None,
+        message_count: int | None = None,
     ) -> None:
         return await publish_llm_turn_complete(
             event_bus=self._event_bus,
@@ -4343,8 +7108,13 @@ class AgentLoop(AgentProtocol):
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cost_usd=cost_usd,
+            credits=credits,
             execution_id=execution_id,
             iteration=iteration,
+            system_prefix_sha=system_prefix_sha,
+            system_suffix_sha=system_suffix_sha,
+            history_anchor_idx=history_anchor_idx,
+            message_count=message_count,
         )
 
     def _log_skip_judge(
@@ -4370,9 +7140,7 @@ class AgentLoop(AgentProtocol):
             iter_start=iter_start,
         )
 
-    async def _publish_loop_completed(
-        self, stream_id: str, node_id: str, iterations: int, execution_id: str = ""
-    ) -> None:
+    async def _publish_loop_completed(self, stream_id: str, node_id: str, iterations: int, execution_id: str = "") -> None:
         return await publish_loop_completed(
             event_bus=self._event_bus,
             stream_id=stream_id,
@@ -4448,6 +7216,10 @@ class AgentLoop(AgentProtocol):
         is_error: bool,
         execution_id: str = "",
     ) -> None:
+        # A tool result landed — the loop is making progress. Reset the
+        # session-idle clock here so a long-running tool doesn't trip
+        # the watchdog the instant it returns.
+        self._mark_session_progress()
         return await publish_tool_completed(
             event_bus=self._event_bus,
             stream_id=stream_id,

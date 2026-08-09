@@ -40,13 +40,6 @@ class TestSkillCatalog:
         assert catalog.get("a") is not None
         assert catalog.get("b") is not None
 
-    def test_activation_tracking(self):
-        catalog = SkillCatalog([_make_skill()])
-        assert not catalog.is_activated("my-skill")
-
-        catalog.mark_activated("my-skill")
-        assert catalog.is_activated("my-skill")
-
     def test_allowlisted_dirs(self):
         skills = [
             _make_skill("a", base_dir="/skills/a"),
@@ -142,7 +135,7 @@ class TestSkillCatalog:
         assert "## Skills (mandatory)" in prompt
         assert "Before replying: scan <available_skills>" in prompt
         assert "never read more than one skill up front" in prompt
-        assert "`read_file`" in prompt
+        assert "terminal_exec" in prompt
         assert "SKILL.md" in prompt
 
     def test_to_prompt_compact_fallback_drops_descriptions(self):
@@ -170,43 +163,6 @@ class TestSkillCatalog:
             assert f"<name>skill-{i:03d}</name>" in prompt
         # … but no descriptions were rendered.
         assert "<description>" not in prompt
-
-    def test_build_pre_activated_prompt(self):
-        skill = _make_skill("research", body="## Deep Research\nDo thorough research.")
-        catalog = SkillCatalog([skill])
-        prompt = catalog.build_pre_activated_prompt(["research"])
-
-        assert "Pre-Activated Skill: research" in prompt
-        assert "## Deep Research" in prompt
-        assert catalog.is_activated("research")
-
-    def test_build_pre_activated_skips_already_activated(self):
-        skill = _make_skill("research", body="Research body")
-        catalog = SkillCatalog([skill])
-        catalog.mark_activated("research")
-
-        prompt = catalog.build_pre_activated_prompt(["research"])
-        assert prompt == ""
-
-    def test_build_pre_activated_missing_skill(self):
-        catalog = SkillCatalog()
-        prompt = catalog.build_pre_activated_prompt(["nonexistent"])
-        assert prompt == ""
-
-    def test_build_pre_activated_multiple(self):
-        skills = [
-            _make_skill("a", body="Body A"),
-            _make_skill("b", body="Body B"),
-        ]
-        catalog = SkillCatalog(skills)
-        prompt = catalog.build_pre_activated_prompt(["a", "b"])
-
-        assert "Pre-Activated Skill: a" in prompt
-        assert "Body A" in prompt
-        assert "Pre-Activated Skill: b" in prompt
-        assert "Body B" in prompt
-        assert catalog.is_activated("a")
-        assert catalog.is_activated("b")
 
     def test_duplicate_add_overwrites(self):
         """Adding a skill with the same name replaces the previous one."""

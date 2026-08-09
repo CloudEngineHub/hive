@@ -1,9 +1,12 @@
 # File System Toolkits (post-consolidation)
 
 This package contains only sandbox path helpers used by `csv_tool` and
-`excel_tool`. **All file tools live in `aden_tools.file_ops`** (read_file,
-write_file, edit_file, hashline_edit, search_files, apply_patch) — they
-share one path policy and one home dir.
+`excel_tool`. The file tools in `aden_tools.file_ops` (read_file, write_file,
+edit_file, hashline_edit, search_files, apply_patch) still exist for internal
+helpers (`_FilePolicy`, V4A patch) and the standalone `files_server.py`, but
+are **no longer registered for agents** — queens/workers do file I/O through
+the terminal tools (`terminal_exec` for cat/sed/heredoc, `terminal_rg` /
+`terminal_glob` for search), which default their cwd to the session workdir.
 
 ## Sub-modules
 

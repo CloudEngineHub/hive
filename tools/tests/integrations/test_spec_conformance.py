@@ -179,8 +179,7 @@ class TestSpecToolsMatchRegistered:
             if tool_name in KNOWN_PHANTOM_TOOLS:
                 continue
             assert tool_name in registered_tools, (
-                f"Spec '{spec_name}' references tool '{tool_name}' "
-                f"which is not registered. Registered tools: {sorted(registered_tools)}"
+                f"Spec '{spec_name}' references tool '{tool_name}' which is not registered. Registered tools: {sorted(registered_tools)}"
             )
 
 
@@ -207,9 +206,7 @@ class TestSpecsMergedIntoCredentialSpecs:
         category = self.CATEGORY_DICTS[category_name]
         for spec_name, spec in category.items():
             assert spec_name in CREDENTIAL_SPECS, f"'{spec_name}' from {category_name} is not in CREDENTIAL_SPECS"
-            assert CREDENTIAL_SPECS[spec_name] is spec, (
-                f"'{spec_name}' in CREDENTIAL_SPECS is not the same object as in {category_name}"
-            )
+            assert CREDENTIAL_SPECS[spec_name] is spec, f"'{spec_name}' in CREDENTIAL_SPECS is not the same object as in {category_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +233,7 @@ class TestToolNamesInReturnList:
         for tool_name in spec.tools:
             if tool_name in KNOWN_PHANTOM_TOOLS:
                 continue
-            assert tool_name in all_tools_return, (
-                f"Tool '{tool_name}' (from spec '{spec_name}') not in register_all_tools() return list"
-            )
+            assert tool_name in all_tools_return, f"Tool '{tool_name}' (from spec '{spec_name}') not in register_all_tools() return list"
 
 
 # ---------------------------------------------------------------------------

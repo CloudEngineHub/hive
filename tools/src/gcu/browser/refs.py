@@ -159,9 +159,7 @@ def resolve_ref(selector: str, ref_map: RefMap | None) -> str:
     entry = ref_map.get(selector)
     if entry is None:
         valid = ", ".join(sorted(ref_map.keys(), key=lambda k: int(k[1:])))
-        raise ValueError(
-            f"Ref '{selector}' not found. Valid refs: {valid}. The page may have changed - take a new snapshot."
-        )
+        raise ValueError(f"Ref '{selector}' not found. Valid refs: {valid}. The page may have changed - take a new snapshot.")
 
     # Build CSS selector
     if entry.name is not None:

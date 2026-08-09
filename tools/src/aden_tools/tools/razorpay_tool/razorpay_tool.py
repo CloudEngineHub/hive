@@ -322,8 +322,7 @@ def register_tools(
         return {
             "error": "Razorpay credentials not configured",
             "help": (
-                "Set RAZORPAY_API_KEY and RAZORPAY_API_SECRET environment variables. "
-                "Get your credentials at https://dashboard.razorpay.com/app/keys"
+                "Set RAZORPAY_API_KEY and RAZORPAY_API_SECRET environment variables. Get your credentials at https://dashboard.razorpay.com/app/keys"
             ),
         }
 
@@ -443,9 +442,7 @@ def register_tools(
             return {"error": "Description is required"}
 
         try:
-            return client.create_payment_link(
-                amount, currency, description, customer_name, customer_email, customer_contact
-            )
+            return client.create_payment_link(amount, currency, description, customer_name, customer_email, customer_contact)
         except httpx.TimeoutException:
             return {"error": "Request timed out"}
         except httpx.RequestError as e:

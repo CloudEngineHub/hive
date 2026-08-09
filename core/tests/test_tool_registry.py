@@ -210,6 +210,55 @@ def test_register_mcp_server_direct_client_when_manager_disabled(monkeypatch):
     assert created_clients[0].disconnect_calls == 1
 
 
+def test_full_mcp_catalog_omits_tools_shadowed_by_earlier_server(monkeypatch):
+    """The Tool Library catalog should mirror execution's first-wins names."""
+    registry = ToolRegistry()
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def list_tools(self):
+            names = {
+                "files-tools": ["read_file", "write_file"],
+                "hive_tools": ["read_file", "write_file", "pdf_read"],
+            }[self.config.name]
+            return [
+                SimpleNamespace(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object", "properties": {}, "required": []},
+                )
+                for name in names
+            ]
+
+        def call_tool(self, tool_name, arguments):
+            return {"tool": tool_name, "arguments": arguments}
+
+    monkeypatch.setattr("framework.loader.mcp_client.MCPClient", FakeClient)
+
+    registry.register_mcp_server(
+        {"name": "files-tools", "transport": "stdio", "command": "echo"},
+        use_connection_manager=False,
+    )
+    registry.register_mcp_server(
+        {"name": "hive_tools", "transport": "stdio", "command": "echo"},
+        use_connection_manager=False,
+    )
+
+    catalog = registry.get_full_mcp_catalog()
+    assert [t["name"] for t in catalog["files-tools"]] == ["read_file", "write_file"]
+    assert [t["name"] for t in catalog["hive_tools"]] == ["pdf_read"]
+    assert registry.get_server_tool_names("files-tools") == {"read_file", "write_file"}
+    assert registry.get_server_tool_names("hive_tools") == {"pdf_read"}
+
+
 def test_load_registry_servers_retries_when_registration_returns_zero(monkeypatch):
     registry = ToolRegistry()
     attempts = {"count": 0}
@@ -285,6 +334,46 @@ def test_load_registry_servers_emits_structured_log_fields(monkeypatch):
             },
         )
     ]
+
+
+def test_load_registry_servers_exempts_essential_servers_from_cap(monkeypatch):
+    """A bundled server must register even when an earlier user server exhausts
+    the max_tools budget.
+
+    Regression for the intermittent chart_render bug: the cap used a hard
+    ``break`` once the budget was spent, so a user server early in the list
+    dropped every server after it — including essential bundled tools like
+    chart-tools. The fix skips capped *non-essential* servers individually and
+    always loads essential ones.
+    """
+    registry = ToolRegistry()
+
+    per_server_counts = {"jira": 2, "extra": 5, "chart-tools": 1}
+
+    def fake_register(server_config, use_connection_manager=True, **kwargs):
+        return per_server_counts[server_config["name"]]
+
+    monkeypatch.setattr(registry, "register_mcp_server", fake_register)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    results = registry.load_registry_servers(
+        [
+            {"name": "jira", "transport": "http", "url": "http://localhost:4010"},
+            {"name": "extra", "transport": "http", "url": "http://localhost:4011"},
+            {"name": "chart-tools", "transport": "stdio"},
+        ],
+        log_summary=False,
+        max_tools=2,
+    )
+
+    by_name = {r["server"]: r for r in results}
+    # jira fits the budget; extra is skipped (budget exhausted), NOT a hard break.
+    assert by_name["jira"]["status"] == "loaded"
+    assert by_name["extra"]["status"] == "skipped"
+    assert "budget exhausted" in by_name["extra"]["skipped_reason"]
+    # chart-tools is essential → loads despite the budget being spent.
+    assert by_name["chart-tools"]["status"] == "loaded"
+    assert by_name["chart-tools"]["tools_loaded"] == 1
 
 
 def test_tool_execution_error_logs_stack_trace_and_context(caplog):
@@ -618,6 +707,59 @@ def test_session_context_is_injected_into_mcp_tool_call(monkeypatch):
     assert received[0].get("agent_id") == "agent-99"
 
 
+def test_principal_is_injected_into_terminal_tool_env(monkeypatch):
+    """principal (a CONTEXT_PARAM) is handed to a terminal tool's subprocess via its
+    `env` as HIVE_PRINCIPAL, so the hive-crm CLI can name the caller. Tools without an
+    `env` param are untouched."""
+    from framework.loader.tool_registry import _execution_context
+
+    registry = ToolRegistry()
+    received: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def list_tools(self):
+            return [
+                SimpleNamespace(name="terminal_exec", description="run a command",
+                                input_schema={"type": "object", "required": ["command"], "properties": {
+                                    "command": {"type": "string"}, "env": {"type": "object"}}}),
+                SimpleNamespace(name="plain_tool", description="no env",
+                                input_schema={"type": "object", "required": [], "properties": {
+                                    "x": {"type": "string"}}}),
+            ]
+
+        def call_tool(self, tool_name, arguments):
+            received.append({"tool": tool_name, "args": dict(arguments)})
+            return {"result": "ok"}
+
+    monkeypatch.setattr("framework.loader.mcp_client.MCPClient", FakeClient)
+    registry.register_mcp_server({"name": "term", "transport": "stdio", "command": "echo"},
+                                 use_connection_manager=False)
+    executor = registry.get_executor()
+
+    token = _execution_context.set({"principal": "colony:acme:queen"})
+    try:
+        executor(ToolUse(id="c1", name="terminal_exec",
+                         input={"command": "hive-crm whoami", "env": {"FOO": "bar"}}))
+        executor(ToolUse(id="c2", name="plain_tool", input={"x": "y"}))
+    finally:
+        _execution_context.reset(token)
+
+    term = next(r for r in received if r["tool"] == "terminal_exec")
+    # merged onto the agent-provided env, not clobbering it
+    assert term["args"]["env"] == {"FOO": "bar", "HIVE_PRINCIPAL": "colony:acme:queen"}
+    plain = next(r for r in received if r["tool"] == "plain_tool")
+    assert "env" not in plain["args"]  # no env param → not injected
+
+
 # ---------------------------------------------------------------------------
 # Execution context (contextvars isolation)
 # ---------------------------------------------------------------------------
@@ -858,7 +1000,7 @@ def test_mcp_tool_conversion_marks_known_safe_tools():
     registry = ToolRegistry()
 
     safe_mcp = MCPTool(
-        name="read_file",
+        name="terminal_rg",
         description="",
         input_schema={"type": "object", "properties": {}, "required": []},
         server_name="stub",
@@ -889,7 +1031,7 @@ def test_concurrency_safe_allowlist_is_conservative():
     allowlist = ToolRegistry.CONCURRENCY_SAFE_TOOLS
 
     # Positive assertions: known-safe read operations are present.
-    for name in ("read_file", "terminal_rg", "terminal_find", "search_files", "web_scrape"):
+    for name in ("pdf_read", "terminal_rg", "terminal_glob", "web_scrape"):
         assert name in allowlist, f"{name} should be concurrency-safe"
 
     # Negative assertions: nothing that mutates state is allowed in.
@@ -897,9 +1039,36 @@ def test_concurrency_safe_allowlist_is_conservative():
         "execute_command",
         "write_file",
         "hashline_edit",
-        "browser_click",
-        "browser_type",
-        "browser_type_focused",
+        "browser_interact",
         "browser_navigate",
     ):
         assert forbidden not in allowlist, f"{forbidden} must not be concurrency-safe"
+
+
+def test_session_cwd_is_context_param_and_stripped_from_schema():
+    """session_cwd is framework-injected: it's a CONTEXT_PARAM and never appears
+    in the LLM-facing tool schema (the agent only ever sees/sets ``cwd``)."""
+    from framework.loader.mcp_client import MCPTool
+
+    assert "session_cwd" in ToolRegistry.CONTEXT_PARAMS
+
+    registry = ToolRegistry()
+    mcp = MCPTool(
+        name="terminal_exec",
+        description="",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+                "session_cwd": {"type": "string"},
+            },
+            "required": ["command"],
+        },
+        server_name="terminal-tools",
+    )
+    tool = registry._convert_mcp_tool_to_framework_tool(mcp)  # noqa: SLF001
+    props = tool.parameters.get("properties", {})
+    assert "command" in props
+    assert "cwd" in props  # the LLM-overridable arg stays
+    assert "session_cwd" not in props  # stripped — only the framework sets it

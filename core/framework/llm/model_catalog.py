@@ -100,9 +100,7 @@ def _validate_model_catalog(data: dict[str, Any]) -> dict[str, Any]:
                 raise ModelCatalogError(f"{model_path}.supports_vision must be a boolean when present")
 
         if not default_found:
-            raise ModelCatalogError(
-                f"{provider_path}.default_model={default_model!r} is not present in {provider_path}.models"
-            )
+            raise ModelCatalogError(f"{provider_path}.default_model={default_model!r} is not present in {provider_path}.models")
 
     presets = _require_mapping(data.get("presets"), "presets")
     for preset_id, preset_info in presets.items():

@@ -27,7 +27,6 @@ from framework.orchestrator.node import (
     NodeResult,
     NodeSpec,
 )
-from framework.orchestrator.validator import OutputValidator
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +153,6 @@ class NodeWorker:
         self._run_gate: asyncio.Event = asyncio.Event()
         self._run_gate.set()  # Not paused by default
         self._pause_requested: asyncio.Event = asyncio.Event()
-
-        # Validator
-        self._validator = OutputValidator()
 
         # Node implementation (lazy)
         self._node_impl: NodeProtocol | None = None
@@ -464,9 +460,7 @@ class NodeWorker:
             conditionals = [e for e in traversable if e.condition == EdgeCondition.CONDITIONAL]
             if len(conditionals) > 1:
                 max_prio = max(e.priority for e in conditionals)
-                traversable = [
-                    e for e in traversable if e.condition != EdgeCondition.CONDITIONAL or e.priority == max_prio
-                ]
+                traversable = [e for e in traversable if e.condition != EdgeCondition.CONDITIONAL or e.priority == max_prio]
 
         # When parallel execution is disabled, follow first match only (sequential)
         if not gc.enable_parallel_execution and len(traversable) > 1:
@@ -522,18 +516,6 @@ class NodeWorker:
         gc = self._gc
         node_spec = self.node_spec
 
-        # Event loop nodes skip executor-level validation (judge is the authority)
-        if node_spec.node_type != "event_loop":
-            errors = self._validator.validate_all(
-                output=result.output,
-                output_keys=node_spec.output_keys,
-                nullable_keys=getattr(node_spec, "nullable_output_keys", []) or [],
-                output_schema=getattr(node_spec, "output_schema", None),
-                output_model=getattr(node_spec, "output_model", None),
-            )
-            if errors:
-                logger.warning("Worker %s output validation warnings: %s", node_spec.id, errors)
-
         # Determine if this worker is a fan-out branch
         is_fanout_branch = any(tag.via_branch == node_spec.id for tag in self._inherited_fan_out_tags)
 
@@ -548,11 +530,7 @@ class NodeWorker:
             value = result.output.get(key)
             if value is not None:
                 if is_fanout_branch:
-                    conflict_strategy = (
-                        getattr(gc.parallel_config, "buffer_conflict_strategy", "last_wins")
-                        if gc.parallel_config
-                        else "last_wins"
-                    )
+                    conflict_strategy = getattr(gc.parallel_config, "buffer_conflict_strategy", "last_wins") if gc.parallel_config else "last_wins"
                     prior_worker = gc._fanout_written_keys.get(key)
                     if prior_worker and prior_worker != node_spec.id:
                         if conflict_strategy == "error":
@@ -616,8 +594,8 @@ class NodeWorker:
                 judge=None,
                 config=LoopConfig(
                     max_iterations=lc.get("max_iterations", default_max_iter),
-                    max_tool_calls_per_turn=lc.get("max_tool_calls_per_turn", 30),
-                    tool_call_overflow_margin=lc.get("tool_call_overflow_margin", 0.5),
+                    tool_call_budget=lc.get("tool_call_budget", 30),
+                    tool_call_hard_multiple=lc.get("tool_call_hard_multiple", 5),
                     stall_detection_threshold=lc.get("stall_detection_threshold", 3),
                     max_context_tokens=lc.get(
                         "max_context_tokens",
@@ -727,7 +705,7 @@ class NodeWorker:
         from framework.orchestrator.prompting import (
             TransitionSpec,
             build_narrative,
-            build_system_prompt_for_node_context,
+            build_system_prompt_parts_for_node_context,
             build_transition_message,
         )
 
@@ -739,7 +717,15 @@ class NodeWorker:
             inherited_conversation=gc.continuous_conversation,
             narrative=narrative,
         )
-        gc.continuous_conversation.update_system_prompt(build_system_prompt_for_node_context(next_ctx))
+        # Phase transitions used to call ``update_system_prompt`` with the
+        # combined static+narrative string, which mutated the cached
+        # prefix every phase and lost any cache hits the continuous
+        # conversation had accumulated in the previous phase. Routing the
+        # narrative + timestamp through ``dynamic_suffix`` keeps the
+        # identity / accounts / skills / focus block cache-stable across
+        # phase boundaries.
+        _static, _suffix = build_system_prompt_parts_for_node_context(next_ctx)
+        gc.continuous_conversation.update_system_prompt(_static, dynamic_suffix=_suffix)
         gc.continuous_conversation.set_current_phase(next_spec.id)
 
         buffer_items, data_files = self._prepare_transition_payload()
@@ -779,16 +765,10 @@ class NodeWorker:
                 filename = f"output_{key}{ext}"
                 file_path = data_dir / filename
                 try:
-                    write_content = (
-                        json.dumps(value, indent=2, ensure_ascii=False)
-                        if isinstance(value, (dict, list))
-                        else str(value)
-                    )
+                    write_content = json.dumps(value, indent=2, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
                     file_path.write_text(write_content, encoding="utf-8")
                     file_size = file_path.stat().st_size
-                    buffer_items[key] = (
-                        f"[Saved to '{filename}' ({file_size:,} bytes). Use read_file(path='{filename}') to access.]"
-                    )
+                    buffer_items[key] = f"[Saved to '{filename}' ({file_size:,} bytes). Use terminal_exec(\"cat {filename}\") to access.]"
                     continue
                 except Exception:
                     pass
@@ -797,11 +777,7 @@ class NodeWorker:
 
         data_files: list[str] = []
         if data_dir is not None and data_dir.exists():
-            data_files = [
-                f"{entry.name} ({entry.stat().st_size:,} bytes)"
-                for entry in sorted(data_dir.iterdir())
-                if entry.is_file()
-            ]
+            data_files = [f"{entry.name} ({entry.stat().st_size:,} bytes)" for entry in sorted(data_dir.iterdir()) if entry.is_file()]
 
         return buffer_items, data_files
 

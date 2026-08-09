@@ -41,9 +41,9 @@ def global_memory_dir() -> Path:
     return MEMORIES_DIR / "global"
 
 
-def colony_memory_dir(colony_name: str) -> Path:
+def colony_memory_dir(colony_id: str) -> Path:
     """Return the memory directory for a named colony."""
-    return MEMORIES_DIR / "colonies" / colony_name
+    return MEMORIES_DIR / "colonies" / colony_id
 
 
 def queen_memory_dir(queen_name: str = "default") -> Path:
@@ -196,14 +196,7 @@ def build_memory_document(
     body: str,
 ) -> str:
     """Build one memory file with frontmatter and body."""
-    return (
-        f"---\n"
-        f"name: {name.strip()}\n"
-        f"description: {description.strip()}\n"
-        f"type: {mem_type.strip()}\n"
-        f"---\n\n"
-        f"{body.strip()}\n"
-    )
+    return f"---\nname: {name.strip()}\ndescription: {description.strip()}\ntype: {mem_type.strip()}\n---\n\n{body.strip()}\n"
 
 
 # ---------------------------------------------------------------------------

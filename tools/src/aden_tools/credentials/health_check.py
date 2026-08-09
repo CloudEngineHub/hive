@@ -1502,8 +1502,7 @@ def validate_integration_wiring(credential_name: str) -> list[str]:
     spec = CREDENTIAL_SPECS.get(credential_name)
     if spec is None:
         issues.append(
-            f"No CredentialSpec for '{credential_name}' in CREDENTIAL_SPECS. "
-            f"Add it to the appropriate category file and import in __init__.py."
+            f"No CredentialSpec for '{credential_name}' in CREDENTIAL_SPECS. Add it to the appropriate category file and import in __init__.py."
         )
         return issues
 
@@ -1521,9 +1520,7 @@ def validate_integration_wiring(credential_name: str) -> list[str]:
 
     # 3. Check health check
     if not spec.health_check_endpoint:
-        issues.append(
-            "CredentialSpec.health_check_endpoint is empty. Add a lightweight API endpoint for credential validation."
-        )
+        issues.append("CredentialSpec.health_check_endpoint is empty. Add a lightweight API endpoint for credential validation.")
     else:
         checker = HEALTH_CHECKERS.get(credential_name)
         if checker is None:
@@ -1538,8 +1535,6 @@ def validate_integration_wiring(credential_name: str) -> list[str]:
                 spec_base = spec.health_check_endpoint.split("?")[0]
                 checker_base = str(checker_endpoint).split("?")[0]
                 if spec_base != checker_base:
-                    issues.append(
-                        f"Endpoint mismatch: spec='{spec.health_check_endpoint}' vs checker='{checker_endpoint}'"
-                    )
+                    issues.append(f"Endpoint mismatch: spec='{spec.health_check_endpoint}' vs checker='{checker_endpoint}'")
 
     return issues

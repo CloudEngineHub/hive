@@ -155,17 +155,6 @@ class SessionState(BaseModel):
     # True after first successful worker execution (gates trigger delivery on restart)
     worker_configured: bool = Field(default=False)
 
-    # Task-system fields (see framework/tasks).
-    # task_list_id: this session's own task list id (populated on first
-    #   task_create; immutable thereafter). Used for resume reattachment —
-    #   if it differs from resolve_task_list_id(ctx) on resume, a
-    #   TASK_LIST_REATTACH_MISMATCH event is emitted and a fresh list is
-    #   created at the resolved id (the orphan stays on disk).
-    task_list_id: str | None = None
-    # picked_up_from: for worker sessions, the (colony_task_list_id,
-    #   template_task_id) pair this session was spawned for.
-    picked_up_from: list[Any] | None = None
-
     model_config = {"extra": "allow"}
 
     @property
@@ -265,9 +254,7 @@ class SessionState(BaseModel):
                 error=result.error,
                 output=result.output,
             ),
-            data_buffer=result.session_state.get("data_buffer", result.session_state.get("memory", {}))
-            if result.session_state
-            else {},
+            data_buffer=result.session_state.get("data_buffer", result.session_state.get("memory", {})) if result.session_state else {},
             input_data=input_data or {},
         )
 
@@ -323,11 +310,7 @@ class SessionState(BaseModel):
         Use checkpoint-based resume (``resume_from_checkpoint`` key) instead.
         """
         # Derive resume target: explicit > last node in path > entry point
-        resume_from = (
-            self.progress.resume_from
-            or self.progress.paused_at
-            or (self.progress.path[-1] if self.progress.path else None)
-        )
+        resume_from = self.progress.resume_from or self.progress.paused_at or (self.progress.path[-1] if self.progress.path else None)
         return {
             "paused_at": resume_from,
             "resume_from": resume_from,

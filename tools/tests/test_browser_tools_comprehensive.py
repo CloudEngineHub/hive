@@ -19,9 +19,27 @@ from fastmcp import FastMCP
 from gcu.browser.bridge import BeelineBridge
 from gcu.browser.tools.advanced import register_advanced_tools
 from gcu.browser.tools.inspection import register_inspection_tools
-from gcu.browser.tools.interactions import register_interaction_tools
+from gcu.browser.tools.interact import register_interact_tools
 from gcu.browser.tools.navigation import register_navigation_tools
 from gcu.browser.tools.tabs import register_tab_tools
+
+
+def _payload(result) -> dict:
+    """browser_interact returns a list of MCP content blocks; pull the
+    JSON dict out of the first text block. Dicts pass through unchanged."""
+    if isinstance(result, dict):
+        return result
+    import json
+
+    for block in result:
+        text = getattr(block, "text", None)
+        if text is not None:
+            try:
+                return json.loads(text)
+            except Exception:
+                return {}
+    return {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -67,6 +85,11 @@ def mock_bridge() -> MagicMock:
     bridge.select_option = AsyncMock(return_value={"ok": True, "selected": ["option1"]})
     bridge.drag = AsyncMock(return_value={"ok": True})
 
+    # Native dialogs — no dialog pending by default. get_pending_dialog is
+    # a sync accessor, so a plain MagicMock (not AsyncMock).
+    bridge.get_pending_dialog = MagicMock(return_value=None)
+    bridge.handle_javascript_dialog = AsyncMock(return_value={"ok": True, "tab_id": 100, "dialog": None})
+
     # Inspection
     bridge.evaluate = AsyncMock(return_value={"result": {"value": True}})
     bridge.snapshot = AsyncMock(return_value={"tree": "mock_accessibility_tree"})
@@ -99,7 +122,7 @@ class TestMultipleSubagentsTabGroups:
         """Multiple subagents should each create their own tab group."""
         call_count = 0
 
-        async def mock_create_context(agent_id: str) -> dict:
+        async def mock_create_context(agent_id: str, display_name: str | None = None, browser_profile: str = "default") -> dict:
             nonlocal call_count
             call_count += 1
             return {"groupId": call_count, "tabId": 100 + call_count}
@@ -201,17 +224,22 @@ class TestComplexScriptExecution:
 
         mock_bridge.scroll = AsyncMock(side_effect=mock_scroll)
 
-        register_interaction_tools(mcp)
-        browser_scroll = mcp._tool_manager._tools["browser_scroll"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
                 # Simulate infinite scroll - multiple scroll operations
                 for _ in range(3):
-                    await browser_scroll(direction="down", amount=500)
+                    await browser_interact(
+                        action="scroll",
+                        scroll_direction="down",
+                        scroll_amount=500,
+                        auto_snapshot_mode="off",
+                    )
 
         assert len(scroll_calls) == 3
 
@@ -253,19 +281,24 @@ class TestComplexScriptExecution:
         mock_bridge.evaluate = AsyncMock(return_value={"result": {"value": tweets_loaded}})
         mock_bridge.scroll = AsyncMock(return_value={"ok": True})
 
-        register_interaction_tools(mcp)
+        register_interact_tools(mcp)
         register_advanced_tools(mcp)
 
-        browser_scroll = mcp._tool_manager._tools["browser_scroll"].fn
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
         browser_evaluate = mcp._tool_manager._tools["browser_evaluate"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
                 # Simulate Twitter timeline scroll
-                await browser_scroll(direction="down", amount=800)
+                await browser_interact(
+                    action="scroll",
+                    scroll_direction="down",
+                    scroll_amount=800,
+                    auto_snapshot_mode="off",
+                )
 
         with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
             with patch(
@@ -292,7 +325,6 @@ class TestComplexScriptExecution:
         mock_bridge.click = AsyncMock(return_value={"ok": True})
 
         register_advanced_tools(mcp)
-        register_interaction_tools(mcp)
 
         browser_evaluate = mcp._tool_manager._tools["browser_evaluate"].fn
 
@@ -359,21 +391,23 @@ class TestComplexScriptExecution:
         mock_bridge.type_text = AsyncMock(side_effect=mock_type_text)
         mock_bridge.select_option = AsyncMock(side_effect=mock_select_option)
 
-        register_interaction_tools(mcp)
+        register_interact_tools(mcp)
 
-        browser_type = mcp._tool_manager._tools["browser_type"].fn
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
         browser_select = mcp._tool_manager._tools["browser_select"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
-            with patch(
-                "gcu.browser.tools.interactions._get_context",
+        with (
+            patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge),
+            patch(
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
-            ):
-                # Fill out a LinkedIn job application form
-                await browser_type(selector="#first-name", text="John")
-                await browser_type(selector="#last-name", text="Doe")
-                await browser_type(selector="#email", text="john.doe@example.com")
-                await browser_select(selector="#experience-level", values=["5-10 years"])
+            ),
+        ):
+            # Fill out a LinkedIn job application form
+            await browser_interact(action="type", selector="#first-name", text="John", auto_snapshot_mode="off")
+            await browser_interact(action="type", selector="#last-name", text="Doe", auto_snapshot_mode="off")
+            await browser_interact(action="type", selector="#email", text="john.doe@example.com", auto_snapshot_mode="off")
+            await browser_select(selector="#experience-level", values=["5-10 years"])
 
         assert filled_fields.get("#first-name") == "John"
         assert filled_fields.get("#last-name") == "Doe"
@@ -445,28 +479,6 @@ class TestNavigation:
         # The bridge.navigate is called with wait_until as keyword argument
         mock_bridge.navigate.assert_awaited_once_with(100, "https://example.com", wait_until="networkidle")
 
-    @pytest.mark.asyncio
-    async def test_navigation_history(self, mcp: FastMCP, mock_bridge: MagicMock):
-        """Test back/forward navigation."""
-        mock_bridge.go_back = AsyncMock(return_value={"ok": True})
-        mock_bridge.go_forward = AsyncMock(return_value={"ok": True})
-
-        register_navigation_tools(mcp)
-        browser_go_back = mcp._tool_manager._tools["browser_go_back"].fn
-        browser_go_forward = mcp._tool_manager._tools["browser_go_forward"].fn
-
-        with patch("gcu.browser.tools.navigation.get_bridge", return_value=mock_bridge):
-            with patch(
-                "gcu.browser.tools.navigation._get_context",
-                return_value={"groupId": 1, "activeTabId": 100},
-            ):
-                back_result = await browser_go_back()
-                forward_result = await browser_go_forward()
-
-        assert back_result.get("ok") is True
-        assert forward_result.get("ok") is True
-
-
 class TestInteractions:
     """Tests for interaction tools."""
 
@@ -481,17 +493,17 @@ class TestInteractions:
 
         mock_bridge.click = AsyncMock(side_effect=track_click)
 
-        register_interaction_tools(mcp)
-        browser_click = mcp._tool_manager._tools["browser_click"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
-                await browser_click(selector="button", button="left")
-                await browser_click(selector="button", button="right")
-                await browser_click(selector="button", button="middle")
+                await browser_interact(action="left_click", selector="button", auto_snapshot_mode="off")
+                await browser_interact(action="right_click", selector="button", auto_snapshot_mode="off")
+                await browser_interact(action="middle_click", selector="button", auto_snapshot_mode="off")
 
         assert len(click_calls) == 3
         assert [c[2] for c in click_calls] == ["left", "right", "middle"]
@@ -507,12 +519,12 @@ class TestInteractions:
 
         mock_bridge.type_text = AsyncMock(side_effect=track_type)
 
-        register_interaction_tools(mcp)
-        browser_type = mcp._tool_manager._tools["browser_type"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
                 # Test various special characters
@@ -526,15 +538,15 @@ class TestInteractions:
                 ]
 
                 for text in special_texts:
-                    result = await browser_type(selector="input", text=text)
-                    assert result.get("ok") is True
+                    result = await browser_interact(action="type", selector="input", text=text, auto_snapshot_mode="off")
+                    assert _payload(result).get("ok") is True
 
         assert typed_texts == special_texts
 
     @pytest.mark.asyncio
     async def test_drag_and_drop(self, mcp: FastMCP, mock_bridge: MagicMock):
         """Test drag and drop operation."""
-        # browser_drag uses _cdp directly for DOM queries and mouse events
+        # the drag action uses _cdp directly for DOM queries and mouse events
         mock_bridge._cdp = AsyncMock(
             side_effect=lambda tab_id, method, params=None: {
                 "DOM.getDocument": {"root": {"nodeId": 1}},
@@ -544,20 +556,21 @@ class TestInteractions:
             }.get(method, {})
         )
 
-        register_interaction_tools(mcp)
-        browser_drag = mcp._tool_manager._tools["browser_drag"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
-                result = await browser_drag(
+                result = await browser_interact(
+                    action="drag",
                     start_selector="#draggable",
-                    end_selector="#dropzone",
+                    selector="#dropzone",
                 )
 
-        assert result.get("ok") is True
+        assert _payload(result).get("ok") is True
 
 
 class TestInspection:
@@ -606,7 +619,7 @@ class TestInspection:
                 "gcu.browser.tools.inspection._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
-                result = await browser_screenshot(full_page=True)
+                result = await browser_screenshot(full_page=True, intent="test")
 
         # browser_screenshot returns list of content blocks
         assert isinstance(result, list)
@@ -621,19 +634,20 @@ class TestAdvancedTools:
         """Test wait_for_selector timeout behavior."""
         mock_bridge.wait_for_selector = AsyncMock(side_effect=TimeoutError("Element not found within timeout"))
 
-        register_advanced_tools(mcp)
-        browser_wait = mcp._tool_manager._tools["browser_wait"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.advanced._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
-                result = await browser_wait(selector=".nonexistent", timeout_ms=1000)
+                result = await browser_interact(action="wait", wait_for_selector=".nonexistent", timeout_ms=1000)
 
         # Should return error result, not raise
-        assert result.get("ok") is False
-        assert "error" in result or "timed out" in str(result).lower()
+        payload = _payload(result)
+        assert payload.get("ok") is False
+        assert "error" in payload or "timed out" in str(payload).lower()
 
     @pytest.mark.asyncio
     async def test_evaluate_with_return_value(self, mcp: FastMCP, mock_bridge: MagicMock):
@@ -653,6 +667,47 @@ class TestAdvancedTools:
         # browser_evaluate returns raw result from bridge
         assert "result" in result
         assert result["result"]["value"]["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_unnests_json_string_from_remote_bridge(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """Client mode: `bridge.evaluate` is forwarded over RPC to the long-lived
+        bridge_host, which may still hand back a raw `JSON.stringify(...)` string.
+        The tool wrapper (running in the recyclable gcu server) must un-nest it so
+        the agent sees clean nested JSON, not an escaped string."""
+        mock_bridge.evaluate = AsyncMock(
+            return_value={"ok": True, "action": "evaluate", "result": '[{"h":"x","t":"y"}]'}
+        )
+
+        register_advanced_tools(mcp)
+        browser_evaluate = mcp._tool_manager._tools["browser_evaluate"].fn
+
+        with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.advanced._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_evaluate(script="return JSON.stringify(items)")
+
+        assert result["ok"] is True
+        assert result["result"] == [{"h": "x", "t": "y"}]
+        assert isinstance(result["result"], list)
+
+    @pytest.mark.asyncio
+    async def test_evaluate_leaves_plain_string_result_untouched(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """A non-JSON string result (e.g. a status token) must pass through as-is."""
+        mock_bridge.evaluate = AsyncMock(return_value={"ok": True, "action": "evaluate", "result": "no-trigger"})
+
+        register_advanced_tools(mcp)
+        browser_evaluate = mcp._tool_manager._tools["browser_evaluate"].fn
+
+        with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.advanced._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_evaluate(script="return status")
+
+        assert result["result"] == "no-trigger"
 
     @pytest.mark.asyncio
     async def test_file_upload(self, mcp: FastMCP, mock_bridge: MagicMock, tmp_path):
@@ -694,23 +749,260 @@ class TestAdvancedTools:
         assert result.get("count") == 2
 
 
+class TestEvaluateJsonUnnesting:
+    """BeelineBridge.evaluate should un-nest JSON-string results.
+
+    Skills routinely `return JSON.stringify(...)` from browser_evaluate, so the
+    page hands back a JSON *string*. The bridge parses {/[-prefixed JSON strings
+    back into real objects so the tool result serializes as clean nested JSON
+    instead of `"result": "[{\\"h\\":...}]"` (escaped, hard for the agent to read).
+    """
+
+    def _bridge_with_cdp_value(self, cdp_value) -> BeelineBridge:
+        """Real BeelineBridge whose CDP touchpoints are mocked to return
+        a Runtime.evaluate result carrying ``cdp_value``."""
+        bridge = BeelineBridge.__new__(BeelineBridge)
+        bridge.cdp_attach = AsyncMock(return_value={"ok": True})
+        bridge._try_enable_domain = AsyncMock(return_value={"ok": True})
+        bridge._cdp = AsyncMock(return_value={"result": {"type": "string", "value": cdp_value}})
+        return bridge
+
+    @pytest.mark.asyncio
+    async def test_json_array_string_is_parsed(self):
+        bridge = self._bridge_with_cdp_value('[{"h":"x","t":"y"}]')
+        out = await bridge.evaluate(100, "return JSON.stringify(items)")
+        assert out["ok"] is True
+        # Parsed into a real list — NOT left as an escaped JSON string.
+        assert out["result"] == [{"h": "x", "t": "y"}]
+        assert isinstance(out["result"], list)
+
+    @pytest.mark.asyncio
+    async def test_json_object_string_is_parsed(self):
+        bridge = self._bridge_with_cdp_value('{"n": 4, "ok": true}')
+        out = await bridge.evaluate(100, "return JSON.stringify(meta)")
+        assert out["result"] == {"n": 4, "ok": True}
+        assert isinstance(out["result"], dict)
+
+    @pytest.mark.asyncio
+    async def test_plain_string_is_untouched(self):
+        # Not JSON-shaped (doesn't start with { or [) — must stay a string.
+        bridge = self._bridge_with_cdp_value("no-trigger")
+        out = await bridge.evaluate(100, "return status")
+        assert out["result"] == "no-trigger"
+
+    @pytest.mark.asyncio
+    async def test_html_string_is_untouched(self):
+        # outerHTML starts with '<' — leave it as the raw string.
+        bridge = self._bridge_with_cdp_value("<div>hello</div>")
+        out = await bridge.evaluate(100, "return el.outerHTML")
+        assert out["result"] == "<div>hello</div>"
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_string_is_untouched(self):
+        # Looks JSON-ish but doesn't parse — keep the raw string, don't crash.
+        bridge = self._bridge_with_cdp_value("{not valid json")
+        out = await bridge.evaluate(100, "return weird")
+        assert out["result"] == "{not valid json"
+
+    @pytest.mark.asyncio
+    async def test_object_value_passes_through(self):
+        # JS returned an object literal directly — value is already a dict.
+        bridge = self._bridge_with_cdp_value({"w": 1280, "h": 720})
+        out = await bridge.evaluate(100, "return ({w: innerWidth, h: innerHeight})")
+        assert out["result"] == {"w": 1280, "h": 720}
+
+
+class TestNativeDialogs:
+    """Tests for native dialog handling (alert/confirm/prompt/beforeunload)."""
+
+    @pytest.mark.asyncio
+    async def test_dialog_respond_accept(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """browser_dialog_respond(accept) resolves a pending dialog via the bridge."""
+        mock_bridge.get_pending_dialog = MagicMock(return_value={"type": "beforeunload", "message": "Leave site?"})
+        mock_bridge.handle_javascript_dialog = AsyncMock(return_value={"ok": True, "tab_id": 100, "dialog": {"type": "beforeunload"}})
+
+        register_advanced_tools(mcp)
+        browser_dialog_respond = mcp._tool_manager._tools["browser_dialog_respond"].fn
+
+        with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.advanced._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_dialog_respond(action="accept")
+
+        assert result.get("ok") is True
+        mock_bridge.handle_javascript_dialog.assert_awaited_once()
+        assert mock_bridge.handle_javascript_dialog.await_args.kwargs["accept"] is True
+
+    @pytest.mark.asyncio
+    async def test_dialog_respond_attempts_even_when_untracked(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """browser_dialog_respond always attempts recovery — even with no tracked
+        dialog — so it can unstick a wedged browser whose dialog event was missed."""
+        mock_bridge.get_pending_dialog = MagicMock(return_value=None)
+        mock_bridge.handle_javascript_dialog = AsyncMock(return_value={"ok": False, "tab_id": 100, "error": "No native dialog is open on this tab"})
+
+        register_advanced_tools(mcp)
+        browser_dialog_respond = mcp._tool_manager._tools["browser_dialog_respond"].fn
+
+        with patch("gcu.browser.tools.advanced.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.advanced._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_dialog_respond(action="dismiss")
+
+        # It must still call through — the bridge decides if a dialog was there.
+        mock_bridge.handle_javascript_dialog.assert_awaited_once()
+        assert result.get("ok") is False
+
+    @pytest.mark.asyncio
+    async def test_snapshot_surfaces_pending_dialog(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """browser_snapshot returns the dialog instead of hanging on a paused tab."""
+        mock_bridge.get_pending_dialog = MagicMock(
+            return_value={
+                "type": "beforeunload",
+                "message": "Leave site?",
+                "default_prompt": "",
+                "url": "https://x.com",
+            }
+        )
+
+        register_inspection_tools(mcp)
+        browser_snapshot = mcp._tool_manager._tools["browser_snapshot"].fn
+
+        with patch("gcu.browser.tools.inspection.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.inspection._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_snapshot()
+
+        assert result.get("ok") is False
+        assert result.get("pending_dialog", {}).get("type") == "beforeunload"
+        # snapshot() must NOT be attempted — it would block on the paused tab.
+        mock_bridge.snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_awaits_async_pending_dialog(self, mcp: FastMCP, mock_bridge: MagicMock):
+        """Client-mode regression: get_pending_dialog is a coroutine via the
+        RemoteBridge RPC proxy. browser_snapshot must await it instead of
+        calling .get() on the raw coroutine (which raised
+        "'coroutine' object has no attribute 'get'")."""
+        mock_bridge.get_pending_dialog = AsyncMock(
+            return_value={
+                "type": "alert",
+                "message": "blocked",
+                "default_prompt": "",
+                "url": "https://x.com",
+            }
+        )
+
+        register_inspection_tools(mcp)
+        browser_snapshot = mcp._tool_manager._tools["browser_snapshot"].fn
+
+        with patch("gcu.browser.tools.inspection.get_bridge", return_value=mock_bridge):
+            with patch(
+                "gcu.browser.tools.inspection._get_context",
+                return_value={"groupId": 1, "activeTabId": 100},
+            ):
+                result = await browser_snapshot()
+
+        mock_bridge.get_pending_dialog.assert_awaited_once()
+        assert result.get("ok") is False
+        assert result.get("pending_dialog", {}).get("type") == "alert"
+        mock_bridge.snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cdp_fast_fails_when_dialog_pending(self):
+        """_cdp raises immediately (no 60s lock wait) when a dialog blocks the tab."""
+        bridge = BeelineBridge()
+        tab_id = 100
+        bridge._pending_dialogs[tab_id] = {
+            "type": "beforeunload",
+            "message": "Leave site?",
+            "default_prompt": "",
+            "url": "",
+            "opened_at_ms": 0.0,
+        }
+        bridge._send = AsyncMock(return_value={"ok": True})
+
+        with pytest.raises(Exception) as exc:
+            await asyncio.wait_for(
+                bridge._cdp(tab_id, "Runtime.evaluate", {"expression": "1"}),
+                timeout=1.0,
+            )
+
+        assert "dialog" in str(exc.value).lower()
+        # Guard fired before sending — no command reached the extension.
+        bridge._send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_dialog_bypasses_tab_lock(self):
+        """handle_javascript_dialog must not deadlock behind a stuck navigate.
+
+        Regression test for the wedge: a beforeunload dialog blocks
+        Page.navigate, which holds the per-tab lock for its full timeout.
+        The dialog-handling command must reach the extension anyway —
+        otherwise the only tool that can unblock the context is itself
+        blocked, and the whole browser stays frozen.
+        """
+        bridge = BeelineBridge()
+        tab_id = 100
+        bridge._pending_dialogs[tab_id] = {
+            "type": "beforeunload",
+            "message": "Leave site?",
+            "default_prompt": "",
+            "url": "",
+            "opened_at_ms": 0.0,
+        }
+        bridge._send = AsyncMock(return_value={"ok": True})
+
+        # Simulate the stuck Page.navigate by holding the tab lock.
+        lock = bridge._tab_lock(tab_id)
+        await lock.acquire()
+        try:
+            result = await asyncio.wait_for(
+                bridge.handle_javascript_dialog(tab_id, accept=True),
+                timeout=1.0,
+            )
+        finally:
+            lock.release()
+
+        assert result["ok"] is True
+        bridge._send.assert_awaited_once()
+        assert bridge._send.await_args.kwargs["method"] == "Page.handleJavaScriptDialog"
+        assert bridge._send.await_args.kwargs["params"]["accept"] is True
+        # Pending state cleared so a stale entry can't block later CDP calls.
+        assert bridge.get_pending_dialog(tab_id) is None
+
+
 class TestErrorHandling:
     """Tests for error handling scenarios."""
 
     @pytest.mark.asyncio
     async def test_bridge_not_connected(self, mcp: FastMCP):
-        """Test behavior when bridge is not connected."""
-        mock_bridge = MagicMock(spec=BeelineBridge)
-        mock_bridge.is_connected = False
+        """A not-connected failure returns a classified, actionable error."""
+        # A real (never-started) bridge so connection_help() runs for real.
+        bridge = BeelineBridge()
+        assert bridge.is_connected is False
 
         register_tab_tools(mcp)
         browser_open = mcp._tool_manager._tools["browser_open"].fn
 
-        with patch("gcu.browser.tools.tabs.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.tabs.get_bridge", return_value=bridge):
             result = await browser_open(url="https://example.com", profile="test")
 
         assert result.get("ok") is False
-        assert "not connected" in result.get("error", "").lower()
+        # Whatever the classified cause, the error names the extension and
+        # gives the agent a concrete next step. The exact wording depends
+        # on which branch of connection_help() fires (extension-missing,
+        # Chrome-not-running, port-conflict, etc.) — all of them must
+        # mention the extension and prescribe an action.
+        error = result.get("error", "")
+        assert "extension" in error.lower()
+        action_words = ("retry", "browser_setup", "stop", "install", "open chrome", "wait")
+        assert any(w in error.lower() for w in action_words), error
 
     @pytest.mark.asyncio
     async def test_browser_not_started(self, mcp: FastMCP, mock_bridge: MagicMock):
@@ -730,18 +1022,19 @@ class TestErrorHandling:
         """Test handling of CDP command failures."""
         mock_bridge.click = AsyncMock(side_effect=RuntimeError("CDP error: Element not found"))
 
-        register_interaction_tools(mcp)
-        browser_click = mcp._tool_manager._tools["browser_click"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
-                result = await browser_click(selector=".nonexistent")
+                result = await browser_interact(action="left_click", selector=".nonexistent", auto_snapshot_mode="off")
 
-        assert result.get("ok") is False
-        assert "error" in result
+        payload = _payload(result)
+        assert payload.get("ok") is False
+        assert "error" in payload
 
 
 class TestIFWrapping:
@@ -821,12 +1114,12 @@ class TestConcurrentOperations:
 
         mock_bridge.click = AsyncMock(side_effect=mock_click)
 
-        register_interaction_tools(mcp)
-        browser_click = mcp._tool_manager._tools["browser_click"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 side_effect=lambda p: {
                     "groupId": 1 if p == "agent_1" else 2 if p == "agent_2" else 3,
                     "activeTabId": 101 if p == "agent_1" else 201 if p == "agent_2" else 301,
@@ -834,9 +1127,9 @@ class TestConcurrentOperations:
             ):
                 # Concurrent clicks from different agents
                 await asyncio.gather(
-                    browser_click(selector="button", profile="agent_1"),
-                    browser_click(selector="button", profile="agent_2"),
-                    browser_click(selector="button", profile="agent_3"),
+                    browser_interact(action="left_click", selector="button", profile="agent_1", auto_snapshot_mode="off"),
+                    browser_interact(action="left_click", selector="button", profile="agent_2", auto_snapshot_mode="off"),
+                    browser_interact(action="left_click", selector="button", profile="agent_3", auto_snapshot_mode="off"),
                 )
 
         # All clicks should have been executed
@@ -864,20 +1157,18 @@ class TestConcurrentOperations:
         mock_bridge.type_text = AsyncMock(side_effect=track_type)
         mock_bridge.scroll = AsyncMock(side_effect=track_scroll)
 
-        register_interaction_tools(mcp)
-        browser_click = mcp._tool_manager._tools["browser_click"].fn
-        browser_type = mcp._tool_manager._tools["browser_type"].fn
-        browser_scroll = mcp._tool_manager._tools["browser_scroll"].fn
+        register_interact_tools(mcp)
+        browser_interact = mcp._tool_manager._tools["browser_interact"].fn
 
-        with patch("gcu.browser.tools.interactions.get_bridge", return_value=mock_bridge):
+        with patch("gcu.browser.tools.interact.get_bridge", return_value=mock_bridge):
             with patch(
-                "gcu.browser.tools.interactions._get_context",
+                "gcu.browser.tools.interact._get_context",
                 return_value={"groupId": 1, "activeTabId": 100},
             ):
                 # Mix of operations
-                await browser_click(selector="button")
-                await browser_type(selector="input", text="hello")
-                await browser_scroll(direction="down")
+                await browser_interact(action="left_click", selector="button", auto_snapshot_mode="off")
+                await browser_interact(action="type", selector="input", text="hello", auto_snapshot_mode="off")
+                await browser_interact(action="scroll", scroll_direction="down", auto_snapshot_mode="off")
 
         assert "click" in operations
         assert "type" in operations

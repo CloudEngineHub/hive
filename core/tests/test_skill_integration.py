@@ -37,7 +37,9 @@ class TestPromptComposition:
         )
         assert "You are a helpful agent." in prompt
         assert "Focus on the task." in prompt
-        assert "Current date and time" in prompt
+        # Day-resolution stamp — minute resolution was a prompt-cache buster
+        # (see stamp_prompt_datetime docstring).
+        assert "Current date:" in prompt
 
     def test_skills_catalog_in_prompt(self):
         catalog = SkillCatalog([_make_skill(source_scope="project")])
@@ -144,11 +146,6 @@ class TestEndToEndPipeline:
         prompt = catalog.to_prompt()
         assert "<name>my-tool</name>" in prompt
         assert "<description>Tool for testing.</description>" in prompt
-
-        # Pre-activation
-        activated = catalog.build_pre_activated_prompt(["my-tool"])
-        assert "## Usage" in activated
-        assert catalog.is_activated("my-tool")
 
     def test_defaults_plus_community_skills(self, tmp_path):
         """Default skills and community skills produce separate prompt sections."""

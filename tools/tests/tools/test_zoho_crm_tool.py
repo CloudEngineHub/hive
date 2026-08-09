@@ -90,9 +90,7 @@ class TestZohoCrmCreateRecord:
         ):
             mock_post.return_value.status_code = 201
             mock_post.return_value.json.return_value = mock_resp
-            result = tool_fns["zoho_crm_create_record"](
-                module="Leads", record_data={"Last_Name": "Doe", "Company": "Test"}
-            )
+            result = tool_fns["zoho_crm_create_record"](module="Leads", record_data={"Last_Name": "Doe", "Company": "Test"})
 
         assert result["status"] == "success"
         assert result["id"] == "456"

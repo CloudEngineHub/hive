@@ -6,7 +6,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
 LEGACY_RUN_ID = "__legacy_run__"
@@ -16,6 +15,57 @@ logger = logging.getLogger(__name__)
 def is_legacy_run_id(run_id: str | None) -> bool:
     """True when run_id represents pre-migration (no run boundary) data."""
     return run_id is None or run_id == LEGACY_RUN_ID
+
+
+def _collect_attach_file_chip_urls(messages: list[Any]) -> list[dict[str, Any]]:
+    """Scan the current turn's ``tool``-role messages for ``attach_file``
+    results that include ``hive_attachment_url`` entries. Returns
+    image_url-shaped dicts ready to live on the next assistant message's
+    ``images`` field, in chronological order.
+
+    "Current turn" = the messages after the most recent ``assistant``
+    message. Tool results from earlier turns are not promoted (they
+    already got attached to their own assistant message when it was
+    persisted).
+    """
+    # Find the boundary: index just after the last assistant message.
+    boundary = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "role", None) == "assistant":
+            boundary = i + 1
+            break
+    images: list[dict[str, Any]] = []
+    for m in messages[boundary:]:
+        if getattr(m, "role", None) != "tool":
+            continue
+        content = getattr(m, "content", "") or ""
+        # Cheap pre-filter — most tool results aren't attach_file summaries.
+        if "hive_attachment_url" not in content or '"attached"' not in content:
+            continue
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        attached = data.get("attached")
+        if not isinstance(attached, list):
+            continue
+        for entry in attached:
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("hive_attachment_url")
+            filename = entry.get("filename")
+            if not isinstance(url, str) or not url:
+                continue
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                    "filename": filename if isinstance(filename, str) else None,
+                }
+            )
+    return images
 
 
 @dataclass
@@ -42,16 +92,17 @@ class Message:
     is_transition_marker: bool = False
     # True when this message is real human input (from /chat), not a system prompt
     is_client_input: bool = False
-    # Optional image content blocks (e.g. from browser_screenshot)
+    # Optional image content blocks (e.g. from a hive-browser screenshot)
     image_content: list[dict[str, Any]] | None = None
     # True when message contains an activated skill body (AS-10: never prune)
     is_skill_content: bool = False
     # Logical worker run identifier for shared-session persistence
     run_id: str | None = None
-    # True when this is a framework-injected continuation hint (continue-nudge
-    # on stream stall). Stored as a user message for API compatibility, but
-    # the UI should render it as a compact system notice, not user speech.
-    is_system_nudge: bool = False
+    # True when this is a framework-injected system reminder (idle nudge,
+    # stream-stall continuation hint, …). Stored as a user message for API
+    # compatibility, but the UI should render it as a compact system notice,
+    # not user speech.
+    is_system_reminder: bool = False
     # True when this message is a partial/truncated assistant turn reconstructed
     # from a crashed or watchdog-cancelled stream. Signals that the original
     # turn never finished — the model may or may not choose to redo it.
@@ -66,6 +117,30 @@ class Message:
     # sees the message as a regular user turn; the UI uses this flag to
     # render it as a trigger banner instead of a speech bubble.
     is_trigger: bool = False
+    # Reasoning/`thinking` content blocks the model produced on this
+    # assistant turn (DeepSeek, GLM via the hive-2.1 alias, Anthropic
+    # extended thinking). Stored verbatim — including each block's opaque
+    # `signature` — and echoed back on every follow-up request. Reasoning
+    # models reject the next request with a 400 if a prior assistant turn
+    # is missing them. None for non-reasoning models and non-assistant
+    # roles.
+    thinking_blocks: list[dict[str, Any]] | None = None
+    # Optional chip-renderable attachments to surface on this message in
+    # the UI. Same shape user messages use for their uploaded files — a
+    # list of ``{"type": "image_url", "image_url": {"url": "hive-attachment://..."}, "filename": "..."}`` entries.
+    # Populated for assistant messages by `add_assistant_message` when
+    # the preceding turn called `attach_file` and the tool result included
+    # ``hive_attachment_url`` entries. Renderer uses this directly. Does
+    # NOT round-trip through ``to_llm_dict`` — purely UI sidecar.
+    images: list[dict[str, Any]] | None = None
+    # Absolute path to the on-disk spill file holding this tool result's full
+    # content (set for compactable results whenever a spillover dir is
+    # configured). Out-of-band metadata — deliberately NOT emitted by
+    # ``to_llm_dict`` so the model never sees it on a fresh result (poison
+    # pattern). Compaction (microcompact / prune) reads it so a cleared result
+    # can always cite a recovery path, even when the result was small enough to
+    # be inlined without an in-message ``Full result at:`` pointer.
+    spillover_path: str | None = None
 
     def to_llm_dict(self) -> dict[str, Any]:
         """Convert to OpenAI-format message dict."""
@@ -85,6 +160,13 @@ class Message:
                 d["content"] = self.content if self.content else None
             else:
                 d["content"] = self.content or ""
+            # Echo reasoning blocks back verbatim. litellm's Anthropic
+            # request transform reads ``thinking_blocks`` off the assistant
+            # message and re-emits them as `thinking` content blocks (in
+            # order, before text/tool_use). Omitting them 400s reasoning
+            # models — see Message.thinking_blocks.
+            if self.thinking_blocks:
+                d["thinking_blocks"] = self.thinking_blocks
             return d
 
         # role == "tool"
@@ -127,14 +209,20 @@ class Message:
             d["image_content"] = self.image_content
         if self.run_id is not None:
             d["run_id"] = self.run_id
-        if self.is_system_nudge:
-            d["is_system_nudge"] = self.is_system_nudge
+        if self.is_system_reminder:
+            d["is_system_reminder"] = self.is_system_reminder
         if self.truncated:
             d["truncated"] = self.truncated
         if self.inherited_from is not None:
             d["inherited_from"] = self.inherited_from
         if self.is_trigger:
             d["is_trigger"] = self.is_trigger
+        if self.thinking_blocks is not None:
+            d["thinking_blocks"] = self.thinking_blocks
+        if self.images is not None:
+            d["images"] = self.images
+        if self.spillover_path is not None:
+            d["spillover_path"] = self.spillover_path
         return d
 
     @classmethod
@@ -152,10 +240,13 @@ class Message:
             is_client_input=data.get("is_client_input", False),
             image_content=data.get("image_content"),
             run_id=data.get("run_id"),
-            is_system_nudge=data.get("is_system_nudge", False),
+            is_system_reminder=data.get("is_system_reminder", data.get("is_system_nudge", False)),
             truncated=data.get("truncated", False),
             inherited_from=data.get("inherited_from"),
             is_trigger=data.get("is_trigger", False),
+            thinking_blocks=data.get("thinking_blocks"),
+            images=data.get("images"),
+            spillover_path=data.get("spillover_path"),
         )
 
 
@@ -192,70 +283,27 @@ def update_run_cursor(
 def _extract_spillover_filename(content: str) -> str | None:
     """Extract spillover filename from a tool result annotation.
 
-    Matches patterns produced by ``truncate_tool_result``:
-        - New large-result header: "Full result saved at: /abs/path/file.txt"
-        - Legacy bracketed trailer: "[Saved to 'file.txt']"  (pre-2026-04-15,
-          retained here so cold conversations still resolve)
+    Matches every header format ``truncate_tool_result`` and microcompact
+    have ever emitted — missing one silently drops the pointer to the
+    spilled file when the message is pruned, stranding the only surviving
+    copy of the tool result:
+        - Current large-result header: "Full result at: /abs/path/file.txt"
+        - Microcompact placeholder: "Old tool result (N chars) at /abs/path"
+        - Older prose: "Full result saved at: /abs/path/file.txt"
+        - Legacy bracketed trailer: "[Saved to 'file.txt']" (pre-2026-04-15)
     """
-    # New prose format — ``saved at: <absolute path>``, terminated by
-    # newline or end-of-string.
+    match = re.search(r"[Ff]ull result at:\s*(\S+)", content)
+    if match:
+        return match.group(1).rstrip(".,;:")
+    match = re.search(r"\)\s+at\s+(/\S+)", content)
+    if match:
+        return match.group(1).rstrip(".,;:")
     match = re.search(r"[Ss]aved at:\s*(\S+)", content)
     if match:
-        return match.group(1)
+        return match.group(1).rstrip(".,;:")
     # Legacy format.
     match = re.search(r"[Ss]aved to '([^']+)'", content)
     return match.group(1) if match else None
-
-
-_TC_ARG_LIMIT = 200  # max chars per tool_call argument after compaction
-
-
-def _compact_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Truncate tool_call arguments to save context tokens during compaction.
-
-    Preserves ``id``, ``type``, and ``function.name`` exactly.  When arguments
-    exceed ``_TC_ARG_LIMIT``, replaces the full JSON string with a compact
-    **valid** JSON summary.  The Anthropic API parses tool_call arguments and
-    rejects requests with malformed JSON (e.g. unterminated strings), so we
-    must never produce broken JSON here.
-    """
-    compact = []
-    for tc in tool_calls:
-        func = tc.get("function", {})
-        args = func.get("arguments", "")
-        if len(args) > _TC_ARG_LIMIT:
-            # Build a valid JSON summary instead of slicing mid-string.
-            # Try to extract top-level keys for a meaningful preview.
-            try:
-                parsed = json.loads(args)
-                if isinstance(parsed, dict):
-                    # Preserve key names, truncate values
-                    summary_parts = []
-                    for k, v in parsed.items():
-                        v_str = str(v)
-                        if len(v_str) > 60:
-                            v_str = v_str[:60] + "..."
-                        summary_parts.append(f"{k}={v_str}")
-                    summary = ", ".join(summary_parts)
-                    if len(summary) > _TC_ARG_LIMIT:
-                        summary = summary[:_TC_ARG_LIMIT] + "..."
-                    args = json.dumps({"_compacted": summary})
-                else:
-                    args = json.dumps({"_compacted": str(parsed)[:_TC_ARG_LIMIT]})
-            except (json.JSONDecodeError, TypeError):
-                # Args were already invalid JSON — wrap the preview safely
-                args = json.dumps({"_compacted": args[:_TC_ARG_LIMIT]})
-        compact.append(
-            {
-                "id": tc.get("id", ""),
-                "type": tc.get("type", "function"),
-                "function": {
-                    "name": func.get("name", ""),
-                    "arguments": args,
-                },
-            }
-        )
-    return compact
 
 
 def extract_tool_call_history(messages: list[Message], max_entries: int = 30) -> str:
@@ -275,8 +323,8 @@ def extract_tool_call_history(messages: list[Message], max_entries: int = 30) ->
             return args.get("query", "")
         if name == "web_scrape":
             return args.get("url", "")
-        if name == "read_file":
-            return args.get("path", "")
+        if name == "terminal_exec":
+            return args.get("command", "")
         return ""
 
     for msg in messages:
@@ -292,8 +340,6 @@ def extract_tool_call_history(messages: list[Message], max_entries: int = 30) ->
                 summary = _summarize_input(name, args)
                 tool_calls_detail.setdefault(name, []).append(summary)
 
-                if name == "read_file" and args.get("path"):
-                    files_saved.append(args["path"])
                 if name == "set_output" and args.get("key"):
                     outputs_set.append(args["key"])
 
@@ -418,10 +464,15 @@ class NodeConversation:
     ``_persist`` call).
     """
 
+    # Class-level default so ``__new__`` bypass paths (used by some tests
+    # and the legacy restore-from-storage flow) still resolve the flag.
+    # ``__init__`` overrides this with an instance-level attribute.
+    _microcompact_inflight: bool = False
+
     def __init__(
         self,
         system_prompt: str = "",
-        max_context_tokens: int = 32000,
+        max_context_tokens: int = 180_000,
         compaction_threshold: float = 0.8,
         output_keys: list[str] | None = None,
         store: ConversationStore | None = None,
@@ -464,6 +515,11 @@ class NodeConversation:
         self._last_api_input_tokens: int | None = None
         self._current_phase: str | None = None
         self._run_id: str | None = run_id
+        # Re-entrancy guard for proactive microcompaction triggered from
+        # add_tool_result. microcompact() itself mutates _messages, and
+        # while it doesn't currently call back into add_tool_result, the
+        # guard keeps future refactors from looping.
+        self._microcompact_inflight: bool = False
 
     # --- Properties --------------------------------------------------------
 
@@ -557,7 +613,7 @@ class NodeConversation:
         is_transition_marker: bool = False,
         is_client_input: bool = False,
         image_content: list[dict[str, Any]] | None = None,
-        is_system_nudge: bool = False,
+        is_system_reminder: bool = False,
         is_trigger: bool = False,
     ) -> Message:
         msg = Message(
@@ -569,7 +625,7 @@ class NodeConversation:
             is_transition_marker=is_transition_marker,
             is_client_input=is_client_input,
             image_content=image_content,
-            is_system_nudge=is_system_nudge,
+            is_system_reminder=is_system_reminder,
             is_trigger=is_trigger,
         )
         self._messages.append(msg)
@@ -586,7 +642,13 @@ class NodeConversation:
         tool_calls: list[dict[str, Any]] | None = None,
         *,
         truncated: bool = False,
+        thinking_blocks: list[dict[str, Any]] | None = None,
     ) -> Message:
+        # Collect any chip attachments published by attach_file during
+        # the run of tools that fed into this assistant turn. We walk
+        # back from the end, stopping at the previous assistant message
+        # (the boundary of the current turn's tool sequence).
+        images = _collect_attach_file_chip_urls(self._messages)
         msg = Message(
             seq=self._next_seq,
             role="assistant",
@@ -595,6 +657,8 @@ class NodeConversation:
             phase_id=self._current_phase,
             run_id=self._run_id,
             truncated=truncated,
+            thinking_blocks=thinking_blocks or None,
+            images=images or None,
         )
         self._messages.append(msg)
         self._next_seq += 1
@@ -609,6 +673,7 @@ class NodeConversation:
         is_error: bool = False,
         image_content: list[dict[str, Any]] | None = None,
         is_skill_content: bool = False,
+        spillover_path: str | None = None,
     ) -> Message:
         # Dedup guard: reject a second tool_result for the same tool_use_id.
         # Anthropic's API only accepts one result per tool_call, and a duplicate
@@ -624,8 +689,7 @@ class NodeConversation:
                 import logging as _logging
 
                 _logging.getLogger(__name__).warning(
-                    "add_tool_result: dropping duplicate result for tool_use_id=%s "
-                    "(first result preserved, %d chars; new result ignored, %d chars)",
+                    "add_tool_result: dropping duplicate result for tool_use_id=%s (first result preserved, %d chars; new result ignored, %d chars)",
                     tool_use_id,
                     len(existing.content),
                     len(content),
@@ -641,12 +705,57 @@ class NodeConversation:
             image_content=image_content,
             is_skill_content=is_skill_content,
             run_id=self._run_id,
+            spillover_path=spillover_path,
         )
         self._messages.append(msg)
         self._next_seq += 1
         self._last_api_input_tokens = None
         await self._persist(msg)
+        # Proactive microcompaction: when a fresh result lands and the
+        # conversation now has more than ``MICROCOMPACT_KEEP_RECENT``
+        # compactable results pending, clear the oldest ones immediately
+        # rather than waiting until usage_ratio crosses the compaction
+        # threshold (~80%). This is cheap (pure Python, no LLM call)
+        # and only mutates older compactable results — placeholders
+        # already include the spillover path so the agent can re-read.
+        # Guarded by ``_microcompact_inflight`` to avoid recursion.
+        if not is_error and not is_skill_content and not self._microcompact_inflight:
+            self._microcompact_inflight = True
+            try:
+                from framework.agent_loop.internals.compaction import (
+                    COMPACTABLE_TOOLS,
+                    microcompact,
+                )
+
+                tool_name = self._find_tool_name_for_use_id(tool_use_id)
+                if tool_name and tool_name in COMPACTABLE_TOOLS:
+                    microcompact(self)
+            except Exception:
+                # Microcompaction is best-effort. A failure here must
+                # not lose the tool result we just persisted.
+                logger.debug(
+                    "Proactive microcompact failed for tool_use_id=%s",
+                    tool_use_id,
+                    exc_info=True,
+                )
+            finally:
+                self._microcompact_inflight = False
         return msg
+
+    def _find_tool_name_for_use_id(self, tool_use_id: str) -> str | None:
+        """Look up the assistant tool call that produced ``tool_use_id``.
+
+        Walks the message list backwards; returns the function name from
+        the matching ``tool_calls`` entry or None when no match is found
+        (e.g. the assistant message was already compacted out).
+        """
+        for msg in reversed(self._messages):
+            if not msg.tool_calls:
+                continue
+            for tc in msg.tool_calls:
+                if tc.get("id") == tool_use_id:
+                    return tc.get("function", {}).get("name")
+        return None
 
     # --- Query -------------------------------------------------------------
 
@@ -662,8 +771,8 @@ class NodeConversation:
 
         Used by the replay detector to flag when the model is about to redo
         a successful call — we prepend a steer onto the upcoming result but
-        still execute, so tools like browser_screenshot that are legitimately
-        repeated are not silently skipped.
+        still execute, so calls like a hive-browser screenshot that are
+        legitimately repeated are not silently skipped.
         """
         try:
             target_canonical = json.dumps(tool_input, sort_keys=True, default=str)
@@ -702,6 +811,79 @@ class NodeConversation:
                             return m
                         break
         return None
+
+    def count_consecutive_completed_tool_calls(
+        self,
+        name: str,
+        tool_input: dict[str, Any],
+        within_last_turns: int = 3,
+        *,
+        skip_most_recent_assistant: bool = False,
+    ) -> int:
+        """Walk backwards over recent assistant turns; count how many
+        consecutive turns issued a non-error tool call matching
+        ``(name, canonical-args)``. A turn that does NOT include a
+        matching call breaks the streak.
+
+        Used by the hard-breaker variant of the replay detector — when
+        the count reaches the doom-loop threshold, the next identical
+        call is refused instead of nudged.
+
+        ``skip_most_recent_assistant=True`` ignores the most recent
+        assistant turn. The breaker call site needs this: by the time
+        it runs in Phase 1 of ``_handle_pending_tools``, the in-flight
+        assistant message has already been written but its tool
+        results have not, so a naive walk-back would mistake the
+        in-flight turn for a streak-break.
+        """
+        try:
+            target_canonical = json.dumps(tool_input, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            target_canonical = str(tool_input)
+
+        streak = 0
+        assistant_turns_seen = 0
+        skipped_in_flight = not skip_most_recent_assistant
+        for idx in range(len(self._messages) - 1, -1, -1):
+            m = self._messages[idx]
+            if m.role != "assistant":
+                continue
+            if not skipped_in_flight:
+                # Skip the most recent assistant message — its tool
+                # results are still being produced by the caller.
+                skipped_in_flight = True
+                continue
+            assistant_turns_seen += 1
+            if assistant_turns_seen > within_last_turns:
+                break
+            if not m.tool_calls:
+                # Text-only turn breaks the streak.
+                break
+            matched_in_turn = False
+            for tc in m.tool_calls:
+                func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                if func.get("name") != name:
+                    continue
+                args_str = func.get("arguments", "")
+                try:
+                    parsed = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    canonical = json.dumps(parsed, sort_keys=True, default=str)
+                except (TypeError, ValueError):
+                    canonical = str(args_str)
+                if canonical != target_canonical:
+                    continue
+                tc_id = tc.get("id")
+                for later in self._messages[idx + 1 :]:
+                    if later.role == "tool" and later.tool_use_id == tc_id:
+                        if not later.is_error:
+                            matched_in_turn = True
+                        break
+                if matched_in_turn:
+                    break
+            if not matched_in_turn:
+                break
+            streak += 1
+        return streak
 
     def to_llm_messages(self) -> list[dict[str, Any]]:
         """Return messages as OpenAI-format dicts (system prompt excluded).
@@ -746,6 +928,18 @@ class NodeConversation:
                     cleaned[-1]["content"] = f"{prev_content}\n{curr_content}"
                     continue
 
+                # Mixed content types (one has image blocks as a list,
+                # the other is a plain string).  Normalise both sides to
+                # content-block lists and concatenate so the API never
+                # sees two consecutive user messages.
+                def _to_blocks(c: Any) -> list[dict[str, Any]]:
+                    if isinstance(c, list):
+                        return list(c)
+                    return [{"type": "text", "text": c}] if c else []
+
+                cleaned[-1]["content"] = _to_blocks(prev_content) + _to_blocks(curr_content)
+                continue
+
             cleaned.append(m)
 
         # Drop leading assistant/tool messages (no prior context)
@@ -764,13 +958,15 @@ class NodeConversation:
            anywhere) are dropped.  Happens after compaction removes the
            parent assistant message.
         2. **Positionally orphaned tool results** (tool_result separated
-           from its parent by a non-tool message, e.g. a user injection)
-           are dropped.  The Anthropic API requires tool messages to
-           follow immediately after the assistant message that issued
-           the matching tool_call.
+           from its parent by a non-tool message, e.g. an async user
+           injection like a worker report) are hoisted to immediately
+           follow the assistant message that issued the matching
+           tool_call — the position the Anthropic API requires.  A real
+           result must never be masked by a synthetic error: the model
+           would retry calls that already succeeded.
         3. **Duplicate tool results** (same tool_call_id appearing more
            than once) are dropped; only the first is kept.
-        4. **Orphaned tool calls** (tool_use with no following tool_result)
+        4. **Orphaned tool calls** (tool_use with no tool_result anywhere)
            get a synthetic error result appended.  Happens when the loop
            is cancelled mid-tool-execution.
         """
@@ -794,9 +990,11 @@ class NodeConversation:
         # dropped — that closes the gap that caused the tool-after-user
         # 400 errors.
         repaired: list[dict[str, Any]] = []
-        open_tool_calls: set[str] = set()
+        # dict (insertion-ordered) so hoisted/stubbed results keep the
+        # order the tool_calls were issued in.
+        open_tool_calls: dict[str, None] = {}
         seen_tool_ids: set[str] = set()
-        for m in msgs:
+        for i, m in enumerate(msgs):
             role = m.get("role")
 
             if role == "tool":
@@ -805,25 +1003,42 @@ class NodeConversation:
                 if not tid or tid not in all_tool_call_ids:
                     continue
                 # Drop duplicates (same id appearing twice) — keep first.
+                # Also drops the original position of results hoisted
+                # next to their tool_call below.
                 if tid in seen_tool_ids:
                     continue
                 # Drop positional orphans — tool messages whose parent
                 # assistant isn't the still-open assistant block.
                 if tid not in open_tool_calls:
                     continue
-                open_tool_calls.discard(tid)
+                open_tool_calls.pop(tid, None)
                 seen_tool_ids.add(tid)
                 repaired.append(m)
                 continue
 
             # Any non-tool message closes the current assistant tool block.
-            # If the previous assistant left tool_calls unanswered, patch
-            # synthetic error results before emitting this message so the
-            # API sees a complete pairing.
+            # Async events (worker reports, user injections) can land
+            # between a tool_call and its result, so the real result may
+            # still exist later in the stream: hoist it up to directly
+            # follow its tool_call rather than masking a completed call
+            # with a synthetic "interrupted" error (which made the model
+            # retry writes that had already succeeded).  Only when no
+            # result exists anywhere is a synthetic stub patched in.
             if open_tool_calls:
                 for stale_id in list(open_tool_calls):
+                    real_result = next(
+                        (
+                            later
+                            for later in msgs[i:]
+                            if later.get("role") == "tool"
+                            and later.get("tool_call_id") == stale_id
+                        ),
+                        None,
+                    )
                     repaired.append(
-                        {
+                        real_result
+                        if real_result is not None
+                        else {
                             "role": "tool",
                             "tool_call_id": stale_id,
                             "content": "ERROR: Tool execution was interrupted.",
@@ -838,7 +1053,7 @@ class NodeConversation:
                 for tc in m.get("tool_calls") or []:
                     tc_id = tc.get("id")
                     if tc_id and tc_id not in seen_tool_ids:
-                        open_tool_calls.add(tc_id)
+                        open_tool_calls[tc_id] = None
 
         # Tail: if the conversation ends with an assistant that issued
         # tool_calls and no results followed, patch them so the next
@@ -855,20 +1070,17 @@ class NodeConversation:
 
         return repaired
 
-    def estimate_tokens(self) -> int:
-        """Best available token estimate.
+    def conversation_chars_and_images(self) -> tuple[int, int]:
+        """Return (content+args chars, image_block_count) for the conversation only.
 
-        Uses actual API input token count when available (set via
-        :meth:`update_token_count`), otherwise falls back to a
-        character-based heuristic that includes message content, tool_call
-        arguments, and image blocks.  The heuristic applies a 4/3 safety
-        margin to avoid under-counting (inspired by Claude Code's compact
-        service).
+        Counts message content, tool_call arguments, and function names from
+        the current ``_messages`` list. Does NOT include the system prompt or
+        tool definitions — callers add those externally. Used by the
+        context-usage telemetry to combine with system+tools sizes for a
+        real-time "what will the next prompt cost" estimate.
         """
-        if self._last_api_input_tokens is not None:
-            return self._last_api_input_tokens
         total_chars = 0
-        image_tokens = 0
+        image_blocks = 0
         for m in self._messages:
             total_chars += len(m.content)
             if m.tool_calls:
@@ -877,17 +1089,43 @@ class NodeConversation:
                     total_chars += len(func.get("arguments", ""))
                     total_chars += len(func.get("name", ""))
             if m.image_content:
-                # Images/documents have a fixed token cost per block
-                image_tokens += len(m.image_content) * 2000
+                image_blocks += len(m.image_content)
+        return total_chars, image_blocks
+
+    def estimate_tokens(self) -> int:
+        """Best available token estimate (conversation messages only).
+
+        Uses the actual API input token count from the most recent LLM call
+        when available (set via :meth:`update_token_count`); otherwise falls
+        back to a character-based heuristic with a 4/3 safety margin.
+
+        This estimate covers only the conversation messages — it does NOT
+        include the system prompt or tool definitions. Compaction triggers
+        use this value. The real-time UI telemetry (``publish_context_usage``)
+        builds a fuller estimate that includes system+tools on top.
+        """
+        if self._last_api_input_tokens is not None:
+            return self._last_api_input_tokens
+        total_chars, image_blocks = self.conversation_chars_and_images()
+        image_tokens = image_blocks * 2000
         # Apply 4/3 safety margin to character-based estimate
         return (total_chars * 4) // (3 * 4) + image_tokens
 
     def update_token_count(self, actual_input_tokens: int) -> None:
-        """Store actual API input token count for more accurate compaction.
+        """Store the actual size of the most recent single LLM request.
 
-        Called by EventLoopNode after each LLM call with the ``input_tokens``
-        value from the API response.  This value includes system prompt and
-        tool definitions, so it may be higher than a message-only estimate.
+        Called immediately after each FinishEvent with that event's
+        ``input_tokens`` (the prompt size the provider counted for that
+        one call). This value includes the system prompt and tool
+        definitions, so it may be higher than the message-only
+        char-based estimate — that's intentional.
+
+        DO NOT pass a cumulative sum across multiple LLM calls here.
+        ``max_context_tokens`` is a single-prompt budget, and
+        ``usage_ratio()`` divides this field by it; feeding in a
+        billing sum would make ``usage_ratio()`` compare billing to a
+        request budget and report fictional 1000%+ ratios for turns
+        that fan out into many inner LLM calls.
         """
         self._last_api_input_tokens = actual_input_tokens
 
@@ -1032,7 +1270,14 @@ class NodeConversation:
                 continue
 
             est = len(msg.content) // 4
-            if protected_tokens < protect_tokens:
+            # Recoverability invariant: only prune a result we can point back to
+            # — the out-of-band spill path recorded when it landed, or a path
+            # embedded in its text. A result with no recovery path is KEPT in
+            # full (never stranded as an unrecoverable placeholder); it counts
+            # toward the protect budget like any retained result but is never
+            # added to pruneable.
+            recoverable = bool(msg.spillover_path or _extract_spillover_filename(msg.content))
+            if protected_tokens < protect_tokens or not recoverable:
                 protected_tokens += est
             else:
                 pruneable.append(i)
@@ -1047,16 +1292,13 @@ class NodeConversation:
         for i in pruneable:
             msg = self._messages[i]
             orig_len = len(msg.content)
-            spillover = _extract_spillover_filename(msg.content)
-
-            if spillover:
-                placeholder = (
-                    f"Pruned tool result ({orig_len:,} chars) cleared from context. "
-                    f"Full data saved at: {spillover}\n"
-                    f"Read the complete data with read_file(path='{spillover}')."
-                )
-            else:
-                placeholder = f"Pruned tool result ({orig_len:,} chars) cleared from context."
+            # Guaranteed non-None by the eligibility invariant above.
+            spillover = msg.spillover_path or _extract_spillover_filename(msg.content)
+            placeholder = (
+                f"Pruned tool result ({orig_len:,} chars) cleared from context. "
+                f"Full data saved at: {spillover}\n"
+                f'Read the complete data with terminal_exec("cat {spillover}").'
+            )
 
             self._messages[i] = Message(
                 seq=msg.seq,
@@ -1068,6 +1310,7 @@ class NodeConversation:
                 phase_id=msg.phase_id,
                 is_transition_marker=msg.is_transition_marker,
                 run_id=msg.run_id,
+                spillover_path=msg.spillover_path,
             )
             count += 1
 
@@ -1081,7 +1324,7 @@ class NodeConversation:
     async def evict_old_images(self, keep_latest: int = 2) -> int:
         """Strip ``image_content`` from older messages, keeping the most recent.
 
-        Screenshots from ``browser_screenshot`` are inlined into the
+        Screenshots from ``hive-browser screenshot`` are inlined into the
         message's ``image_content`` as base64 data URLs. Each screenshot
         costs ~250k tokens when the provider counts the base64 as
         text — four screenshots push a conversation over gemini's 1M
@@ -1155,6 +1398,7 @@ class NodeConversation:
         summary: str,
         keep_recent: int = 2,
         phase_graduated: bool = False,
+        max_verbatim_client: int | None = None,
     ) -> None:
         """Replace old messages with a summary, optionally keeping recent ones.
 
@@ -1165,6 +1409,12 @@ class NodeConversation:
             phase_graduated: When True and messages have phase_id metadata,
                 split at phase boundaries instead of using keep_recent.
                 Keeps current + previous phase intact; compacts older phases.
+            max_verbatim_client: Cap on how many of the MOST RECENT client-input
+                messages survive compaction verbatim. None = unbounded (legacy
+                1:1 behaviour). In group chat every member's message is
+                is_client_input=True, so the unbounded rule preserves the entire
+                group backlog forever and compaction can never shrink the window;
+                capping folds older group messages into the summary instead.
         """
         if not self._messages:
             return
@@ -1197,6 +1447,23 @@ class NodeConversation:
         old_messages = list(self._messages[:split])
         recent_messages = list(self._messages[split:])
 
+        # Carve out real client input from the discard set. The LLM summary
+        # paraphrases at best; the user's original words must survive
+        # verbatim so the agent stays anchored to the original intent even
+        # after many compaction cycles. Only ``is_client_input`` messages
+        # qualify — synthetic framework-injected user-role messages (prior
+        # compaction summaries, continuation nudges, etc.) are filtered out
+        # so they don't accumulate across successive compactions.
+        preserved_client_messages = [m for m in old_messages if m.role == "user" and m.is_client_input]
+
+        # Group-chat guard: keep only the most recent N verbatim. The dropped
+        # older ones already live in ``summary`` (llm_compact saw the full
+        # history), so this loses no information — it just stops the group
+        # backlog from being pinned in-context forever. In-order list, so the
+        # tail is the most recent.
+        if max_verbatim_client is not None and len(preserved_client_messages) > max_verbatim_client:
+            preserved_client_messages = preserved_client_messages[-max_verbatim_client:]
+
         # Extract protected values from messages being discarded
         if self._output_keys:
             protected = self._extract_protected_values(old_messages)
@@ -1216,250 +1483,27 @@ class NodeConversation:
             summary_seq = self._next_seq
             self._next_seq += 1
 
+        # If the last old message is itself a client input, its seq equals
+        # summary_seq — drop it from the preserved set rather than colliding
+        # on the store. Its content is still represented in the summary text.
+        preserved_client_messages = [m for m in preserved_client_messages if m.seq != summary_seq]
+
         summary_msg = Message(seq=summary_seq, role="user", content=summary, run_id=self._run_id)
 
         # Persist
         if self._store:
             delete_before = recent_messages[0].seq if recent_messages else self._next_seq
             await self._store.delete_parts_before(delete_before)
+            for m in preserved_client_messages:
+                await self._store.write_part(m.seq, m.to_storage_dict())
             await self._store.write_part(summary_msg.seq, summary_msg.to_storage_dict())
             await self._write_next_seq()
 
-        self._messages = [summary_msg] + recent_messages
+        # Live list order matches sorted-by-seq disk order: preserved client
+        # messages keep their original (lower) seqs and sit before the
+        # summary; the summary takes the slot just below recent_messages[0].
+        self._messages = preserved_client_messages + [summary_msg] + recent_messages
         self._last_api_input_tokens = None  # reset; next LLM call will recalibrate
-
-    async def compact_preserving_structure(
-        self,
-        spillover_dir: str,
-        keep_recent: int = 4,
-        phase_graduated: bool = False,
-        aggressive: bool = False,
-    ) -> None:
-        """Structure-preserving compaction: save freeform text to file, keep tool messages.
-
-        Unlike ``compact()`` which replaces ALL old messages with a single LLM
-        summary, this method preserves the tool call structure (assistant
-        messages with tool_calls + tool result messages) that are already tiny
-        after pruning.  Only freeform text exchanges (user messages,
-        text-only assistant messages) are saved to a file and removed.
-
-        When *aggressive* is True, non-essential tool call pairs are also
-        collapsed into a compact summary instead of being kept individually.
-        Only ``set_output`` calls and error results are preserved; all other
-        old tool pairs are replaced by a tool-call history summary.
-
-        The result: the agent retains exact knowledge of what tools it called,
-        where each result is stored, and can load the conversation text if
-        needed.  No LLM summary call.  No heuristics.  Nothing lost.
-        """
-        if not self._messages:
-            return
-
-        total = len(self._messages)
-
-        # Determine split point (same logic as compact)
-        if phase_graduated and self._current_phase:
-            split = self._find_phase_graduated_split()
-        else:
-            split = None
-
-        if split is None:
-            keep_recent = max(0, min(keep_recent, total - 1))
-            split = total - keep_recent if keep_recent > 0 else total
-
-        # Advance split past orphaned tool results at the boundary
-        while split < total and self._messages[split].role == "tool":
-            split += 1
-
-        if split == 0:
-            return
-
-        old_messages = self._messages[:split]
-
-        # Classify old messages: structural (keep) vs freeform (save to file)
-        kept_structural: list[Message] = []
-        freeform_lines: list[str] = []
-        collapsed_msgs: list[Message] = []
-
-        # Collect all tool_use IDs present in old messages so we can detect
-        # orphaned tool results whose parent assistant message was already
-        # compacted away (API invariant protection).
-        old_tc_ids: set[str] = set()
-        for msg in old_messages:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    old_tc_ids.add(tc.get("id", ""))
-
-        if aggressive:
-            # Aggressive: only keep set_output tool pairs and error results.
-            # Everything else is collapsed into a tool-call history summary.
-            # We need to track tool_call IDs to pair assistant messages with
-            # their tool results.
-            protected_tc_ids: set[str] = set()
-            collapsible_tc_ids: set[str] = set()
-
-            # First pass: classify assistant messages
-            for msg in old_messages:
-                if msg.role != "assistant" or not msg.tool_calls:
-                    continue
-                has_protected = any(tc.get("function", {}).get("name") == "set_output" for tc in msg.tool_calls)
-                tc_ids = {tc.get("id", "") for tc in msg.tool_calls}
-                if has_protected:
-                    protected_tc_ids |= tc_ids
-                else:
-                    collapsible_tc_ids |= tc_ids
-
-            # Skill content and transition markers are always protected
-            for msg in old_messages:
-                if msg.role == "tool" and msg.is_skill_content and msg.tool_use_id:
-                    protected_tc_ids.add(msg.tool_use_id)
-
-            # Second pass: classify all messages
-            for msg in old_messages:
-                if msg.is_transition_marker:
-                    # Transition markers are always kept (phase boundaries)
-                    kept_structural.append(msg)
-                elif msg.role == "tool":
-                    tc_id = msg.tool_use_id or ""
-                    if tc_id in protected_tc_ids:
-                        kept_structural.append(msg)
-                    elif msg.is_error:
-                        # Error results are always protected
-                        kept_structural.append(msg)
-                        # Protect the parent assistant message too
-                        protected_tc_ids.add(tc_id)
-                    elif msg.is_skill_content:
-                        kept_structural.append(msg)
-                    elif tc_id and tc_id not in old_tc_ids:
-                        # Orphaned tool result — parent tool_use not in old msgs.
-                        # Keep it to maintain API invariants.
-                        kept_structural.append(msg)
-                    else:
-                        collapsed_msgs.append(msg)
-                elif msg.role == "assistant" and msg.tool_calls:
-                    tc_ids = {tc.get("id", "") for tc in msg.tool_calls}
-                    if tc_ids & protected_tc_ids:
-                        # Has at least one protected tool call — keep entire msg
-                        compact_tcs = _compact_tool_calls(msg.tool_calls)
-                        kept_structural.append(
-                            Message(
-                                seq=msg.seq,
-                                role=msg.role,
-                                content="",
-                                tool_calls=compact_tcs,
-                                is_error=msg.is_error,
-                                phase_id=msg.phase_id,
-                                is_transition_marker=msg.is_transition_marker,
-                                run_id=msg.run_id,
-                            )
-                        )
-                    else:
-                        collapsed_msgs.append(msg)
-                else:
-                    # Freeform text — save to file
-                    role_label = msg.role
-                    text = msg.content
-                    if len(text) > 2000:
-                        text = text[:2000] + "…"
-                    freeform_lines.append(f"[{role_label}] (seq={msg.seq}): {text}")
-        else:
-            # Standard mode: keep all tool call pairs as structural
-            for msg in old_messages:
-                if msg.is_transition_marker:
-                    # Transition markers are always kept (phase boundaries)
-                    kept_structural.append(msg)
-                elif msg.role == "tool":
-                    kept_structural.append(msg)
-                elif msg.role == "assistant" and msg.tool_calls:
-                    compact_tcs = _compact_tool_calls(msg.tool_calls)
-                    kept_structural.append(
-                        Message(
-                            seq=msg.seq,
-                            role=msg.role,
-                            content="",
-                            tool_calls=compact_tcs,
-                            is_error=msg.is_error,
-                            phase_id=msg.phase_id,
-                            is_transition_marker=msg.is_transition_marker,
-                            run_id=msg.run_id,
-                        )
-                    )
-                else:
-                    role_label = msg.role
-                    text = msg.content
-                    if len(text) > 2000:
-                        text = text[:2000] + "…"
-                    freeform_lines.append(f"[{role_label}] (seq={msg.seq}): {text}")
-
-        # Write freeform text to a numbered conversation file
-        spill_path = Path(spillover_dir)
-        spill_path.mkdir(parents=True, exist_ok=True)
-
-        # Find next conversation file number
-        existing = sorted(spill_path.glob("conversation_*.md"))
-        next_n = len(existing) + 1
-        conv_filename = f"conversation_{next_n}.md"
-
-        if freeform_lines:
-            header = f"## Compacted conversation (messages 1-{split})\n\n"
-            conv_text = header + "\n\n".join(freeform_lines)
-            (spill_path / conv_filename).write_text(conv_text, encoding="utf-8")
-        else:
-            # Nothing to save — skip file creation
-            conv_filename = ""
-
-        # Build reference message. Prose format (no brackets) — see the
-        # poison-pattern note on truncate_tool_result. Frontier models
-        # autocomplete `[...']` trailers into their own text turns.
-        ref_parts: list[str] = []
-        if conv_filename:
-            full_path = str((spill_path / conv_filename).resolve())
-            ref_parts.append(
-                f"Previous conversation saved at: {full_path}\n"
-                f"Read the full transcript with read_file('{conv_filename}')."
-            )
-        elif not collapsed_msgs:
-            ref_parts.append("(Previous freeform messages compacted.)")
-
-        # Aggressive: add collapsed tool-call history to the reference
-        if collapsed_msgs:
-            tool_history = extract_tool_call_history(collapsed_msgs)
-            if tool_history:
-                ref_parts.append(tool_history)
-            elif not ref_parts:
-                ref_parts.append("[Previous tool calls compacted.]")
-
-        ref_content = "\n\n".join(ref_parts)
-
-        # Use a seq just before the first kept message
-        recent_messages = list(self._messages[split:])
-        if kept_structural:
-            ref_seq = kept_structural[0].seq - 1
-        elif recent_messages:
-            ref_seq = recent_messages[0].seq - 1
-        else:
-            ref_seq = self._next_seq
-            self._next_seq += 1
-
-        ref_msg = Message(seq=ref_seq, role="user", content=ref_content, run_id=self._run_id)
-
-        # Persist: delete old messages from store, write reference + kept structural.
-        # In aggressive mode, collapsed messages may be interspersed with kept
-        # messages, so we delete everything before the recent boundary and
-        # rewrite only what we want to keep.
-        if self._store:
-            recent_boundary = recent_messages[0].seq if recent_messages else self._next_seq
-            await self._store.delete_parts_before(recent_boundary)
-            # Write the reference message
-            await self._store.write_part(ref_msg.seq, ref_msg.to_storage_dict())
-            # Write kept structural messages (they may have been modified)
-            for msg in kept_structural:
-                await self._store.write_part(msg.seq, msg.to_storage_dict())
-            await self._write_next_seq()
-
-        # Reassemble: reference + kept structural (in original order) + recent
-        self._messages = [ref_msg] + kept_structural + recent_messages
-        self._last_api_input_tokens = None
 
     def _find_phase_graduated_split(self) -> int | None:
         """Find split point that preserves current + previous phase.
@@ -1628,7 +1672,7 @@ class NodeConversation:
 
         conv = cls(
             system_prompt=meta.get("system_prompt", ""),
-            max_context_tokens=meta.get("max_context_tokens", 32000),
+            max_context_tokens=meta.get("max_context_tokens", 180_000),
             compaction_threshold=meta.get("compaction_threshold", 0.8),
             output_keys=meta.get("output_keys"),
             store=store,

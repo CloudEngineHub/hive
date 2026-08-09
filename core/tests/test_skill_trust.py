@@ -384,7 +384,7 @@ class TestTrustGate:
         """Security notice (NFR-5) should be shown the first time only."""
         # Use a temp sentinel path
         sentinel = tmp_path / ".skill_trust_notice_shown"
-        monkeypatch.setattr("framework.skills.trust._NOTICE_SENTINEL_PATH", sentinel)
+        monkeypatch.setattr("framework.skills.trust._notice_sentinel_path", lambda: sentinel)
         assert not sentinel.exists()
 
         (tmp_path / ".git").mkdir()

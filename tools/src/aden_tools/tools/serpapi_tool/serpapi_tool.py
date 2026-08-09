@@ -187,8 +187,7 @@ def register_tools(
             return {
                 "error": "SerpAPI credentials not configured",
                 "help": (
-                    "Set SERPAPI_API_KEY environment variable or configure "
-                    "via credential store. Get a key at https://serpapi.com/manage-api-key"
+                    "Set SERPAPI_API_KEY environment variable or configure via credential store. Get a key at https://serpapi.com/manage-api-key"
                 ),
             }
         return _SerpAPIClient(api_key)
@@ -580,9 +579,7 @@ def register_tools(
                 }
                 authors = item.get("publication_info", {}).get("authors", [])
                 if authors:
-                    result["authors"] = [
-                        {"name": a.get("name", ""), "author_id": a.get("author_id", "")} for a in authors
-                    ]
+                    result["authors"] = [{"name": a.get("name", ""), "author_id": a.get("author_id", "")} for a in authors]
                 results.append(result)
 
             return {

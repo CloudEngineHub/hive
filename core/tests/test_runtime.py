@@ -346,10 +346,7 @@ class TestConvenienceMethods:
 class TestNarrativeGeneration:
     """Test automatic narrative generation."""
 
-    @pytest.mark.skip(
-        reason="save_run() and get_runs_by_goal() are deprecated. "
-        "New sessions use unified storage at sessions/{session_id}/state.json"
-    )
+    @pytest.mark.skip(reason="save_run() and get_runs_by_goal() are deprecated. New sessions use unified storage at sessions/{session_id}/state.json")
     def test_default_narrative_success(self, tmp_path: Path):
         """Test default narrative for successful run."""
         runtime = Runtime(tmp_path)
@@ -369,10 +366,7 @@ class TestNarrativeGeneration:
         run = runtime.storage.load_run(runtime.storage.get_runs_by_goal("test_goal")[0])
         assert "completed successfully" in run.narrative
 
-    @pytest.mark.skip(
-        reason="save_run() and get_runs_by_goal() are deprecated. "
-        "New sessions use unified storage at sessions/{session_id}/state.json"
-    )
+    @pytest.mark.skip(reason="save_run() and get_runs_by_goal() are deprecated. New sessions use unified storage at sessions/{session_id}/state.json")
     def test_default_narrative_failure(self, tmp_path: Path):
         """Test default narrative for failed run."""
         runtime = Runtime(tmp_path)

@@ -12,6 +12,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
@@ -25,6 +26,7 @@ from framework.config import (
     OPENROUTER_API_BASE,
     get_hive_config,
 )
+from framework.server.app import get_request_executor
 from framework.llm.model_catalog import (
     find_model,
     get_models_catalogue,
@@ -285,7 +287,19 @@ def _get_subscription_token(sub_id: str) -> str | None:
 
 
 def _hot_swap_sessions(request: web.Request, full_model: str, api_key: str | None, api_base: str | None) -> int:
-    """Hot-swap the LLM on all running sessions. Returns count of swapped sessions.
+    """Hot-swap the LLM on all running sessions. Returns count of swapped providers.
+
+    Walks every long-lived LLM holder reachable from a session:
+      - ``session.llm`` (the queen's own provider).
+      - ``session.colony._llm`` / ``.llm`` when an in-flight ColonyRuntime is
+        attached — its baked-in worker provider doesn't appear under
+        ``manager.list_sessions()`` but is still rotating LLM calls.
+
+    For api_key freshness on its own, the ``api_key_resolver`` wired through
+    ``build_llm`` / ``build_worker_llm`` already re-resolves the credential
+    on every call. This hot-swap remains the canonical path for **model**
+    and **api_base** changes, and keeps each provider's snapshot in sync as
+    a belt-and-suspenders.
 
     Also refreshes the SessionManager's default model so that subsequent
     one-shot LLM consumers (e.g. /messages/classify, new session bootstrap)
@@ -296,11 +310,24 @@ def _hot_swap_sessions(request: web.Request, full_model: str, api_key: str | Non
     manager: SessionManager = request.app["manager"]
     manager._model = full_model
     swapped = 0
+
+    def _reconfigure_if_possible(prov: Any) -> bool:
+        if prov and hasattr(prov, "reconfigure"):
+            prov.reconfigure(full_model, api_key=api_key, api_base=api_base)
+            return True
+        return False
+
     for session in manager.list_sessions():
-        llm_provider = getattr(session, "llm", None)
-        if llm_provider and hasattr(llm_provider, "reconfigure"):
-            llm_provider.reconfigure(full_model, api_key=api_key, api_base=api_base)
+        if _reconfigure_if_possible(getattr(session, "llm", None)):
             swapped += 1
+        # ColonyRuntime holds its own worker LLM; expose attribute may be
+        # either ``_llm`` (current convention) or ``llm`` (defensive).
+        colony = getattr(session, "colony", None)
+        if colony is not None:
+            for attr in ("_llm", "llm"):
+                if _reconfigure_if_possible(getattr(colony, attr, None)):
+                    swapped += 1
+                    break
     return swapped
 
 
@@ -334,9 +361,20 @@ async def _validate_provider_key(
             if api_base and pid == "openrouter":
                 return check_openrouter(api_key, api_base)
             if api_base and pid == "kimi":
-                return check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Kimi")
+                return check_anthropic_compatible(
+                    api_key,
+                    api_base.rstrip("/") + "/v1/messages",
+                    "Kimi",
+                    model=model or "kimi-k2.6",
+                )
             if api_base and pid == "hive":
-                return check_anthropic_compatible(api_key, api_base.rstrip("/") + "/v1/messages", "Hive")
+                return check_anthropic_compatible(
+                    api_key,
+                    api_base.rstrip("/") + "/v1/messages",
+                    "Hive",
+                    model=model or "queen",
+                    bearer_auth=True,
+                )
             if api_base:
                 endpoint = api_base.rstrip("/") + "/models"
                 name = {"zai": "ZAI"}.get(pid, "Custom provider")
@@ -348,7 +386,7 @@ async def _validate_provider_key(
         except Exception as exc:
             return {"valid": None, "message": f"Validation error: {exc}"}
 
-    return await asyncio.get_event_loop().run_in_executor(None, _check)
+    return await asyncio.get_event_loop().run_in_executor(get_request_executor(), _check)
 
 
 # ------------------------------------------------------------------
@@ -427,7 +465,7 @@ async def handle_update_llm_config(request: web.Request) -> web.Response:
                 status=400,
             )
 
-        check = await _validate_provider_key(provider, token, api_base=api_base)
+        check = await _validate_provider_key(provider, token, api_base=api_base, model=model)
         if check.get("valid") is False:
             return web.json_response(
                 {"error": f"{sub['name']} key validation failed: {check.get('message', 'unknown error')}"},
@@ -508,6 +546,12 @@ async def handle_update_llm_config(request: web.Request) -> web.Response:
         # Determine env var and api_base
         env_var = PROVIDER_ENV_VARS.get(provider.lower(), "")
         api_base = _get_api_base_for_provider(provider)
+        # Hive routes through a proxy whose URL is environment-specific (local
+        # dev vs prod) and written into configuration.json by the desktop app.
+        # Reuse it so key validation pings the right proxy and the URL isn't
+        # dropped from the persisted config below.
+        if api_base is None and provider.lower() == "hive":
+            api_base = get_hive_config().get("llm", {}).get("api_base")
 
         # Validate the API key before committing
         api_key = _resolve_api_key(provider, request)
@@ -567,6 +611,27 @@ async def handle_update_llm_config(request: web.Request) -> web.Response:
         )
 
 
+# Valid sort keys for the Prompt Library top-right dropdowns. Mirrors
+# the SortKey union in the renderer's prompt-library page; anything else
+# is rejected so a hand-edited config can't poison the dropdown state.
+_PROMPT_SORT_KEYS = ("date", "name", "popular")
+
+
+def _normalize_prompt_sort(raw: object) -> dict | None:
+    """Coerce a stored prompt_library_sort blob into a partial {my, community}
+    dict containing only the keys the user actually set. Returns None when
+    nothing was saved, so the renderer can fall back to its local cache
+    instead of being clobbered by server-side defaults on first hydration."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for k in ("my", "community"):
+        v = raw.get(k)
+        if isinstance(v, str) and v in _PROMPT_SORT_KEYS:
+            out[k] = v
+    return out or None
+
+
 async def handle_get_profile(request: web.Request) -> web.Response:
     """GET /api/config/profile — user display name and about."""
     profile = get_hive_config().get("user_profile", {})
@@ -575,6 +640,8 @@ async def handle_get_profile(request: web.Request) -> web.Response:
             "displayName": profile.get("displayName", ""),
             "about": profile.get("about", ""),
             "theme": profile.get("theme", ""),
+            "density": profile.get("density", ""),
+            "prompt_library_sort": _normalize_prompt_sort(profile.get("prompt_library_sort")),
         }
     )
 
@@ -657,6 +724,21 @@ async def handle_update_profile(request: web.Request) -> web.Response:
         profile["about"] = str(body["about"]).strip()
     if body.get("theme") in ("light", "dark"):
         profile["theme"] = body["theme"]
+    if body.get("density") in ("spacious", "compact"):
+        profile["density"] = body["density"]
+    # prompt_library_sort: partial merge — caller may send just {my} or just
+    # {community}; unknown keys / invalid values are dropped. Note
+    # _normalize_prompt_sort returns None when nothing is stored yet, so
+    # the merge has to start from a fresh dict on first write.
+    if isinstance(body.get("prompt_library_sort"), dict):
+        current = _normalize_prompt_sort(profile.get("prompt_library_sort")) or {}
+        incoming = body["prompt_library_sort"]
+        for k in ("my", "community"):
+            v = incoming.get(k)
+            if isinstance(v, str) and v in _PROMPT_SORT_KEYS:
+                current[k] = v
+        if current:
+            profile["prompt_library_sort"] = current
     config["user_profile"] = profile
     _write_config_atomic(config)
 
@@ -669,6 +751,8 @@ async def handle_update_profile(request: web.Request) -> web.Response:
             "displayName": profile.get("displayName", ""),
             "about": profile.get("about", ""),
             "theme": profile.get("theme", ""),
+            "density": profile.get("density", ""),
+            "prompt_library_sort": _normalize_prompt_sort(profile.get("prompt_library_sort")),
         }
     )
 
@@ -676,6 +760,169 @@ async def handle_update_profile(request: web.Request) -> web.Response:
 async def handle_get_models(request: web.Request) -> web.Response:
     """GET /api/config/models — curated provider→models list."""
     return web.json_response({"models": MODELS_CATALOGUE})
+
+
+# ------------------------------------------------------------------
+# Global sentinel tuning block
+# ------------------------------------------------------------------
+
+
+async def handle_get_sentinel_config(request: web.Request) -> web.Response:
+    """GET /api/config/sentinel — the global sentinel tuning block.
+
+    Per-colony opt-in/routing lives in colonies/<id>/notifications.json
+    (routes_sentinel); this is only the user-level tuning defaults. Used
+    by the desktop vm-sync loop to mirror the block onto the workspace VM.
+    """
+    return web.json_response({"sentinel": get_hive_config().get("sentinel") or {}})
+
+
+async def handle_update_sentinel_config(request: web.Request) -> web.Response:
+    """PUT /api/config/sentinel — replace the global sentinel block."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    block = body.get("sentinel", body)
+    if not isinstance(block, dict):
+        return web.json_response({"error": "sentinel must be an object"}, status=400)
+
+    config = get_hive_config()
+    if block:
+        config["sentinel"] = block
+    else:
+        config.pop("sentinel", None)
+    _write_config_atomic(config)
+
+    # Wake the manager so new tuning applies without a restart — same
+    # pattern as routes_sentinel's per-colony config save.
+    try:
+        from framework.sentinel.manager import get_sentinel_manager
+
+        mgr = get_sentinel_manager()
+        if mgr is not None:
+            mgr.refresh_listeners()
+    except Exception:
+        logger.debug("sentinel: refresh_listeners after global config save failed", exc_info=True)
+
+    return web.json_response({"sentinel": block})
+
+
+# ------------------------------------------------------------------
+# Global feature flags (desktop Developer options)
+# ------------------------------------------------------------------
+
+# Whitelisted top-level boolean keys in configuration.json that the
+# features endpoint may read/write. Keep this in sync with the getters
+# in framework.config (e.g. get_adaptive_tool_budget_enabled).
+_FEATURE_KEYS = ("adaptive_tool_budget", "email_senders")
+
+
+def _apply_adaptive_budget_flag(request: web.Request, enabled: bool) -> int:
+    """Hot-apply the adaptive-budget flag to running colony runtimes.
+
+    Returns the number of colonies flipped. Skips colonies whose
+    metadata.json pins ``adaptive_tool_budget`` explicitly — the
+    per-colony override beats the global toggle, matching the resolution
+    order at session start (session_manager._start_queen).
+
+    Note: disabling stops sampling and new clamps immediately, but
+    workers already clamped keep their shrunk budget (the AgentLoop
+    setter is deliberately shrink-only); resume-with-raised-budget is
+    the recovery path for those.
+    """
+    manager = request.app["manager"]
+    applied = 0
+    for session in manager.list_sessions():
+        colony = getattr(session, "colony", None)
+        if colony is None:
+            continue
+        colony_id = getattr(session, "colony_id", None)
+        if colony_id:
+            try:
+                from framework.config import COLONIES_DIR
+
+                meta_path = COLONIES_DIR / colony_id / "metadata.json"
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if isinstance(meta.get("adaptive_tool_budget"), bool):
+                        continue  # per-colony pin wins
+            except Exception:
+                logger.debug("features: metadata check failed for colony %s", colony_id, exc_info=True)
+        cfg = getattr(colony, "_config", None)
+        if cfg is not None and getattr(cfg, "adaptive_tool_budget", None) is not None and cfg.adaptive_tool_budget != enabled:
+            cfg.adaptive_tool_budget = enabled
+            applied += 1
+    return applied
+
+
+async def handle_get_features(request: web.Request) -> web.Response:
+    """GET /api/config/features — global feature flags (Developer options)."""
+    from framework.config import (
+        get_adaptive_tool_budget_enabled,
+        get_email_senders_enabled,
+    )
+
+    return web.json_response(
+        {
+            "features": {
+                "adaptive_tool_budget": get_adaptive_tool_budget_enabled(),
+                "email_senders": get_email_senders_enabled(),
+            }
+        }
+    )
+
+
+async def handle_update_features(request: web.Request) -> web.Response:
+    """PUT /api/config/features — set global feature flags.
+
+    Persists whitelisted boolean keys top-level in configuration.json
+    (picked up by every NEW session, since get_hive_config re-reads the
+    file) and hot-applies to RUNNING colony runtimes — same
+    write-then-apply shape as the sentinel and LLM config routes.
+    HIVE_ADAPTIVE_TOOL_BUDGET env, when set, still wins for new sessions
+    (see config.get_adaptive_tool_budget_enabled).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    block = body.get("features", body)
+    if not isinstance(block, dict):
+        return web.json_response({"error": "features must be an object"}, status=400)
+
+    updates: dict[str, bool] = {}
+    for key in _FEATURE_KEYS:
+        if key in block:
+            if not isinstance(block[key], bool):
+                return web.json_response({"error": f"{key} must be a boolean"}, status=400)
+            updates[key] = block[key]
+    if not updates:
+        return web.json_response({"error": f"No known feature keys. Supported: {', '.join(_FEATURE_KEYS)}"}, status=400)
+
+    config = get_hive_config()
+    config.update(updates)
+    _write_config_atomic(config)
+
+    colonies_applied = 0
+    if "adaptive_tool_budget" in updates:
+        try:
+            colonies_applied = _apply_adaptive_budget_flag(request, updates["adaptive_tool_budget"])
+        except Exception:
+            logger.debug("features: hot-apply of adaptive_tool_budget failed (non-fatal)", exc_info=True)
+
+    # Senders can't be hot-applied: the tools are registered when an MCP
+    # subprocess spawns, so flipping this only changes the tool set of
+    # sessions started from here on. Republish the env var the hive_tools
+    # server reads, so those new spawns see the new value without waiting
+    # for a runtime restart.
+    if "email_senders" in updates:
+        from framework.config import sync_email_senders_env
+
+        sync_email_senders_env(updates["email_senders"])
+
+    logger.info("features: updated %s (colonies hot-applied: %d)", updates, colonies_applied)
+    return web.json_response({"features": updates, "colonies_applied": colonies_applied})
 
 
 # ------------------------------------------------------------------
@@ -739,6 +986,83 @@ async def handle_get_user_avatar(request: web.Request) -> web.Response:
 # ------------------------------------------------------------------
 # Route registration
 # ------------------------------------------------------------------
+# Social rate limits
+# ------------------------------------------------------------------
+
+
+async def handle_get_rate_limits(request: web.Request) -> web.Response:
+    """GET /api/config/rate-limits — current effective rate limits."""
+    from framework.rate_limiter import get_all_limits
+
+    return web.json_response({"limits": get_all_limits()})
+
+
+async def handle_update_rate_limits(request: web.Request) -> web.Response:
+    """PUT /api/config/rate-limits — update user overrides.
+
+    Body: ``{"limits": {"linkedin.invite.daily": 20, ...}}``
+
+    Keys are ``<platform>.<action>.<window>`` where window is
+    ``daily`` or ``weekly``.  Values are clamped to the hard ceiling
+    defined in ``rate_limiter._LIMITS``.
+    """
+    from framework.rate_limiter import _LIMITS
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    incoming = body.get("limits")
+    if not isinstance(incoming, dict):
+        return web.json_response({"error": "limits must be an object"}, status=400)
+
+    # Validate each key. Values above the ceiling are allowed but flagged.
+    cleaned: dict[str, int] = {}
+    warnings: list[str] = []
+    for key, value in incoming.items():
+        parts = key.split(".")
+        if len(parts) != 3:
+            continue
+        platform, action, window = parts
+        if window not in ("hourly", "daily", "weekly"):
+            continue
+        entry = _LIMITS.get((platform, action))
+        if entry is None:
+            continue
+        ceiling = entry.get(f"{window}_max")
+        try:
+            val = int(value)
+        except (TypeError, ValueError):
+            continue
+        if val < 1:
+            val = 1
+        if ceiling is not None and val > ceiling:
+            warnings.append(
+                f"{platform}.{action}.{window}={val} exceeds recommended max of {ceiling}. "
+                f"High values increase the risk of account bans."
+            )
+        cleaned[key] = val
+
+    config = get_hive_config()
+    existing = config.get("rate_limits", {})
+    if isinstance(existing, dict):
+        existing.update(cleaned)
+    else:
+        existing = cleaned
+    config["rate_limits"] = existing
+    _write_config_atomic(config)
+
+    from framework.rate_limiter import get_all_limits
+
+    logger.info("rate_limits: updated %s", cleaned)
+    resp: dict[str, Any] = {"limits": get_all_limits()}
+    if warnings:
+        resp["warnings"] = warnings
+    return web.json_response(resp)
+
+
+# ------------------------------------------------------------------
 
 
 def register_routes(app: web.Application) -> None:
@@ -746,6 +1070,12 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/config/llm", handle_get_llm_config)
     app.router.add_put("/api/config/llm", handle_update_llm_config)
     app.router.add_get("/api/config/models", handle_get_models)
+    app.router.add_get("/api/config/sentinel", handle_get_sentinel_config)
+    app.router.add_put("/api/config/sentinel", handle_update_sentinel_config)
+    app.router.add_get("/api/config/features", handle_get_features)
+    app.router.add_put("/api/config/features", handle_update_features)
+    app.router.add_get("/api/config/rate-limits", handle_get_rate_limits)
+    app.router.add_put("/api/config/rate-limits", handle_update_rate_limits)
     app.router.add_get("/api/config/profile", handle_get_profile)
     app.router.add_put("/api/config/profile", handle_update_profile)
     app.router.add_post("/api/config/profile/avatar", handle_upload_user_avatar)

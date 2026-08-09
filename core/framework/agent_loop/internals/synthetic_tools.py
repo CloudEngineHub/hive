@@ -188,6 +188,105 @@ def build_ask_user_tool() -> Tool:
     )
 
 
+def build_collect_result_tool() -> Tool:
+    """Build the synthetic ``collect_result`` tool.
+
+    Tools listed in ``LoopConfig.background_tools`` (e.g. ``image_generate``,
+    whose work can take minutes) return a ``handle`` immediately and keep
+    running off the agent's critical path. The agent calls
+    ``collect_result(handle)`` to fetch the outcome: it waits up to
+    ``wait_seconds`` and returns ``{"status": "pending"}`` until the work
+    finishes, then returns the tool's real result. The caller (AgentLoop)
+    intercepts this tool — it is never dispatched to an MCP server.
+    """
+    return Tool(
+        name="collect_result",
+        description=(
+            "Fetch the result of a tool that is running in the background — one "
+            'that returned {"status":"started","handle":"bg_…"}. Pass that handle. '
+            'It waits a few seconds and returns {"status":"pending"} if the work '
+            "isn't done yet; keep calling it until you get the real result. This "
+            "is how you retrieve image_generate output."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": 'The handle from the backgrounded call (e.g. "bg_1").',
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "description": "Max seconds to wait this poll (1-45, default 30).",
+                    "minimum": 1,
+                    "maximum": 45,
+                },
+            },
+            "required": ["handle"],
+        },
+    )
+
+
+def build_suggest_colony_tool() -> Tool:
+    """Build the synthetic ``suggest_colony`` tool.
+
+    The queen calls this when the current work would benefit from
+    parallelization, persistence, or scheduling that needs to outlive
+    this chat. It emits ``COLONY_SUGGESTION_REQUESTED`` and blocks the
+    queen loop until the user either accepts (the frontend POSTs
+    /api/sessions with colony_id + source_session_id, which forks this
+    session into the new colony and compacts this chat into the colony's
+    queen seed) or dismisses (the frontend injects a user message that
+    unblocks the queen so she can continue).
+
+    Queen-only — workers fan out via ``run_worker`` inside an
+    existing colony, not by suggesting new ones.
+    """
+    return Tool(
+        name="suggest_colony",
+        description=(
+            "Propose forking this session into a colony. Call this when "
+            "the current work needs parallelization, scheduling, "
+            "background/recurring execution, or otherwise should outlive "
+            "this chat. The frontend opens a 'Create Colony' popup "
+            "pre-filled with this colony_id and the current queen "
+            "auto-selected; the user reviews and confirms. On accept, "
+            "this chat's conversation is compacted into the new colony's "
+            "queen seed and this session locks — so make sure you've "
+            "left the conversation in a self-contained state. On dismiss "
+            "the chat continues normally. Do NOT call this for one-shot "
+            "work the user wants finished in THIS chat — do that work "
+            "yourself with your independent toolkit."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "colony_id": {
+                    "type": "string",
+                    "description": (
+                        "Lowercase alphanumeric+underscore slug for the "
+                        "proposed colony (e.g. 'morning_hn_digest', "
+                        "'fintech_competitor_research'). Pre-fills the "
+                        "popup's name field; the user can edit it before "
+                        "confirming."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Optional one-sentence rationale shown in the "
+                        "popup — why parallel/persistent execution helps "
+                        "here. Be specific (e.g. '23 competitor profiles "
+                        "to research in parallel' rather than 'this is a "
+                        "lot of work')."
+                    ),
+                },
+            },
+            "required": ["colony_id"],
+        },
+    )
+
+
 def build_set_output_tool(output_keys: list[str] | None) -> Tool | None:
     """Build the synthetic set_output tool for explicit output declaration."""
     if not output_keys:
@@ -250,18 +349,68 @@ def build_escalate_tool() -> Tool:
     )
 
 
-def build_report_to_parent_tool() -> Tool:
+def build_structured_output_instruction(report_schema: dict[str, Any] | None) -> str:
+    """Render the system-prompt instruction for a worker bound to a report schema.
+
+    Returns "" when no schema is set. When a schema IS set, the worker is told
+    the exact shape its ``report_to_parent(data=...)`` payload must take, so the
+    contract flows TO the worker (not just validated after the fact). Mirrors the
+    schema onto the ``data`` parameter in ``build_report_to_parent_tool``.
+    """
+    if not report_schema:
+        return ""
+    import json
+
+    pretty = json.dumps(report_schema, indent=2, sort_keys=True)
+    return (
+        "<structured_output>\n"
+        "Before you finish, your final report_to_parent call MUST include a `data` "
+        "object conforming to this JSON Schema — required fields present, enum "
+        "values exact. This is the structured receipt your overseer relies on; a "
+        "free-form summary is not enough.\n\n"
+        f"{pretty}\n"
+        "</structured_output>"
+    )
+
+
+def build_report_to_parent_tool(report_schema: dict[str, Any] | None = None) -> Tool:
     """Build the synthetic ``report_to_parent`` tool.
 
     Parallel workers (those spawned by the overseer via
-    ``run_parallel_workers``) call this to send a structured report back
+    ``run_worker``) call this to send a structured report back
     to the overseer queen when they have finished their task. Calling
     ``report_to_parent`` terminates the worker's loop cleanly -- do not
     call other tools after it.
 
     The overseer receives these as ``SUBAGENT_REPORT`` events and
     aggregates them into a single summary for the user.
+
+    When ``report_schema`` is supplied, the ``data`` parameter IS that schema
+    (instead of a generic free-form object), so the provider guides generation
+    toward the required receipt shape at decode time. Pair with
+    ``build_structured_output_instruction`` in the system prompt.
     """
+    if report_schema:
+        # Specialize `data`: use the caller's schema verbatim but force object
+        # type and keep an overseer-facing description so intent is clear.
+        data_param = dict(report_schema)
+        data_param.setdefault("type", "object")
+        data_param["description"] = (
+            "REQUIRED structured receipt — must conform to this schema "
+            "(required fields present, enum values exact). The overseer relies "
+            "on it; do not omit it or return a free-form object."
+        )
+        required = ["status", "summary", "data"]
+    else:
+        data_param = {
+            "type": "object",
+            "description": (
+                "Optional structured payload (rows fetched, IDs "
+                "processed, files written, etc.) that the "
+                "overseer can merge into its final summary."
+            ),
+        }
+        required = ["status", "summary"]
     return Tool(
         name="report_to_parent",
         description=(
@@ -279,28 +428,16 @@ def build_report_to_parent_tool() -> Tool:
                     "type": "string",
                     "enum": ["success", "partial", "failed"],
                     "description": (
-                        "Overall outcome. 'success' = task complete. "
-                        "'partial' = some progress but incomplete. "
-                        "'failed' = could not make progress."
+                        "Overall outcome. 'success' = task complete. 'partial' = some progress but incomplete. 'failed' = could not make progress."
                     ),
                 },
                 "summary": {
                     "type": "string",
-                    "description": (
-                        "One-paragraph narrative for the overseer. What "
-                        "you did, what you found, and any notable issues."
-                    ),
+                    "description": ("One-paragraph narrative for the overseer. What you did, what you found, and any notable issues."),
                 },
-                "data": {
-                    "type": "object",
-                    "description": (
-                        "Optional structured payload (rows fetched, IDs "
-                        "processed, files written, etc.) that the "
-                        "overseer can merge into its final summary."
-                    ),
-                },
+                "data": data_param,
             },
-            "required": ["status", "summary"],
+            "required": required,
         },
     )
 
@@ -385,3 +522,22 @@ def handle_set_output(
         content=f"Output '{key}' set successfully.",
         is_error=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase-tool registry for synthetics
+# ---------------------------------------------------------------------------
+# Synthetic tools that should appear in a queen's per-phase tool surface
+# (alongside registered tools listed in ``_QUEEN_*_TOOLS``). The queen
+# orchestrator's ``_phase_tools`` resolver looks names up in the queen's
+# tool registry first, then falls through to this map. This keeps the
+# phase tool lists in ``agents/queen/nodes/__init__.py`` the single
+# source of truth — adding a synthetic that should be phase-gated is
+# "register a builder here + add the name to the phase list."
+#
+# Tools NOT in this map (``ask_user``, ``escalate``, ``report_to_parent``,
+# ``set_output``) are framework-attached unconditionally in AgentLoop
+# based on stream identity and are intentionally not phase-gated.
+SYNTHETIC_PHASE_TOOL_BUILDERS: dict[str, Any] = {
+    "suggest_colony": build_suggest_colony_tool,
+}

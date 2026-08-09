@@ -60,8 +60,7 @@ async def evaluate_phase_completion(
     outputs_summary = _format_outputs(accumulator_state)
 
     system_prompt = (
-        "You are a quality judge evaluating whether a phase of work is complete. "
-        "Be concise. Evaluate based on the success criteria, not on style."
+        "You are a quality judge evaluating whether a phase of work is complete. Be concise. Evaluate based on the success criteria, not on style."
     )
 
     user_prompt = f"""Evaluate this phase:

@@ -1,8 +1,8 @@
 """HTTP integration tests for the skills routes.
 
-Covers the per-queen, per-colony, and aggregated-library surfaces plus
-the multipart upload handler. Uses aiohttp's TestClient directly (no
-pytest-aiohttp plugin), which is why each test sets up its own client.
+Covers the per-queen and aggregated-library surfaces plus the multipart
+upload handler. Uses aiohttp's TestClient directly (no pytest-aiohttp
+plugin), which is why each test sets up its own client.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class _StubSessionManager:
     def iter_queen_sessions(self, queen_id: str):
         return iter([])
 
-    def iter_colony_runtimes(self, *, queen_id=None, colony_name=None):
+    def iter_colony_runtimes(self, *, queen_id=None, colony_id=None):
         return iter([])
 
 
@@ -140,12 +140,12 @@ async def test_delete_framework_skill_is_refused(client: TestClient, _seed_queen
     # user toggling a framework default so the override exists on disk.
     store = SkillOverrideStore.load(_seed_queen / "skills_overrides.json")
     store.upsert(
-        "hive.note-taking",
+        "hive.writing-hive-skills",
         OverrideEntry(enabled=False, provenance=Provenance.FRAMEWORK),
     )
     store.save()
 
-    resp = await client.delete("/api/queen/ops/skills/hive.note-taking")
+    resp = await client.delete("/api/queen/ops/skills/hive.writing-hive-skills")
     assert resp.status == 403
 
 
@@ -189,94 +189,47 @@ async def test_upload_zip_bundle_places_in_queen_scope(client: TestClient, _seed
     assert (skill_dir / "scripts" / "helper.py").exists()
 
 
-async def test_create_colony_skill_writes_to_flat_path(client: TestClient, _seed_colony) -> None:
-    """POSTing a new colony skill must write to the flat ``colonies/{name}/skills/``
-    layout, not the legacy nested ``.hive/skills/`` path.
+async def test_colony_authored_skills_surface_in_library(client: TestClient, _seed_colony) -> None:
+    """Colonies no longer have their own skill config, but skills written
+    into a colony's dir (by ``create_colony`` / ``write_skill``) — in both
+    the flat ``skills/`` and the legacy nested ``.hive/skills/`` layouts —
+    must still surface in the aggregated library with colony_ui scope and
+    queen-authored provenance.
     """
-    payload = {
-        "name": "new-flat-skill",
-        "description": "Created via UI",
-        "body": "## Body\nstuff\n",
-        "enabled": True,
-    }
-    resp = await client.post("/api/colonies/research_one/skills", json=payload)
-    assert resp.status == 201
-
-    flat_md = _seed_colony / "skills" / "new-flat-skill" / "SKILL.md"
-    nested_md = _seed_colony / ".hive" / "skills" / "new-flat-skill" / "SKILL.md"
-    assert flat_md.exists(), "new colony skill should land in flat skills/ dir"
-    assert not nested_md.exists(), "new colony skill must NOT land in legacy nested .hive/skills/"
-
-
-async def test_legacy_nested_colony_skill_still_lists(client: TestClient, _seed_colony) -> None:
-    """Pre-flatten colonies keep their skills under ``colonies/{name}/.hive/skills/``.
-    They must continue to surface in GET responses.
-    """
-    skill_dir = _seed_colony / ".hive" / "skills" / "legacy-flat-test"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: legacy-flat-test\ndescription: Legacy nested\n---\n\nbody\n",
+    flat_dir = _seed_colony / "skills" / "flat-colony-skill"
+    flat_dir.mkdir(parents=True)
+    (flat_dir / "SKILL.md").write_text(
+        "---\nname: flat-colony-skill\ndescription: Flat layout\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    nested_dir = _seed_colony / ".hive" / "skills" / "legacy-colony-skill"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "SKILL.md").write_text(
+        "---\nname: legacy-colony-skill\ndescription: Legacy nested\n---\n\nbody\n",
         encoding="utf-8",
     )
 
-    resp = await client.get("/api/colonies/research_one/skills")
+    resp = await client.get("/api/skills")
     assert resp.status == 200
     rows = {r["name"]: r for r in (await resp.json())["skills"]}
-    assert "legacy-flat-test" in rows
+    for name in ("flat-colony-skill", "legacy-colony-skill"):
+        assert name in rows
+        assert rows[name]["source_scope"] == "colony_ui"
+        assert rows[name]["provenance"] == "queen_created"
+        assert rows[name]["owner"] == {"type": "colony", "id": "research_one", "name": "research_one"}
 
 
-async def test_patch_does_not_mislabel_legacy_colony_skill_as_framework(client: TestClient, _seed_colony) -> None:
-    """Regression: toggling a legacy colony skill (no ledger entry yet)
-    must not stamp provenance=FRAMEWORK on the new entry. Before the fix,
-    the first PATCH wrote FRAMEWORK and the next GET displayed 'Framework'
-    instead of the queen-authored label.
+async def test_colony_config_routes_are_gone(client: TestClient, _seed_colony) -> None:
+    """Per-colony skill configuration was removed — colonies inherit their
+    owning queen's config. The old routes must not resolve.
     """
-    skill_dir = _seed_colony / ".hive" / "skills" / "legacy-queen-skill"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: legacy-queen-skill\ndescription: From create_colony\n---\n\nbody\n",
-        encoding="utf-8",
-    )
-
+    resp = await client.get("/api/colonies/research_one/skills")
+    assert resp.status == 404
     resp = await client.patch(
-        "/api/colonies/research_one/skills/legacy-queen-skill",
+        "/api/colonies/research_one/skills/anything",
         json={"enabled": False},
     )
-    assert resp.status == 200
-
-    list_resp = await client.get("/api/colonies/research_one/skills")
-    rows = {r["name"]: r for r in (await list_resp.json())["skills"]}
-    assert rows["legacy-queen-skill"]["provenance"] == "queen_created"
-    assert rows["legacy-queen-skill"]["enabled"] is False
-
-
-async def test_colony_skill_is_editable_even_without_override_entry(client: TestClient, _seed_colony) -> None:
-    """Regression: a SKILL.md dropped into a colony's .hive/skills dir
-    (e.g. from a pre-override-store colony) must still be marked editable
-    when listed via /api/colonies/{name}/skills. The admin manager used
-    to set project_root=colony_home, which retagged the skill as
-    source_scope='project' and fell back to PROJECT_DROPPED provenance —
-    flipping editable to False.
-    """
-    # Write a bare SKILL.md directly; no override ledger entry.
-    skill_dir = _seed_colony / ".hive" / "skills" / "legacy-skill"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: legacy-skill\ndescription: A legacy\n---\n\nbody\n",
-        encoding="utf-8",
-    )
-
-    resp = await client.get("/api/colonies/research_one/skills")
-    assert resp.status == 200
-    data = await resp.json()
-    rows = {r["name"]: r for r in data["skills"]}
-    assert "legacy-skill" in rows
-    assert rows["legacy-skill"]["editable"] is True
-    assert rows["legacy-skill"]["source_scope"] == "colony_ui"
-    # Legacy colony skills (no override ledger entry) were authored by
-    # create_colony() before the ledger existed — the fallback provenance
-    # must reflect that, not be misreported as user-UI-created.
-    assert rows["legacy-skill"]["provenance"] == "queen_created"
+    assert resp.status == 404
 
 
 async def test_list_scopes_enumerates_queens_and_colonies(client: TestClient, _seed_queen, _seed_colony) -> None:

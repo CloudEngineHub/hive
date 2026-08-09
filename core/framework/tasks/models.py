@@ -19,17 +19,42 @@ class TaskStatus(StrEnum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+    # Set by the sweep job (TaskStore.sweep_idle_tasks) when an in_progress
+    # task hasn't been touched within IDLE_TASK_THRESHOLD_SECONDS — typically
+    # the queen marked the task started, asked the user a question, and the
+    # user moved on without responding. Distinguishes "we gave up on this"
+    # from "it actually finished." Queens MAY transition abandoned →
+    # in_progress on resume by calling task_update again.
+    ABANDONED = "abandoned"
+    # Set by the agent via task_update(status="archived") when it tidies
+    # the plan (the user's "Update plan"): a finished or no-longer-relevant
+    # task is moved out of the active plan into the user's History. Hidden
+    # from the default task_list (pass include_archived=true to see it) but
+    # NOT gone — the agent can still task_get it and edit it, and setting a
+    # live status again restores it (the archived_* markers are stripped).
+    # Distinct from `deleted`, which is permanent id retirement.
+    ARCHIVED = "archived"
 
 
-class TaskListRole(StrEnum):
-    """Distinguishes a colony template from a session-scoped working list.
+# An in_progress task whose `updated_at` is older than this is treated as
+# abandoned by `TaskStore.sweep_idle_tasks`. The frontend mirrors this
+# threshold for its purely-visual demote (so the rail stays accurate
+# between sweeps); the server is the authority. 30 minutes is conservative —
+# adjust if a slow LLM provider produces legitimate single turns longer than
+# this and false-positive abandonments become common.
+IDLE_TASK_THRESHOLD_SECONDS: float = 30 * 60
 
-    Used for sanity-checking which write paths are allowed (e.g. the four
-    session tools must never touch a ``template`` list).
+
+def is_task_idle(record: TaskRecord, *, now: float | None = None) -> bool:
+    """True when an `in_progress` task has been silent past the threshold.
+
+    Pure function on the record — no I/O. Used by the sweep job and by
+    callers that want to filter without persisting.
     """
-
-    TEMPLATE = "template"  # colony:{colony_id}
-    SESSION = "session"  # session:{agent_id}:{session_id}
+    if record.status is not TaskStatus.IN_PROGRESS:
+        return False
+    current = now if now is not None else time.time()
+    return current - (record.updated_at or 0.0) > IDLE_TASK_THRESHOLD_SECONDS
 
 
 class TaskRecord(BaseModel):
@@ -49,21 +74,30 @@ class TaskRecord(BaseModel):
 
 
 class TaskListMeta(BaseModel):
-    """Per-list metadata. Embedded in ``TaskListDocument``."""
+    """Per-list metadata. Embedded in ``TaskListDocument``.
 
-    task_list_id: str
-    role: TaskListRole
+    The list's identity comes from its on-disk path (its parent session
+    folder). The session_id is not stored here — it's already encoded in
+    the path.
+    """
+
+    # Always "session" — colony template lists were removed. Kept as a field
+    # so the REST snapshot and persisted docs carry a stable shape.
+    role: str = "session"
     creator_agent_id: str | None = None
+    # The user-facing goal this task list serves. Set by the queen on the
+    # first task_create of a session and used as the divergence anchor: a
+    # later task_create whose goal differs meaningfully is the trigger for
+    # a pivot (new_session in DM phase, new_colony in colony phase).
+    goal: str | None = None
     created_at: float = Field(default_factory=time.time)
-    last_seen_session_ids: list[str] = Field(default_factory=list)
     schema_version: int = 1
 
 
 class TaskListDocument(BaseModel):
     """Whole task list as a single JSON document on disk.
 
-    Lives at ``{task_list_path(list_id)}/tasks.json``; the list-lock
-    sentinel is its sibling ``tasks.json.lock``.
+    Lives at ``{session_storage_dir(session_id)}/tasks.json``.
     """
 
     meta: TaskListMeta
@@ -71,9 +105,8 @@ class TaskListDocument(BaseModel):
     tasks: list[TaskRecord] = Field(default_factory=list)
 
 
-# Tagged union for claim_task_with_busy_check.  Used by run_parallel_workers
-# when stamping ``assigned_session`` on a colony template entry — the only
-# place a "claim" actually happens under the hive model.
+# Tagged union for claim_task_with_busy_check — an atomic owner-claim under
+# the list lock. Generic task-store infrastructure, not tied to any one caller.
 @dataclass
 class ClaimOk:
     kind: Literal["ok"]

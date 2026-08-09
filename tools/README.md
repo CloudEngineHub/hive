@@ -63,6 +63,13 @@ python mcp_server.py
 
 ### File System
 
+> **Note:** `read_file` / `write_file` / `edit_file` / `search_files` are
+> **no longer exposed to agents** — queens/workers do file I/O through the
+> terminal tools (`terminal_exec` for cat/sed/heredoc, `terminal_rg` /
+> `terminal_glob` for search), which default their cwd to the session workdir.
+> The functions below remain in `aden_tools.file_ops` for internal helpers and
+> the standalone `files_server.py`.
+
 All file tools live in `aden_tools.file_ops` and share one path policy
 (relative paths anchor to a registered `home`; absolute paths are honored
 verbatim; system + credential paths are on a deny list).

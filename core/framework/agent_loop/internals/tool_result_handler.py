@@ -8,10 +8,13 @@ the context-window-exceeded error detector.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import json
 import logging
+import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,37 @@ from framework.llm.provider import ToolResult, ToolUse
 from framework.llm.stream_events import ToolCallEvent
 
 logger = logging.getLogger(__name__)
+
+
+# Dedicated executor for blocking tool execution, kept SEPARATE from the
+# process-wide default ThreadPoolExecutor that asyncio.to_thread / the HTTP
+# server use. A sync tool (esp. an MCP STDIO call) blocks its worker thread on
+# future.result(); a hung tool whose thread can't be reclaimed (see the
+# timeout path below) would otherwise leak threads from the default pool until
+# it is exhausted and EVERY API request — session loads, colony data polls —
+# hangs forever. Isolating tools here means a tool storm can only starve other
+# tools, never the API surface. Threads are named so a py-spy dump makes the
+# distinction obvious.
+_TOOL_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_TOOL_EXECUTOR_LOCK = threading.Lock()
+
+
+def _tool_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily build the shared, bounded tool-execution thread pool."""
+    global _TOOL_EXECUTOR
+    ex = _TOOL_EXECUTOR
+    if ex is None:
+        with _TOOL_EXECUTOR_LOCK:
+            ex = _TOOL_EXECUTOR
+            if ex is None:
+                workers = max(
+                    8, int(os.environ.get("HIVE_TOOL_EXECUTOR_WORKERS", "64"))
+                )
+                ex = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="hive-tool"
+                )
+                _TOOL_EXECUTOR = ex
+    return ex
 
 # Pattern for detecting context-window-exceeded errors across LLM providers.
 _CONTEXT_TOO_LARGE_RE = re.compile(
@@ -238,7 +272,6 @@ def truncate_tool_result(
       model can locate the full file without seeing a mimicry-prone
       bracket token outside the body.
     - **Errors:** pass through unchanged.
-    - **read_file results:** truncate with pagination hint (no re-spill).
     """
     limit = max_tool_result_chars
 
@@ -246,63 +279,14 @@ def truncate_tool_result(
     if result.is_error:
         return result
 
-    # read_file reads FROM spilled files — never re-spill (circular).
-    # Just truncate with a pagination hint if the result is too large.
-    if tool_name == "read_file":
-        if limit <= 0 or len(result.content) <= limit:
-            return result  # Small result — pass through as-is
-        # Large result — truncate with smart preview
-        PREVIEW_CAP = min(5000, max(limit - 500, limit // 2))
-
-        metadata_str = ""
-        smart_preview: str | None = None
-        try:
-            parsed_ld = json.loads(result.content)
-            metadata_str = extract_json_metadata(parsed_ld)
-            smart_preview = build_json_preview(parsed_ld, max_chars=PREVIEW_CAP)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-
-        if smart_preview is not None:
-            preview_block = smart_preview
-        else:
-            preview_block = result.content[:PREVIEW_CAP] + "…"
-
-        # Prose header (no brackets).
-        header = (
-            f"Tool `{tool_name}` returned {len(result.content):,} characters "
-            f"(too large for context). Use offset_bytes / limit_bytes "
-            f"parameters to paginate smaller chunks."
-        )
-        if metadata_str:
-            header += f"\n\nData structure:\n{metadata_str}"
-        header += (
-            "\n\nWARNING: the preview below is a SAMPLE only — do NOT draw counts, totals, or conclusions from it."
-        )
-
-        truncated = f"{header}\n\nPreview (truncated):\n{preview_block}"
-        logger.info(
-            "%s result truncated: %d → %d chars (use offset/limit to paginate)",
-            tool_name,
-            len(result.content),
-            len(truncated),
-        )
-        return ToolResult(
-            tool_use_id=result.tool_use_id,
-            content=truncated,
-            is_error=False,
-            image_content=result.image_content,
-            is_skill_content=result.is_skill_content,
-        )
-
     spill_dir = spillover_dir
     if spill_dir:
         spill_path = Path(spill_dir)
         spill_path.mkdir(parents=True, exist_ok=True)
         filename = next_spill_filename_fn(tool_name)
 
-        # Pretty-print JSON content so read_file's line-based
-        # pagination works correctly.
+        # Pretty-print JSON content so terminal cat/grep line-based
+        # reading works correctly.
         write_content = result.content
         parsed_json: Any = None  # track for metadata extraction
         try:
@@ -336,19 +320,22 @@ def truncate_tool_result(
             else:
                 preview_block = result.content[:PREVIEW_CAP] + "…"
 
-            # Prose header (no brackets). Absolute path still surfaced
-            # so the agent can read the full file, but it's framed as
-            # a sentence, not a bracketed trailer.
+            # Prose header (no brackets). Absolute path is surfaced so the
+            # agent can recover detail on demand. The recovery hint points
+            # at terminal_exec with shell `grep` — models have a strong
+            # pre-training prior for grep and reach for it naturally, so
+            # aligning the hint with that prior minimises tool-selection
+            # friction. cat-ing the whole file would just be re-truncated
+            # at the same max_tool_result_chars cap.
             header = (
                 f"Tool `{tool_name}` returned {len(result.content):,} characters "
-                f"(too large for context). Full result saved at: {abs_path}\n"
-                f"Read the complete data with read_file(path='{abs_path}').\n"
+                f"(too large for context). Full result at: {abs_path}\n"
+                f'For targeted lookup, run `grep -nE "<pattern>" "{abs_path}"` via '
+                f"terminal_exec.\n"
             )
             if metadata_str:
                 header += f"\nData structure:\n{metadata_str}\n"
-            header += (
-                "\nWARNING: the preview below is a SAMPLE only — do NOT draw counts, totals, or conclusions from it."
-            )
+            header += "\nWARNING: the preview below is a SAMPLE only — do NOT draw counts, totals, or conclusions from it."
 
             content = f"{header}\n\nPreview (truncated):\n{preview_block}"
             logger.info(
@@ -385,6 +372,10 @@ def truncate_tool_result(
             is_error=False,
             image_content=result.image_content,
             is_skill_content=result.is_skill_content,
+            # Full content lives here on disk (both the large-preview and the
+            # small-inline branch above wrote it). Surfaced out-of-band so
+            # compaction can cite a recovery path when it clears this result.
+            spillover_path=abs_path,
         )
 
     # No spillover_dir — truncate in-place if needed
@@ -407,15 +398,10 @@ def truncate_tool_result(
 
         # Prose header (no brackets) — see docstring for the poison
         # pattern that the bracket format triggered.
-        header = (
-            f"Tool `{tool_name}` returned {len(result.content):,} characters "
-            f"(truncated to fit context budget — no spillover dir configured)."
-        )
+        header = f"Tool `{tool_name}` returned {len(result.content):,} characters (truncated to fit context budget — no spillover dir configured)."
         if metadata_str:
             header += f"\n\nData structure:\n{metadata_str}"
-        header += (
-            "\n\nWARNING: the preview below is a SAMPLE only — do NOT draw counts, totals, or conclusions from it."
-        )
+        header += "\n\nWARNING: the preview below is a SAMPLE only — do NOT draw counts, totals, or conclusions from it."
 
         truncated = f"{header}\n\n{preview_block}"
         logger.info(
@@ -456,7 +442,7 @@ async def execute_tool(
         )
 
     skill_dirs = skill_dirs or []
-    skill_read_tools = {"view_file", "read_file"}
+    skill_read_tools = {"view_file"}
     if tc.tool_name in skill_read_tools and skill_dirs:
         raw_path = tc.tool_input.get("path", "")
         if raw_path:
@@ -487,7 +473,9 @@ async def execute_tool(
         # execution context) propagate into the worker thread.
         loop = asyncio.get_running_loop()
         ctx = contextvars.copy_context()
-        result = await loop.run_in_executor(None, ctx.run, tool_executor, tool_use)
+        # Dedicated tool pool (NOT the default executor) so a hung tool can
+        # never starve the HTTP server / file / db reads.
+        result = await loop.run_in_executor(_tool_executor(), ctx.run, tool_executor, tool_use)
         # Async executors return a coroutine — await it on the loop
         if asyncio.iscoroutine(result) or asyncio.isfuture(result):
             result = await result
@@ -500,16 +488,77 @@ async def execute_tool(
             result = await _run()
     except TimeoutError:
         logger.warning("Tool '%s' timed out after %.0fs", tc.tool_name, timeout)
-        # asyncio.wait_for cancels the awaiting coroutine, but the sync
-        # executor running inside run_in_executor keeps going — and so
-        # does any MCP subprocess it is blocked on. Reach through to the
-        # owning MCPClient and force-disconnect it so the subprocess is
-        # torn down. Next call_tool triggers a reconnect. Without this
-        # the executor thread and MCP child leak on every timeout.
+        # The MCP client behind this tool is SHARED by every worker on the
+        # server (pooled per server name). A timeout here often means the
+        # server is merely busy — one slow browser call convoys others into
+        # timeouts — NOT that it is dead. Force-disconnecting on every
+        # timeout killed the shared transport for all workers (2026-06-11
+        # incident), so probe liveness first and only kill a server that
+        # is provably unresponsive. The abandoned call's executor thread is
+        # reclaimed by the MCP client's own call-result ceiling.
+        verdict = "unknown"
+        probe_for_tool = getattr(tool_executor, "probe_for_tool", None)
+        if callable(probe_for_tool):
+            try:
+                probe_loop = asyncio.get_running_loop()
+                verdict = await probe_loop.run_in_executor(_tool_executor(), probe_for_tool, tc.tool_name)
+            except Exception as exc:  # defensive — never let the probe crash the loop
+                logger.warning("probe_for_tool('%s') raised during timeout handling: %s", tc.tool_name, exc)
+
+        if verdict == "alive":
+            logger.info(
+                "Tool server for '%s' answered liveness probe; abandoning the slow call without disconnecting",
+                tc.tool_name,
+            )
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                content=(
+                    f"Tool '{tc.tool_name}' timed out after {timeout:.0f}s and the request "
+                    "was abandoned. TRANSPORT STATUS: the tool server is RESPONSIVE "
+                    "(liveness check passed) — it is still processing a slow operation, or "
+                    "another agent's long call is queued ahead of yours on the shared "
+                    "connection. This is a client-side timeout, NOT an application or "
+                    "browser crash. DO NOT kill, restart, or inspect any processes, and DO "
+                    "NOT use terminal commands to 'fix' anything — other agents share this "
+                    "connection and manual intervention will break their work. Recommended: "
+                    "wait ~30s, retry once with a smaller/simpler request; if it times out "
+                    "again, report the timeout and move on to other work."
+                ),
+                is_error=True,
+            )
+        if verdict == "resetting":
+            logger.info(
+                "Tool server for '%s' is already resetting; skipping force-disconnect",
+                tc.tool_name,
+            )
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                content=(
+                    f"Tool '{tc.tool_name}' timed out after {timeout:.0f}s. The shared "
+                    "connection to its tool server is being reset AUTOMATICALLY by the "
+                    "runtime. DO NOT kill or restart any processes and DO NOT attempt "
+                    "manual cleanup — recovery is already in progress. Recommended: wait "
+                    "30-60s, then retry the tool once; if it still fails, report the "
+                    "transport problem and stop using these tools until it recovers."
+                ),
+                is_error=True,
+            )
+
+        # verdict is "dead" or "unknown": the server failed its liveness
+        # probe (or doesn't support probing). asyncio.wait_for cancels the
+        # awaiting coroutine, but the sync executor running inside
+        # run_in_executor keeps going — and so does any MCP subprocess it
+        # is blocked on. Reach through to the owning MCPClient and
+        # force-disconnect it so the subprocess is torn down. Next
+        # call_tool triggers a reconnect. Without this the executor thread
+        # and MCP child leak on every timeout.
         kill_for_tool = getattr(tool_executor, "kill_for_tool", None)
         if callable(kill_for_tool):
             try:
-                await asyncio.to_thread(kill_for_tool, tc.tool_name)
+                # Run the (blocking, ~tens-of-seconds) disconnect on the tool
+                # pool too — never on the default pool that serves the API.
+                kill_loop = asyncio.get_running_loop()
+                await kill_loop.run_in_executor(_tool_executor(), kill_for_tool, tc.tool_name)
             except Exception as exc:  # defensive — never let cleanup crash the loop
                 logger.warning(
                     "kill_for_tool('%s') raised during timeout handling: %s",
@@ -519,9 +568,12 @@ async def execute_tool(
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             content=(
-                f"Tool '{tc.tool_name}' timed out after {timeout:.0f}s. "
-                "The operation took too long and was cancelled. "
-                "Try a simpler request or a different approach."
+                f"Tool '{tc.tool_name}' timed out after {timeout:.0f}s and its tool server "
+                "failed a liveness check. The runtime is resetting that connection "
+                "AUTOMATICALLY. DO NOT kill, restart, or launch any processes and DO NOT "
+                "attempt manual cleanup — recovery is already in progress. Recommended: "
+                "wait 30-60s, retry the tool once; if it fails again, report the tool "
+                "server outage and move on to work that does not need this tool."
             ),
             is_error=True,
         )

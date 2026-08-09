@@ -36,7 +36,7 @@ conversation_mode: continuous   # always "continuous" for Hive agents
 
 loop_config:
   max_iterations: 100
-  max_tool_calls_per_turn: 30
+  tool_call_budget: 30
   max_context_tokens: 32000
 
 # MCP servers to connect (resolved by name from ~/.hive/mcp_registry/)

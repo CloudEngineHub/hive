@@ -1,7 +1,7 @@
 import { Hash, Share2, Download, Play, Pause, Loader2, CheckCircle2, KeyRound, FolderOpen } from "lucide-react";
 import { memo, useState } from "react";
 import BrowserStatusBadge from "./BrowserStatusBadge";
-import { sessionsApi } from "@/api/sessions";
+import { coloniesApi } from "@/api/colonies";
 
 interface ColonyHeaderProps {
   colonyName: string;
@@ -10,7 +10,6 @@ interface ColonyHeaderProps {
   onRun?: () => void;
   onPause?: () => void;
   onCredentials?: () => void;
-  sessionId?: string | null;
   disabled?: boolean;
 }
 
@@ -21,7 +20,6 @@ export default memo(function ColonyHeader({
   onRun,
   onPause,
   onCredentials,
-  sessionId,
   disabled,
 }: ColonyHeaderProps) {
   const [hovered, setHovered] = useState(false);
@@ -44,16 +42,14 @@ export default memo(function ColonyHeader({
           <KeyRound className="w-3.5 h-3.5" />
           Credentials
         </button>
-        {sessionId && (
-          <button
-            onClick={() => sessionsApi.revealFolder(sessionId).catch(() => {})}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
-            title="Open session data folder"
-          >
-            <FolderOpen className="w-3.5 h-3.5" />
-            Data
-          </button>
-        )}
+        <button
+          onClick={() => coloniesApi.revealFolder(colonyName).catch(() => {})}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+          title="Open colony folder"
+        >
+          <FolderOpen className="w-3.5 h-3.5" />
+          Data
+        </button>
         <BrowserStatusBadge />
 
         <span className="w-px h-4 bg-border/60" />

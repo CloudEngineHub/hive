@@ -190,10 +190,7 @@ def strip_boundary_echo(file_lines: list[str], start_1idx: int, end_1idx: int, n
     # Check if leading boundary echoes
     before_idx = start_1idx - 2  # 0-indexed line before range
     leading_echoes = (
-        before_idx >= 0
-        and new_lines[0].strip()
-        and file_lines[before_idx].strip()
-        and whitespace_equal(new_lines[0], file_lines[before_idx])
+        before_idx >= 0 and new_lines[0].strip() and file_lines[before_idx].strip() and whitespace_equal(new_lines[0], file_lines[before_idx])
     )
 
     # Check if trailing boundary echoes

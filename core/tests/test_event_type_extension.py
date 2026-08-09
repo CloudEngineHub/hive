@@ -65,11 +65,7 @@ def collect_text(events: list) -> str:
 
 def extract_tool_calls(events: list) -> list[dict[str, Any]]:
     """Extract tool call info from a stream of events."""
-    return [
-        {"id": e.tool_use_id, "name": e.tool_name, "input": e.tool_input}
-        for e in events
-        if isinstance(e, ToolCallEvent)
-    ]
+    return [{"id": e.tool_use_id, "name": e.tool_name, "input": e.tool_input} for e in events if isinstance(e, ToolCallEvent)]
 
 
 # ---------------------------------------------------------------------------

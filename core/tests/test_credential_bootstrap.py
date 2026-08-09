@@ -68,3 +68,100 @@ def test_bootstrap_does_not_override_existing_configured_llm_env_var(monkeypatch
 
     assert os.environ.get("OPENROUTER_API_KEY") == "already-set"
     assert "OPENROUTER_API_KEY" not in calls
+
+
+# ---------------------------------------------------------------------------
+# HIVE_CREDENTIAL_KEY env-to-disk persistence
+# ---------------------------------------------------------------------------
+#
+# Without persisting an env-provided key to ``~/.hive/secrets/credential_key``,
+# a process that boots with HIVE_CREDENTIAL_KEY only in its environment
+# (e.g. hive serve under supervisord in a sandbox VM, where the parent
+# env doesn't survive a process restart) encrypts credentials with an
+# in-memory key, then loses it on restart — the .enc files on the
+# persistent volume become permanently undecryptable. The patch in
+# key_storage.py:_persist_key_if_missing_or_stale closes this loop.
+
+
+def test_load_credential_key_persists_env_value_to_disk(monkeypatch, tmp_path):
+    """Env-sourced key gets written to ``credential_key`` file so a
+    subsequent boot without the env var can recover the same key."""
+    key_path = tmp_path / "secrets" / "credential_key"
+    monkeypatch.setattr(key_storage, "CREDENTIAL_KEY_PATH", key_path)
+    monkeypatch.setenv("HIVE_CREDENTIAL_KEY", "env-key-abc")
+
+    loaded = key_storage.load_credential_key()
+
+    assert loaded == "env-key-abc"
+    assert key_path.is_file()
+    assert key_path.read_text(encoding="utf-8") == "env-key-abc"
+
+
+def test_load_credential_key_overwrites_stale_disk_value_with_env(monkeypatch, tmp_path):
+    """When env and file disagree, env wins (already current behavior),
+    AND the file gets overwritten so a future restart-without-env reads
+    the key the encrypted store was actually written with."""
+    key_path = tmp_path / "secrets" / "credential_key"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("disk-old-key", encoding="utf-8")
+    monkeypatch.setattr(key_storage, "CREDENTIAL_KEY_PATH", key_path)
+    monkeypatch.setenv("HIVE_CREDENTIAL_KEY", "env-new-key")
+
+    loaded = key_storage.load_credential_key()
+
+    assert loaded == "env-new-key"
+    assert key_path.read_text(encoding="utf-8") == "env-new-key"
+
+
+def test_load_credential_key_skips_write_when_env_and_file_match(monkeypatch, tmp_path):
+    """Idempotent path: identical env + file means no unnecessary write
+    (avoids churning mtime on the credential_key file every boot)."""
+    key_path = tmp_path / "secrets" / "credential_key"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("same-key", encoding="utf-8")
+    original_mtime = key_path.stat().st_mtime_ns
+    monkeypatch.setattr(key_storage, "CREDENTIAL_KEY_PATH", key_path)
+    monkeypatch.setenv("HIVE_CREDENTIAL_KEY", "same-key")
+
+    loaded = key_storage.load_credential_key()
+
+    assert loaded == "same-key"
+    assert key_path.stat().st_mtime_ns == original_mtime
+
+
+def test_load_credential_key_from_disk_does_not_rewrite_itself(monkeypatch, tmp_path):
+    """When the env var is absent and the key comes from disk, we don't
+    need to write the file back — it's already there. Guards against an
+    accidental double-write loop on every boot."""
+    key_path = tmp_path / "secrets" / "credential_key"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("from-disk", encoding="utf-8")
+    original_mtime = key_path.stat().st_mtime_ns
+    monkeypatch.setattr(key_storage, "CREDENTIAL_KEY_PATH", key_path)
+    monkeypatch.delenv("HIVE_CREDENTIAL_KEY", raising=False)
+
+    loaded = key_storage.load_credential_key()
+
+    assert loaded == "from-disk"
+    assert os.environ.get("HIVE_CREDENTIAL_KEY") == "from-disk"
+    assert key_path.stat().st_mtime_ns == original_mtime
+
+
+def test_load_credential_key_swallows_persistence_failure(monkeypatch, tmp_path, caplog):
+    """Best-effort write: a permission error on the credential_key file
+    must not turn a successful load into a failure. The in-memory key
+    is still usable for THIS process; the warning surfaces the durability
+    risk for forensics. Guards against making a degraded boot fatal."""
+    key_path = tmp_path / "readonly" / "secrets" / "credential_key"
+    monkeypatch.setattr(key_storage, "CREDENTIAL_KEY_PATH", key_path)
+    monkeypatch.setenv("HIVE_CREDENTIAL_KEY", "env-key")
+
+    def explode(*_args, **_kwargs):
+        raise PermissionError("simulated read-only fs")
+
+    monkeypatch.setattr(key_storage, "save_credential_key", explode)
+
+    loaded = key_storage.load_credential_key()
+
+    assert loaded == "env-key"  # in-memory load still works
+    assert "failed to persist HIVE_CREDENTIAL_KEY" in caplog.text

@@ -14,6 +14,7 @@ import os
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,8 @@ from framework.llm.anthropic import AnthropicProvider
 from framework.llm.litellm import (
     OPENROUTER_TOOL_COMPAT_MODEL_CACHE,
     LiteLLMProvider,
+    _append_json_instruction,
+    _apply_history_cache_breakpoint,
     _build_system_message,
     _compute_retry_delay,
     _cost_from_tokens,
@@ -237,10 +240,7 @@ class TestToolConversion:
         provider = LiteLLMProvider(model="gpt-4o-mini", api_key="test-key")
 
         parsed = provider._parse_tool_call_arguments(
-            (
-                '{"question":"What story structure should the agent use?",'
-                '"options":["3-act structure","Beginning-Middle-End","Random paragraph"'
-            ),
+            ('{"question":"What story structure should the agent use?","options":["3-act structure","Beginning-Middle-End","Random paragraph"'),
             "ask_user",
         )
 
@@ -570,6 +570,48 @@ class TestComputeRetryDelay:
         exc = _make_exception_with_headers({"retry-after-ms": "300000"})  # 300s
         assert _compute_retry_delay(0, exception=exc) == 120  # capped
 
+    def test_retry_after_from_exception_headers_attr(self):
+        """LiteLLM may attach headers directly to the exception (no .response)."""
+        exc = _make_exception_with_headers_attr({"retry-after": "1"})
+        # Without the new fallback this would return 16 (2 * 2^3).
+        assert _compute_retry_delay(3, exception=exc) == 1.0
+
+    def test_backpressure_message_implicit_short_retry(self):
+        """Hive proxy backpressure errors get a 1s floor when headers are missing."""
+        exc = Exception('AnthropicException - {"type":"error","error":{"type":"backpressure","message":"concurrent limit (per_user)"}}')
+        # attempt=3 would yield 16s on exponential fallback.
+        assert _compute_retry_delay(3, exception=exc) == 1.0
+
+    def test_backpressure_does_not_override_explicit_retry_after(self):
+        """When a real Retry-After is present, backpressure heuristic must not kick in."""
+        exc = _make_exception_with_headers({"retry-after": "7"})
+        exc.args = ("backpressure: concurrent limit",)
+        assert _compute_retry_delay(0, exception=exc) == 7.0
+
+    def test_jitter_widens_exponential_backoff(self):
+        """Jitter should spread sampled delays in [0.75x, 1.25x] of base."""
+        samples = [_compute_retry_delay(3, jitter=True) for _ in range(100)]
+        assert all(12.0 <= s <= 20.0 for s in samples)
+        assert len(set(samples)) >= 3
+
+    def test_jitter_lengthens_short_retry_after(self):
+        """Short Retry-After values gain positive jitter to avoid lockstep retry."""
+        exc = _make_exception_with_headers({"retry-after": "1"})
+        samples = [_compute_retry_delay(0, exception=exc, jitter=True) for _ in range(100)]
+        assert all(1.0 <= s <= 2.0 for s in samples)
+        assert len(set(samples)) >= 3
+
+    def test_jitter_skips_long_retry_after(self):
+        """Long upstream Retry-After values are kept verbatim under jitter."""
+        exc = _make_exception_with_headers({"retry-after": "60"})
+        assert _compute_retry_delay(0, exception=exc, jitter=True) == 60.0
+
+    def test_jitter_default_off_preserves_exact_values(self):
+        """Default jitter=False keeps deterministic delays for non-jittered call sites."""
+        assert _compute_retry_delay(3) == 16
+        exc = _make_exception_with_headers({"retry-after": "1"})
+        assert _compute_retry_delay(0, exception=exc) == 1.0
+
 
 def _make_exception_with_headers(headers: dict[str, str]) -> BaseException:
     """Create a mock exception with response headers for testing."""
@@ -577,6 +619,13 @@ def _make_exception_with_headers(headers: dict[str, str]) -> BaseException:
     response = MagicMock()
     response.headers = headers
     exc.response = response  # type: ignore[attr-defined]
+    return exc
+
+
+def _make_exception_with_headers_attr(headers: dict[str, str]) -> BaseException:
+    """Mock exception with headers set directly on the exception (no .response)."""
+    exc = Exception("rate limited")
+    exc.headers = headers  # type: ignore[attr-defined]
     return exc
 
 
@@ -779,10 +828,7 @@ class TestOpenRouterToolCompatFallback:
         compat_response = MagicMock()
         compat_response.choices = [MagicMock()]
         compat_response.choices[0].message.content = (
-            '{"assistant_response":"","tool_calls":['
-            '{"name":"web_search","arguments":'
-            '{"query":"Python 3.13 release notes","num_results":3}}'
-            "]}"
+            '{"assistant_response":"","tool_calls":[{"name":"web_search","arguments":{"query":"Python 3.13 release notes","num_results":3}}]}'
         )
         compat_response.choices[0].finish_reason = "stop"
         compat_response.model = provider.model
@@ -881,9 +927,7 @@ class TestOpenRouterToolCompatFallback:
         async def side_effect(*args, **kwargs):
             call_state["count"] += 1
             if kwargs.get("stream"):
-                raise RuntimeError(
-                    'OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}'
-                )
+                raise RuntimeError('OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}')
             return compat_response
 
         mock_acompletion.side_effect = side_effect
@@ -963,9 +1007,7 @@ class TestOpenRouterToolCompatFallback:
 
         async def side_effect(*args, **kwargs):
             if kwargs.get("stream"):
-                raise RuntimeError(
-                    'OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}'
-                )
+                raise RuntimeError('OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}')
             return compat_response
 
         mock_acompletion.side_effect = side_effect
@@ -1024,9 +1066,7 @@ class TestOpenRouterToolCompatFallback:
 
         async def side_effect(*args, **kwargs):
             if kwargs.get("stream"):
-                raise RuntimeError(
-                    'OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}'
-                )
+                raise RuntimeError('OpenrouterException - {"error":{"message":"No endpoints found that support tool use.","code":404}}')
             return compat_response
 
         mock_acompletion.side_effect = side_effect
@@ -1048,6 +1088,96 @@ class TestOpenRouterToolCompatFallback:
         finish_events = [event for event in events if isinstance(event, FinishEvent)]
         assert len(finish_events) == 1
         assert finish_events[0].stop_reason == "stop"
+
+
+# ---------------------------------------------------------------------------
+# Reasoning / `thinking` block streaming
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingBlockStreaming:
+    """Reasoning models (DeepSeek/GLM via the hive-2.1 alias) stream `thinking`
+    content blocks. They must be reassembled from deltas — signature included —
+    and surfaced on FinishEvent so the agent loop can echo them back. Dropping
+    them 400s the next request: "The content[].thinking ... must be passed
+    back to the API."
+    """
+
+    @staticmethod
+    def _chunk(*, content=None, thinking_blocks=None, finish_reason=None, usage=None):
+        """Build a fake litellm streaming chunk the stream() loop can read."""
+        delta = SimpleNamespace(
+            content=content,
+            tool_calls=None,
+            thinking_blocks=thinking_blocks,
+        )
+        choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice], usage=usage)
+
+    @classmethod
+    async def _fake_stream(cls, chunks):
+        for c in chunks:
+            yield c
+
+    @pytest.mark.asyncio
+    @patch("litellm.acompletion")
+    async def test_thinking_blocks_reassembled_onto_finish_event(self, mock_acompletion):
+        """Text + signature deltas reassemble into one signed thinking block."""
+        from framework.llm.stream_events import FinishEvent, TextEndEvent
+
+        provider = LiteLLMProvider(model="anthropic/claude-sonnet-4", api_key="test-key")
+        usage = SimpleNamespace(prompt_tokens=12, completion_tokens=20)
+        chunks = [
+            # thinking text arrives across two deltas, signature empty so far
+            self._chunk(thinking_blocks=[{"type": "thinking", "thinking": "Let me ", "signature": ""}]),
+            self._chunk(thinking_blocks=[{"type": "thinking", "thinking": "weigh it", "signature": ""}]),
+            # signature delta closes the block
+            self._chunk(thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "SIG-ABC"}]),
+            self._chunk(content="The answer."),
+            self._chunk(finish_reason="stop", usage=usage),
+        ]
+
+        async def _side_effect(*args, **kwargs):
+            return self._fake_stream(chunks)
+
+        mock_acompletion.side_effect = _side_effect
+
+        events = []
+        async for event in provider.stream(messages=[{"role": "user", "content": "hi"}]):
+            events.append(event)
+
+        finish = next(e for e in events if isinstance(e, FinishEvent))
+        assert finish.thinking_blocks == [{"type": "thinking", "thinking": "Let me weigh it", "signature": "SIG-ABC"}]
+        text_end = next(e for e in events if isinstance(e, TextEndEvent))
+        assert text_end.full_text == "The answer."
+
+    @pytest.mark.asyncio
+    @patch("litellm.acompletion")
+    async def test_unsigned_thinking_block_is_dropped(self, mock_acompletion):
+        """A thinking block whose signature never arrives cannot be echoed
+        back (the API rejects unsigned thinking) — it must be dropped, not
+        surfaced as a malformed block."""
+        from framework.llm.stream_events import FinishEvent
+
+        provider = LiteLLMProvider(model="anthropic/claude-sonnet-4", api_key="test-key")
+        usage = SimpleNamespace(prompt_tokens=5, completion_tokens=3)
+        chunks = [
+            self._chunk(thinking_blocks=[{"type": "thinking", "thinking": "half a ", "signature": ""}]),
+            self._chunk(content="cut off"),
+            self._chunk(finish_reason="stop", usage=usage),
+        ]
+
+        async def _side_effect(*args, **kwargs):
+            return self._fake_stream(chunks)
+
+        mock_acompletion.side_effect = _side_effect
+
+        events = []
+        async for event in provider.stream(messages=[{"role": "user", "content": "hi"}]):
+            events.append(event)
+
+        finish = next(e for e in events if isinstance(e, FinishEvent))
+        assert finish.thinking_blocks == []
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1327,121 @@ class TestGetLlmExtraKwargsOllama:
         with patch("framework.config.get_hive_config", return_value={}):
             result = get_llm_extra_kwargs()
         assert result == {}
+
+
+class TestApplyHistoryCacheBreakpoint:
+    """`_apply_history_cache_breakpoint` places a rolling cache marker on the
+    LAST message of the request, whatever its role. Anchoring at the end is
+    what lets a long tool-use turn cache incrementally: each iteration
+    appends assistant + tool messages and Anthropic's automatic prefix
+    checking (~20-block lookback from the breakpoint) still hits the prior
+    iteration's cached prefix. It must be silent on non-supported models
+    and on system-only requests (the system block carries its own marker)."""
+
+    def test_skips_on_non_cache_control_model(self):
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        _apply_history_cache_breakpoint(msgs, model="openai/gpt-4o-mini")
+        for m in msgs:
+            assert "cache_control" not in m
+
+    def test_anchors_on_last_message_tool_result(self):
+        # Mid-tool-loop request: the newest tool result is the anchor, so
+        # the entire loop so far is written to cache and the next
+        # iteration reads it back.
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "tool", "content": "t1", "tool_call_id": "x"},
+        ]
+        _apply_history_cache_breakpoint(msgs, model="anthropic/claude-opus-4-5")
+        assert msgs[3].get("cache_control") == {"type": "ephemeral"}
+        # No collateral cache_control elsewhere.
+        for i, m in enumerate(msgs):
+            if i != 3:
+                assert "cache_control" not in m
+
+    def test_anchors_on_last_user_message_at_turn_start(self):
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        _apply_history_cache_breakpoint(msgs, model="claude-3-5-sonnet-20241022")
+        assert msgs[3].get("cache_control") == {"type": "ephemeral"}
+
+    def test_first_turn_anchors_on_the_user_message(self):
+        # Worker's very first request: [system, task]. The task message
+        # itself is the anchor — previously the rule ("message before the
+        # last user turn") landed on the system block and bailed, leaving
+        # the whole tool loop of a single-turn worker uncached forever.
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+        ]
+        _apply_history_cache_breakpoint(msgs, model="anthropic/claude-opus-4-5")
+        assert "cache_control" not in msgs[0]
+        assert msgs[1].get("cache_control") == {"type": "ephemeral"}
+
+    def test_skips_on_system_only_request(self):
+        msgs = [{"role": "system", "content": "s"}]
+        _apply_history_cache_breakpoint(msgs, model="anthropic/claude-opus-4-5")
+        assert "cache_control" not in msgs[0]
+
+    def test_skips_on_empty_list(self):
+        msgs: list = []
+        _apply_history_cache_breakpoint(msgs, model="anthropic/claude-opus-4-5")
+        assert msgs == []
+
+    def test_handles_openrouter_anthropic_routing(self):
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        _apply_history_cache_breakpoint(msgs, model="openrouter/anthropic/claude-opus-4.5")
+        assert msgs[3].get("cache_control") == {"type": "ephemeral"}
+
+
+class TestAppendJsonInstruction:
+    """json_mode's instruction must survive both system-content shapes.
+
+    The two-block form from `_build_system_message` makes `content` a LIST;
+    a bare `+=` with a string would extend the list with individual
+    characters and corrupt the request."""
+
+    def test_appends_to_string_system_content(self):
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "u"}]
+        _append_json_instruction(msgs)
+        assert msgs[0]["content"] == "sys\n\nPlease respond with a valid JSON object."
+
+    def test_appends_text_block_to_list_system_content(self):
+        msgs = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "static", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "suffix"},
+                ],
+            },
+            {"role": "user", "content": "u"},
+        ]
+        _append_json_instruction(msgs)
+        blocks = msgs[0]["content"]
+        assert len(blocks) == 3
+        assert blocks[2] == {"type": "text", "text": "Please respond with a valid JSON object."}
+
+    def test_inserts_system_message_when_absent(self):
+        msgs = [{"role": "user", "content": "u"}]
+        _append_json_instruction(msgs)
+        assert msgs[0] == {"role": "system", "content": "Please respond with a valid JSON object."}
 
 
 class TestModelSupportsCacheControl:
@@ -1493,8 +1738,7 @@ class TestStreamingChunksFallbackPreservesCacheFields:
 
         assert cached == 0
         assert creation == 5601, (
-            "chunks-fallback must recover cache_write_tokens from the raw "
-            "chunk, not from calculate_total_usage which strips details"
+            "chunks-fallback must recover cache_write_tokens from the raw chunk, not from calculate_total_usage which strips details"
         )
 
     def test_chunks_with_cache_read_recovered(self):

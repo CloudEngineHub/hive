@@ -623,9 +623,7 @@ def register_tools(
             return {
                 "error": "GitHub credentials not configured",
                 "help": (
-                    "Set GITHUB_TOKEN environment variable "
-                    "or configure via credential store. "
-                    "Get a token at https://github.com/settings/tokens"
+                    "Set GITHUB_TOKEN environment variable or configure via credential store. Get a token at https://github.com/settings/tokens"
                 ),
             }
         return _GitHubClient(token)

@@ -82,10 +82,7 @@ def register_tools(
             else:
                 # Windows Authentication
                 connection_string = (
-                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                    f"SERVER={params['server']};"
-                    f"DATABASE={params['database']};"
-                    f"Trusted_Connection=yes;"
+                    f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={params['server']};DATABASE={params['database']};Trusted_Connection=yes;"
                 )
 
             connection = pyodbc.connect(connection_string, timeout=10)
@@ -211,9 +208,7 @@ def register_tools(
         query_upper = query.strip().upper()
         allowed_keywords = ["INSERT", "UPDATE", "DELETE", "MERGE"]
         if not any(query_upper.startswith(kw) for kw in allowed_keywords):
-            return {
-                "error": f"Only {', '.join(allowed_keywords)} queries are allowed. Use mssql_execute_query for SELECT."
-            }
+            return {"error": f"Only {', '.join(allowed_keywords)} queries are allowed. Use mssql_execute_query for SELECT."}
 
         # Safety check for DELETE without WHERE
         if query_upper.startswith("DELETE") and "WHERE" not in query_upper:

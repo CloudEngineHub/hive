@@ -191,8 +191,8 @@ class AgentConfig(BaseModel):
     loop_config: dict = Field(
         default_factory=lambda: {
             "max_iterations": 100,
-            "max_tool_calls_per_turn": 30,
-            "max_context_tokens": 32000,
+            "tool_call_budget": 30,
+            "max_context_tokens": 180_000,
         },
     )
 

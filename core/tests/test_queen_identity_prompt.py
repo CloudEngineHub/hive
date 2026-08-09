@@ -6,7 +6,7 @@ from framework.agents.queen.queen_profiles import DEFAULT_QUEENS, format_queen_i
 def test_identity_prompt_starts_with_plain_identity() -> None:
     prompt = format_queen_identity_prompt(DEFAULT_QUEENS["queen_brand_design"], max_examples=1)
 
-    assert prompt.startswith("<core_identity>\nYou are Sophia, Head of Brand & Design.")
+    assert prompt.startswith("<core_identity>\nYou are a queen agent, your name is Jony Ive, Head of Brand & Design.")
     assert "<hidden_background>" in prompt
     assert "<behavior_rules>" in prompt
     assert "<psychological_profile>" in prompt

@@ -50,17 +50,31 @@ class LoopConfig:
     """Configuration for the event loop."""
 
     max_iterations: int = 50
-    # 0 (or any non-positive value) disables the per-turn hard limit,
-    # letting a single assistant turn fan out arbitrarily many tool
-    # calls. Models like Gemini 3.1 Pro routinely emit 40-80 tool
-    # calls in one turn during browser exploration; capping them
-    # strands work half-finished and makes the next turn repeat the
-    # discarded calls, which is worse than just running them.
-    max_tool_calls_per_turn: int = 0
+    # Extra iterations granted after ``max_iterations`` is exhausted, during
+    # which tool dispatch is restricted to a terminal-tool whitelist
+    # (``report_to_parent``, ``tracker_upsert``, ``task_update``) so the
+    # agent can wrap up and report instead of dying silently. A single
+    # ``<system-reminder>`` is injected at the start of the first grace
+    # iteration explaining the restriction. 0 disables grace (current
+    # behavior — loop terminates at ``max_iterations`` with whatever the
+    # worker last did). Workers default to 1; queens default to 0 because
+    # they don't call ``report_to_parent``.
+    grace_iterations: int = 0
+    # Tool-call pacing budget for one agent turn-loop (a single judge
+    # iteration of _run_turn_loop, which may itself span several inner
+    # model<->tool turns). The counter resets at the start of each
+    # turn-loop. While running, the loop emits an escalating *soft*
+    # checkpoint reminder every `tool_call_budget` calls — a nudge to
+    # reassess, never a stop — and a *hard* stop once the count exceeds
+    # `tool_call_budget * tool_call_hard_multiple` (see that field).
+    # 0 (or any non-positive value) disables both the soft reminders
+    # and the hard stop, letting a turn-loop fan out arbitrarily many
+    # tool calls.
+    tool_call_budget: int = 0
     judge_every_n_turns: int = 1
     stall_detection_threshold: int = 3
     stall_similarity_threshold: float = 0.85
-    max_context_tokens: int = 32_000
+    max_context_tokens: int = 180_000
     # Headroom reserved for the NEXT turn's input + output so that
     # proactive compaction always finishes before the hard context limit
     # is hit mid-stream. Scaled to match Claude Code's 13k-buffer-on-
@@ -79,27 +93,64 @@ class LoopConfig:
     # max_tool_result_chars payload ≈ 30k chars ≈ 7.5k tokens, rounded to
     # 8k) plus a fractional headroom that keeps the trigger meaningful on
     # large windows, so the inner tool loop always has room to grow
-    # without tripping the mid-turn pre-send guard. Defaults: 8k + 15%.
-    # On 32k that's a 12.8k buffer (~60% trigger); on 200k it's 38k
-    # (~81% trigger); on 1M it's 158k (~84% trigger).
-    compaction_buffer_ratio: float = 0.15
+    # without tripping the mid-turn pre-send guard. Defaults: 8k + 40%.
+    # On the hive default 180k window that's an 80k buffer (trigger at
+    # ~100k, ~56%); on 32k it's 20.8k (~35% trigger); on 1M it's 408k
+    # (~59% trigger). Raised from 0.25 (trigger ~127k on 180k) in 2026-07:
+    # the cost analysis showed queen sessions plateauing at p50 ~110k
+    # context tokens per call — dozens of turns cruising just under the
+    # old trigger, re-sending ~270 messages of history on every call.
+    # Firing at ~100k trades more frequent compaction summaries (and a
+    # cache-prefix rebuild after each) for a materially smaller resent-
+    # history base; the char-based estimator also under-counts vs billed
+    # tokens, so the effective billed trigger sits above this number.
+    compaction_buffer_ratio: float = 0.4
     # Warning is emitted one buffer earlier so the user/telemetry gets
     # a "we're close" signal without triggering a compaction pass.
     compaction_warning_buffer_tokens: int = 12_000
     store_prefix: str = ""
 
-    # Overflow margin for max_tool_calls_per_turn. When the limit is
-    # enabled (>0), tool calls are only discarded when the count
-    # exceeds max_tool_calls_per_turn * (1 + margin). Ignored when
-    # max_tool_calls_per_turn is 0.
-    tool_call_overflow_margin: float = 0.5
+    # Hard-stop multiple for `tool_call_budget`. The turn-loop hard-stops
+    # and defers any remaining tool calls once the running count exceeds
+    # `tool_call_budget * tool_call_hard_multiple`. Soft checkpoint
+    # reminders fire at every budget multiple strictly below the hard
+    # stop (1x .. (hard_multiple - 1)x). Default 5 (e.g. budget 30 ->
+    # reminders at 30/60/90/120, hard stop at 150); workers run tighter
+    # at 2. Ignored when `tool_call_budget` is 0.
+    tool_call_hard_multiple: int = 5
+
+    # Cumulative (lifetime) tool-call budget for the WHOLE execute() run,
+    # across every turn-loop — distinct from `tool_call_budget`, which
+    # resets each turn. 0 disables (default; queens / overseers / node
+    # workers leave it 0). When the running total of executed tool calls
+    # reaches this, the loop enters its grace wind-down early: a stop
+    # reminder is injected telling the worker to call report_to_parent
+    # with partial results, dispatch is restricted to the terminal-tool
+    # whitelist, and the loop exits after grace_iterations wrap-up turn(s).
+    # Set for workers via worker_definition.DEFAULT_LOOP_CONFIG.
+    tool_call_lifetime_budget: int = 0
 
     # Tool result context management.
+    #
+    # Results larger than this are replaced in-context with a preview +
+    # spillover file reference; the full payload is written to
+    # ``spillover_dir`` so the agent can re-read it via terminal_exec on
+    # demand. See tool_result_handler.truncate_tool_result.
+    #
+    # 30k matches the value stamped by every production spawn site
+    # (orchestrator, node_worker, colony_runtime, queen_orchestrator)
+    # and is the size the compaction buffer above is sized against
+    # (~7.5k tokens worst-case single payload). A lower cap (8-12k) has
+    # been hypothesized to reduce per-turn request density on the theory
+    # that heads carry most information density, but that experiment is
+    # not shipped — change the overrides, not just this default, if you
+    # want to try it.
     max_tool_result_chars: int = 30_000
     spillover_dir: str | None = None
 
     # Image retention in conversation history.
-    # Screenshots from ``browser_screenshot`` are inlined as base64
+    # Screenshots from ``hive-browser screenshot`` (re-inlined by the framework
+    # from the terminal result) are stored as base64
     # data URLs inside message ``image_content``. Each full-page
     # screenshot costs ~250k tokens when the provider counts the
     # base64 as text (gemini, most non-Anthropic providers). Four
@@ -135,8 +186,21 @@ class LoopConfig:
 
     # Client-facing auto-block grace period.
     cf_grace_turns: int = 1
-    # Worker auto-escalation: text-only turns before escalating to queen.
-    worker_escalation_grace_turns: int = 1
+    # Worker stall grace: consecutive text-only turns (no tool calls,
+    # no set_output, no ask_user) before the framework auto-fails the
+    # worker. Behavior diverges by worker type:
+    #   - Parallel workers (stream_id="worker:*"): synthesize a
+    #     report_to_parent(status='failed') and exit. Per the BRD's
+    #     fail-fast model — queen reads the failure as a
+    #     [WORKER_REPORT] and re-dispatches as needed. NO escalation
+    #     to the queen, NO synchronous wait.
+    #   - Legacy primary worker (stream_id="worker"): emit
+    #     ESCALATION_REQUESTED and pause for queen guidance via
+    #     inject_message. Pre-BRD behavior, retained for legacy flows.
+    # Grace=2 means: first plan-text turn is fine (chain-of-thought),
+    # second consecutive text-only turn is also tolerated (rare-but-OK
+    # for genuinely-thinking models), third triggers the auto-fail.
+    worker_escalation_grace_turns: int = 2
     tool_doom_loop_enabled: bool = True
     # Silent worker: consecutive tool-only turns (no user-facing text)
     # before injecting a nudge to communicate progress.
@@ -144,6 +208,24 @@ class LoopConfig:
 
     # Per-tool-call timeout.
     tool_call_timeout_seconds: float = 60.0
+    # Per-class overrides, matched by tool-name prefix (longest prefix
+    # wins; falls back to tool_call_timeout_seconds). browser_* defaults
+    # higher: heavy-page evaluates legitimately run past 60s, and N
+    # workers share one MCP client per server, so a queued call behind a
+    # slow one needs the same headroom. INVARIANT: every value here must
+    # stay below MCPClient._CALL_RESULT_TIMEOUT (default 240s).
+    tool_timeout_overrides: dict[str, float] = field(default_factory=lambda: {"browser_": 180.0})
+
+    # Tools the caller runs in the BACKGROUND: the call returns a handle
+    # immediately and the agent collects the result later via the synthetic
+    # ``collect_result`` tool. For tools whose work legitimately exceeds the
+    # per-call timeout (e.g. image generation, which can take minutes). This
+    # keeps the agent loop — and the shared MCP server — unblocked. See
+    # ``AgentLoop._execute_tool`` / ``_start_background_tool``.
+    background_tools: set[str] = field(default_factory=lambda: {"image_generate"})
+    # Timeout for a backgrounded tool's underlying call. Must stay below
+    # MCPClient._CALL_RESULT_TIMEOUT (240s), same invariant as the overrides.
+    background_tool_timeout_seconds: float = 235.0
 
     # LLM stream inactivity watchdog. Split into two budgets so legitimate
     # slow TTFT on large contexts doesn't get mistaken for a dead connection.
@@ -169,6 +251,27 @@ class LoopConfig:
     # instead of nudging forever.
     continue_nudge_max_per_turn: int = 3
 
+    # Session-level idle watchdog. Fires when the session has been alive but
+    # silent (no stream events, no tool completions, no iteration boundary)
+    # for this many seconds AND _awaiting_input is False. Complements the
+    # stream-level TTFT/inter-event budgets above, which are blind to gaps
+    # between turns (no _stream_task) and to slow-TTFT silence under the
+    # generous 600s ceiling. Set seconds or cap to 0 to disable.
+    session_idle_nudge_seconds: float = 120.0
+    session_idle_nudge_max_per_session: int = 3
+    # Budget for an *invalid* awaiting-input park — the loop is blocked on
+    # user input but presented no question, so there is nothing to answer.
+    # Kept at the generous general budget rather than a shorter one: a
+    # shorter (45s) budget fired while a user was still composing a long
+    # message, so the queen began responding before it was submitted. A
+    # full 120s pause is well past any normal typing gap. 0 disables.
+    session_idle_nudge_awaiting_seconds: float = 120.0
+    # Budget for a *broken* park — the loop parked after a failure (LLM
+    # error, doom loop, repeated empty turns), not by design. Shorter than
+    # the questionless budget: a stranded loop should be recovered quickly,
+    # and there is no "user mid-typing" risk to weigh against it. 0 disables.
+    session_idle_nudge_broken_seconds: float = 30.0
+
     # Tool-call replay detector. When the model emits a tool call whose
     # (name + canonical-args) matches a prior successful call in the last
     # K assistant turns, emit telemetry and prepend a short steer onto the
@@ -177,6 +280,42 @@ class LoopConfig:
     # cause surprising behavior.
     replay_detector_enabled: bool = True
     replay_detector_within_last_turns: int = 3
+    # Tools fully EXEMPT from BOTH the replay detector and the doom-loop
+    # breaker: ones the agent legitimately calls repeatedly with identical
+    # args — async-job polls, idempotent reads, status/observe calls, and
+    # synthetic control tools. The breaker exists to catch a model stuck
+    # re-issuing the same FAILING action; these repeat by design, so counting
+    # them is a false positive (the symptom: a 3-minute image poll, or a
+    # re-screenshot loop, tripping the breaker). Mutating/action tools
+    # (edits, sends, terminal_exec — which now also carries browser actions
+    # via the hive-browser CLI, …)
+    # deliberately stay guarded. Extend per deployment as needed.
+    replay_exempt_tools: frozenset[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                # Synthetic control / poll tools.
+                "ask_user",
+                "escalate",
+                "collect_result",
+                # Async-job polling (terminal jobs).
+                "terminal_job_logs",
+                "terminal_job_manage",
+                "terminal_output_get",
+                # NOTE: browser observation/scripting now runs via the
+                # `hive-browser` CLI under terminal_exec (guarded above), not as
+                # distinct browser_* tools. Re-observation with identical args
+                # (re-screenshot / re-snapshot after acting) is normal browser
+                # behaviour; if the replay breaker false-positives on repeated
+                # `hive-browser ...` terminal calls, exempt them command-aware
+                # here (this list keys on tool name, which is now terminal_exec).
+                # Lookups / context reads.
+                "search_tools",
+                "search_messages",
+                "get_current_time",
+                "get_account_info",
+            }
+        )
+    )
 
     # Subagent delegation timeout (wall-clock max).
     subagent_timeout_seconds: float = 3600.0
@@ -264,9 +403,7 @@ class OutputAccumulator:
             spill_path.mkdir(parents=True, exist_ok=True)
             ext = ".json" if isinstance(value, (dict, list)) else ".txt"
             filename = f"output_{key}{ext}"
-            write_content = (
-                json.dumps(value, indent=2, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-            )
+            write_content = json.dumps(value, indent=2, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
             file_path = spill_path / filename
             file_path.write_text(write_content, encoding="utf-8")
             file_size = file_path.stat().st_size
@@ -285,10 +422,7 @@ class OutputAccumulator:
             # eventually degenerating into echoing the file path as text.
             # Keep the path accessible but frame it as plain prose.
             abs_path = str(file_path.resolve())
-            return (
-                f"Output saved at: {abs_path} ({file_size:,} bytes). "
-                f"Read the full data with read_file(path='{abs_path}')."
-            )
+            return f'Output saved at: {abs_path} ({file_size:,} bytes). Read the full data with terminal_exec("cat {abs_path}").'
 
         return await asyncio.to_thread(_spill_sync)
 

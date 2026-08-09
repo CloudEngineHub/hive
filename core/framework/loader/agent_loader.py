@@ -552,9 +552,7 @@ def get_kimi_code_token() -> str | None:
 # Antigravity IDE (native macOS/Linux app) stores OAuth tokens in its
 # VSCode-style SQLite state database under the key
 # "antigravityUnifiedStateSync.oauthToken" as a base64-encoded protobuf blob.
-ANTIGRAVITY_IDE_STATE_DB = (
-    Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
-)
+ANTIGRAVITY_IDE_STATE_DB = Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 # Linux fallback for the IDE state DB
 ANTIGRAVITY_IDE_STATE_DB_LINUX = Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 # Antigravity credentials stored by native OAuth implementation
@@ -830,9 +828,7 @@ def get_antigravity_token() -> str | None:
         _save_refreshed_antigravity_credentials(auth_data, token_data)
         return token_data["access_token"]
 
-    logger.warning(
-        "Antigravity token refresh failed. Re-open the Antigravity IDE or run 'antigravity-auth accounts add'."
-    )
+    logger.warning("Antigravity token refresh failed. Re-open the Antigravity IDE or run 'antigravity-auth accounts add'.")
     return access_token
 
 
@@ -1325,9 +1321,7 @@ class AgentLoader:
         worker_jsons = sorted(
             p
             for p in agent_path.iterdir()
-            if p.is_file()
-            and p.suffix == ".json"
-            and p.stem not in ("agent", "flowchart", "triggers", "configuration", "metadata")
+            if p.is_file() and p.suffix == ".json" and p.stem not in ("agent", "flowchart", "triggers", "configuration", "metadata")
         )
 
         if not worker_jsons:
@@ -1350,8 +1344,7 @@ class AgentLoader:
             for i, sc in enumerate(goal_data.get("success_criteria", []))
         ]
         constraints = [
-            Constraint(id=f"c-{i}", description=c, constraint_type="hard", category="general")
-            for i, c in enumerate(goal_data.get("constraints", []))
+            Constraint(id=f"c-{i}", description=c, constraint_type="hard", category="general") for i, c in enumerate(goal_data.get("constraints", []))
         ]
         goal = GoalModel(
             id=f"{agent_path.name}-goal",
@@ -1404,18 +1397,6 @@ class AgentLoader:
             credential_store=credential_store,
         )
         runner._agent_default_skills = None
-        # Colony workers attached to a SQLite task queue get the
-        # colony-progress-tracker skill pre-activated so its full
-        # claim / step / SOP-gate protocol lands in the system prompt
-        # on turn 0, bypassing the progressive-disclosure catalog
-        # lookup. Triggered by the presence of ``input_data.db_path``
-        # in worker.json (written by fork_session_into_colony and
-        # backfilled by ensure_progress_db for pre-existing colonies).
-        _preactivate: list[str] = []
-        _input_data = first_worker.get("input_data") or {}
-        if isinstance(_input_data, dict) and _input_data.get("db_path"):
-            _preactivate.append("hive.colony-progress-tracker")
-        runner._agent_skills = _preactivate or None
         return runner
 
     def register_tool(
@@ -1544,7 +1525,6 @@ class AgentLoader:
                 interactive=self._interactive,
                 skills_config=SkillsConfig.from_agent_vars(
                     default_skills=getattr(self, "_agent_default_skills", None),
-                    skills=getattr(self, "_agent_skills", None),
                 ),
                 # Surface the colony's flat ``skills/`` directory as a
                 # ``colony_ui`` extra scope so SKILL.md files written there
@@ -1574,9 +1554,7 @@ class AgentLoader:
         # Merge agent-level overrides from agent.json pipeline field
         if agent_json.exists():
             try:
-                agent_pipeline = (
-                    _json.loads(agent_json.read_text(encoding="utf-8")).get("pipeline", {}).get("stages", [])
-                )
+                agent_pipeline = _json.loads(agent_json.read_text(encoding="utf-8")).get("pipeline", {}).get("stages", [])
                 if agent_pipeline:
                     agent_stages = build_pipeline_from_config(agent_pipeline)
                     pipeline_stages.extend(agent_stages.stages)
@@ -1990,9 +1968,7 @@ class AgentLoader:
                 }
                 for sc in self.goal.success_criteria
             ],
-            constraints=[
-                {"id": c.id, "description": c.description, "type": c.constraint_type} for c in self.goal.constraints
-            ],
+            constraints=[{"id": c.id, "description": c.description, "type": c.constraint_type} for c in self.goal.constraints],
             required_tools=sorted(required_tools),
             has_tools_module=(self.agent_path / "tools.py").exists(),
         )

@@ -62,10 +62,7 @@ def _validate_image_uri(uri: str) -> dict[str, str] | None:
         return {"error": "Invalid image URI: missing scheme. Use https:// or http://"}
 
     if parsed.scheme.lower() not in ALLOWED_IMAGE_SCHEMES:
-        return {
-            "error": f"Invalid image URI scheme: '{parsed.scheme}'. "
-            f"Only {', '.join(ALLOWED_IMAGE_SCHEMES)} are allowed."
-        }
+        return {"error": f"Invalid image URI scheme: '{parsed.scheme}'. Only {', '.join(ALLOWED_IMAGE_SCHEMES)} are allowed."}
 
     # Check for valid URL format
     if not URL_PATTERN.match(uri):
@@ -115,10 +112,7 @@ class _GoogleDocsClient:
         if response.status_code == 401:
             return {"error": "Invalid or expired Google access token"}
         if response.status_code == 403:
-            return {
-                "error": "Insufficient permissions. Check your Google API scopes. "
-                "Required scopes: https://www.googleapis.com/auth/documents"
-            }
+            return {"error": "Insufficient permissions. Check your Google API scopes. Required scopes: https://www.googleapis.com/auth/documents"}
         if response.status_code == 404:
             return {"error": "Document not found"}
         if response.status_code == 429:

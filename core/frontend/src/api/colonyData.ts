@@ -6,6 +6,9 @@ export type CellValue = string | number | boolean | null;
 
 export interface ColumnInfo {
   name: string;
+  /** Human label, when the source has one (the CRM projection supplies it).
+   *  Raw SQLite tables don't, so anything rendering it falls back to `name`. */
+  label?: string;
   /** SQLite declared type (e.g. "TEXT", "INTEGER"). May be empty string. */
   type: string;
   notnull: boolean;
@@ -31,6 +34,28 @@ export interface TableRowsResponse {
   offset: number;
 }
 
+export interface ChangedRow {
+  /** Key column(s) → value(s) identifying the changed row. */
+  pk: Record<string, CellValue>;
+  op: "insert" | "update";
+}
+
+export interface TableChanges {
+  /** Distinct rows changed in the window. */
+  count: number;
+  rows: ChangedRow[];
+}
+
+export interface ChangesResponse {
+  /** Max change-log id; pass back as `since` on the next poll. */
+  cursor: number;
+  /** Tables with change triggers installed (i.e. registered tables).
+   *  Tables absent here have no row-level log — fall back to counts. */
+  covered: string[];
+  truncated: boolean;
+  tables: Record<string, TableChanges>;
+}
+
 export interface UpdateRowRequest {
   /** Primary key column(s) → value(s). All PK columns must be present. */
   pk: Record<string, CellValue>;
@@ -39,9 +64,9 @@ export interface UpdateRowRequest {
 }
 
 export const colonyDataApi = {
-  /** List user tables in the colony's progress.db with row counts.
+  /** List user tables in the colony's tracker.db with row counts.
    *
-   *  Routed by colony directory name (not session) because progress.db
+   *  Routed by colony directory name (not session) because tracker.db
    *  is per-colony — one DB serves every session for that colony, and
    *  the data is reachable even when no session is live. */
   listTables: (colonyName: string) =>
@@ -70,6 +95,14 @@ export const colonyDataApi = {
       `/colonies/${encodeURIComponent(colonyName)}/data/tables/${encodeURIComponent(table)}/rows${qs ? `?${qs}` : ""}`,
     );
   },
+
+  /** Row-level changes since a change-log cursor. `since = -1` is the
+   *  init call: returns only the current cursor + trigger coverage so
+   *  the first poll doesn't report history as new. */
+  listChanges: (colonyName: string, since: number) =>
+    api.get<ChangesResponse>(
+      `/colonies/${encodeURIComponent(colonyName)}/data/changes?since=${since}`,
+    ),
 
   /** Update a single row by primary key. Returns {updated: 0|1}. */
   updateRow: (colonyName: string, table: string, body: UpdateRowRequest) =>

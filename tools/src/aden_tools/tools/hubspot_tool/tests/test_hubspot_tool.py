@@ -273,9 +273,7 @@ class TestContactTools:
 
     @patch("aden_tools.tools.hubspot_tool.hubspot_tool.httpx.post")
     def test_search_contacts(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"total": 1, "results": [{"id": "1"}]})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"total": 1, "results": [{"id": "1"}]}))
         result = self._fn("hubspot_search_contacts")(query="john")
         assert result["total"] == 1
 

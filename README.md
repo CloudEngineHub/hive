@@ -97,7 +97,7 @@ Use Hive when the bottleneck is no longer the model but the harness around it:
 
 - Python 3.11+ for agent development
 - An LLM provider that powers the agents
-- **ripgrep (optional, recommended on Windows):** The `search_files` tool uses ripgrep for faster file search. If not installed, a Python fallback is used. On Windows: `winget install BurntSushi.ripgrep` or `scoop install ripgrep`
+- **ripgrep (optional, recommended on Windows):** The `terminal_rg` / `terminal_glob` search tools use ripgrep for faster file search. If not installed, a Python fallback is used. On Windows: `winget install BurntSushi.ripgrep` or `scoop install ripgrep`
 
 > **Windows Users:** Native Windows is supported via `quickstart.ps1` and `hive.ps1`. Run these in PowerShell 5.1+. WSL is also an option but not required.
 

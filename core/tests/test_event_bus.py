@@ -7,7 +7,7 @@ concurrency handling, history operations, and convenience publishers.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -15,6 +15,8 @@ from framework.host.event_bus import (
     AgentEvent,
     EventBus,
     EventType,
+    _event_to_disk_dict,
+    collect_resolved_request_seqs,
 )
 
 
@@ -833,28 +835,6 @@ class TestConveniencePublishers:
         assert received[0].data["iteration"] == 3
 
     @pytest.mark.asyncio
-    async def test_emit_node_action_plan(self):
-        """emit_node_action_plan publishes correct event."""
-        bus = EventBus()
-        received = []
-
-        async def handler(event: AgentEvent) -> None:
-            received.append(event)
-
-        bus.subscribe(event_types=[EventType.NODE_ACTION_PLAN], handler=handler)
-
-        await bus.emit_node_action_plan(
-            stream_id="test_stream",
-            node_id="node_1",
-            plan="1. Search for data\n2. Analyze results\n3. Generate report",
-            execution_id="exec_1",
-        )
-
-        assert len(received) == 1
-        assert received[0].type == EventType.NODE_ACTION_PLAN
-        assert received[0].data["plan"] == "1. Search for data\n2. Analyze results\n3. Generate report"
-
-    @pytest.mark.asyncio
     async def test_emit_subagent_report(self):
         """emit_subagent_report publishes correct event."""
         bus = EventBus()
@@ -909,7 +889,6 @@ class TestEventType:
         assert EventType.NODE_TOOL_DOOM_LOOP
         assert EventType.ESCALATION_REQUESTED
         assert EventType.LLM_TURN_COMPLETE
-        assert EventType.NODE_ACTION_PLAN
         assert EventType.WORKER_COLONY_LOADED
         assert EventType.CREDENTIALS_REQUIRED
         assert EventType.EXECUTION_RESURRECTED
@@ -917,3 +896,497 @@ class TestEventType:
         assert EventType.SUBAGENT_REPORT
         assert EventType.TRIGGER_AVAILABLE
         assert EventType.TRIGGER_FIRED
+
+
+class TestEventToDiskDict:
+    """`_event_to_disk_dict` — what actually gets persisted to events.jsonl."""
+
+    def test_strips_full_request_from_persisted_event(self) -> None:
+        """`full_request` is the entire LLM prompt re-serialised on every
+        context tick — it must never reach events.jsonl."""
+        event = AgentEvent(
+            type=EventType.CONTEXT_USAGE_UPDATED,
+            stream_id="queen",
+            node_id="queen",
+            data={
+                "usage_pct": 73,
+                "estimated_tokens": 1234,
+                "full_request": {"messages": ["the", "whole", "context"]},
+            },
+        )
+        disk = _event_to_disk_dict(event)
+        assert "full_request" not in disk["data"]
+        # The real metrics survive.
+        assert disk["data"]["usage_pct"] == 73
+        assert disk["data"]["estimated_tokens"] == 1234
+
+    def test_does_not_mutate_the_live_event(self) -> None:
+        """The live SSE broadcast still carries the full event — only the
+        on-disk copy is trimmed."""
+        event = AgentEvent(
+            type=EventType.CONTEXT_USAGE_UPDATED,
+            stream_id="queen",
+            node_id="queen",
+            data={"usage_pct": 10, "full_request": {"big": "payload"}},
+        )
+        _event_to_disk_dict(event)
+        assert event.data["full_request"] == {"big": "payload"}
+
+    def test_ordinary_event_passes_through_unchanged(self) -> None:
+        event = AgentEvent(
+            type=EventType.CLIENT_INPUT_RECEIVED,
+            stream_id="queen",
+            node_id="queen",
+            data={"content": "hello"},
+        )
+        disk = _event_to_disk_dict(event)
+        assert disk["data"] == {"content": "hello"}
+
+
+# ---------------------------------------------------------------------------
+# collect_resolved_request_seqs
+# ---------------------------------------------------------------------------
+class TestCollectResolvedRequestSeqs:
+    """`collect_resolved_request_seqs` — which CLIENT_INPUT_REQUESTED events
+    the SSE replay must suppress because they've already been answered.
+
+    Getting this wrong has a concrete user-visible cost: an un-suppressed
+    request is replayed on reconnect and re-pops a question modal the user
+    already dismissed. So these tests pin *resolution*, not mechanics.
+    """
+
+    async def _publish(self, bus: EventBus, event_type: EventType) -> None:
+        await bus.publish(AgentEvent(type=event_type, stream_id="queen", node_id="queen"))
+
+    @pytest.mark.asyncio
+    async def test_answered_request_is_resolved(self) -> None:
+        """A request followed by an answer is suppressed from replay."""
+        bus = EventBus()
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)
+        await self._publish(bus, EventType.CLIENT_INPUT_RECEIVED)
+        assert collect_resolved_request_seqs(bus) == {1}
+
+    @pytest.mark.asyncio
+    async def test_unanswered_request_is_not_resolved(self) -> None:
+        """A still-open question must keep replaying so the user can answer."""
+        bus = EventBus()
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)
+        assert collect_resolved_request_seqs(bus) == set()
+
+    @pytest.mark.asyncio
+    async def test_one_answer_resolves_every_duplicate_request(self) -> None:
+        """The regression guard: re-emits of the SAME question (one per
+        resume, one per spurious re-wait) all land before a single answer.
+        Resolving only the latest would orphan the earlier duplicates, and
+        the SSE replay would re-pop the question the user already answered.
+        """
+        bus = EventBus()
+        # The same question, re-emitted three times before any answer.
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)  # seq 1
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)  # seq 2
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)  # seq 3
+        await self._publish(bus, EventType.CLIENT_INPUT_RECEIVED)  # seq 4
+        # Every duplicate is resolved — none survives to be replayed.
+        assert collect_resolved_request_seqs(bus) == {1, 2, 3}
+
+    @pytest.mark.asyncio
+    async def test_a_later_unanswered_question_stays_open(self) -> None:
+        """An answer resolves only the questions that preceded it — a fresh
+        question asked afterwards is still pending."""
+        bus = EventBus()
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)  # seq 1
+        await self._publish(bus, EventType.CLIENT_INPUT_RECEIVED)  # seq 2
+        await self._publish(bus, EventType.CLIENT_INPUT_REQUESTED)  # seq 3 — new
+        assert collect_resolved_request_seqs(bus) == {1}
+
+
+# compute_session_snapshot — park_reason (read from the loop-state cell)
+# ---------------------------------------------------------------------------
+class TestSessionSnapshotParkReason:
+    """``park_reason`` comes from the loop's LOOP_STATE_CHANGED
+    announcement (cached in ``_latest_loop_state``), NOT from
+    CLIENT_INPUT_REQUESTED. The debug panel can tell a healthy park from
+    a broken one because the loop labels it at the source."""
+
+    @pytest.mark.asyncio
+    async def test_park_reason_captured_from_loop_state(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "interrupted", "park_reason": "llm_error"},
+            )
+        )
+        snap = compute_session_snapshot(bus)
+        assert snap["interrupted"] is True
+        assert snap["park_reason"] == "llm_error"
+
+    @pytest.mark.asyncio
+    async def test_park_reason_cleared_when_loop_resumes(self) -> None:
+        """A new LOOP_STATE_CHANGED to EXECUTING overwrites the cell —
+        park_reason from the previous parked announcement is gone."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "awaiting_user", "park_reason": "ask_user"},
+            )
+        )
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "executing"},
+            )
+        )
+        snap = compute_session_snapshot(bus)
+        assert snap["is_executing"] is True
+        assert snap["awaiting_input"] is False
+        assert snap["park_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_client_input_requested_does_not_set_park_reason(self) -> None:
+        """Discipline check: CLIENT_INPUT_REQUESTED carries park_reason on
+        the wire for the renderer's question modal, but the snapshot is
+        the loop's verdict only. Without a LOOP_STATE_CHANGED, the
+        snapshot reports no activity and no park_reason — even when a
+        CLIENT_INPUT_REQUESTED has a park_reason field."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.CLIENT_INPUT_REQUESTED,
+                stream_id="queen",
+                data={"park_reason": "llm_error"},
+            )
+        )
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] is None
+        assert snap["awaiting_input"] is False
+        assert snap["interrupted"] is False
+        assert snap["park_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_park_reason_absent_when_no_state_announced(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="queen"))
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] is None
+        assert snap["awaiting_input"] is False
+        assert snap["park_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# compute_session_snapshot — authoritative 3-state activity model
+# ---------------------------------------------------------------------------
+class TestSessionSnapshotActivity:
+    """The snapshot derives is_executing / awaiting_input / interrupted from
+    the latest LOOP_STATE_CHANGED event. The three are structurally mutually
+    exclusive — exactly one is ever true."""
+
+    @staticmethod
+    def _state_event(
+        activity: str,
+        *,
+        stream_id: str = "queen",
+        park_reason: str | None = None,
+        interrupt_cause: str | None = None,
+    ) -> AgentEvent:
+        return AgentEvent(
+            type=EventType.LOOP_STATE_CHANGED,
+            stream_id=stream_id,
+            data={
+                "activity": activity,
+                "park_reason": park_reason,
+                "interrupt_cause": interrupt_cause,
+            },
+        )
+
+    @staticmethod
+    def _assert_exactly_one(snap: dict) -> None:
+        flags = [snap["is_executing"], snap["awaiting_input"], snap["interrupted"]]
+        assert sum(1 for f in flags if f) == 1, flags
+
+    @pytest.mark.asyncio
+    async def test_executing(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("executing"))
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] == "executing"
+        assert snap["is_executing"] is True
+        self._assert_exactly_one(snap)
+
+    @pytest.mark.asyncio
+    async def test_awaiting_user(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("awaiting_user", park_reason="turn_done"))
+        snap = compute_session_snapshot(bus)
+        assert snap["awaiting_input"] is True
+        assert snap["park_reason"] == "turn_done"
+        self._assert_exactly_one(snap)
+
+    @pytest.mark.asyncio
+    async def test_interrupted(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("interrupted", interrupt_cause="stream_stall"))
+        snap = compute_session_snapshot(bus)
+        assert snap["interrupted"] is True
+        assert snap["interrupt_cause"] == "stream_stall"
+        assert snap["queen_busy_reason"] == "interrupted"
+        self._assert_exactly_one(snap)
+
+    @pytest.mark.asyncio
+    async def test_llm_error_park_is_not_awaiting_input(self) -> None:
+        """Regression for the named bug: a broken (LLM error) park reports
+        interrupted, NOT awaiting_input."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("interrupted", park_reason="llm_error"))
+        snap = compute_session_snapshot(bus)
+        assert snap["awaiting_input"] is False
+        assert snap["interrupted"] is True
+        assert snap["park_reason"] == "llm_error"
+
+    @pytest.mark.asyncio
+    async def test_latest_state_event_wins(self) -> None:
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("interrupted", interrupt_cause="llm_error"))
+        await bus.publish(self._state_event("executing"))
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] == "executing"
+        assert snap["interrupted"] is False
+
+    @pytest.mark.asyncio
+    async def test_worker_state_event_ignored(self) -> None:
+        """A worker-stream LOOP_STATE_CHANGED never moves the queen snapshot."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("executing"))
+        await bus.publish(self._state_event("interrupted", stream_id="worker-1", interrupt_cause="crashed"))
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] == "executing"
+        assert snap["interrupted"] is False
+
+    @pytest.mark.asyncio
+    async def test_stale_executing_becomes_interrupted(self) -> None:
+        """A loop that announced EXECUTING but emitted nothing for the
+        staleness window is reclassified INTERRUPTED/stale — a hard crash
+        cannot self-announce."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("executing"))
+        bus._event_history[-1].timestamp = datetime.now() - timedelta(seconds=400)
+        snap = compute_session_snapshot(bus)
+        assert snap["interrupted"] is True
+        assert snap["interrupt_cause"] == "stale"
+        assert snap["is_executing"] is False
+
+    @pytest.mark.asyncio
+    async def test_stale_awaiting_user_left_alone(self) -> None:
+        """A stale AWAITING_USER is NOT reclassified — the user simply
+        hasn't replied yet."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(self._state_event("awaiting_user", park_reason="turn_done"))
+        bus._event_history[-1].timestamp = datetime.now() - timedelta(seconds=400)
+        snap = compute_session_snapshot(bus)
+        assert snap["awaiting_input"] is True
+        assert snap["interrupted"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_state_announced_reports_no_activity(self) -> None:
+        """Discipline: if the loop has never emitted LOOP_STATE_CHANGED,
+        the snapshot reports ``activity=None`` and all flags False — it
+        does NOT guess from EXECUTION_STARTED or other side-effect
+        events. Re-derivation was the previous bug; the cell is now the
+        single source of truth."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="queen"))
+        await bus.publish(AgentEvent(type=EventType.TOOL_CALL_STARTED, stream_id="queen", data={"tool_use_id": "t1", "tool_name": "ls"}))
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] is None
+        assert snap["is_executing"] is False
+        assert snap["awaiting_input"] is False
+        assert snap["interrupted"] is False
+        # Side-effect data is still walked, so the tool is visible.
+        assert snap["current_tool_calls"] == []  # cleared because not is_executing
+
+
+# ---------------------------------------------------------------------------
+# EventBus._latest_loop_state — the sticky LoopActivity cell
+# ---------------------------------------------------------------------------
+class TestLatestLoopStateCell:
+    """The cell is the single bridge between the loop's announcement and
+    the snapshot. Its job: survive ring-buffer eviction, ignore worker
+    streams, mirror exactly what was published."""
+
+    @pytest.mark.asyncio
+    async def test_cell_starts_none(self) -> None:
+        bus = EventBus()
+        assert bus._latest_loop_state is None
+
+    @pytest.mark.asyncio
+    async def test_cell_written_on_loop_state_changed(self) -> None:
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                node_id="queen",
+                data={
+                    "activity": "interrupted",
+                    "park_reason": "user_stopped",
+                    "interrupt_cause": None,
+                },
+            )
+        )
+        cell = bus._latest_loop_state
+        assert cell is not None
+        assert cell["activity"] == "interrupted"
+        assert cell["park_reason"] == "user_stopped"
+        assert cell["interrupt_cause"] is None
+        assert cell["stream_id"] == "queen"
+
+    @pytest.mark.asyncio
+    async def test_cell_overwritten_by_later_announcement(self) -> None:
+        """Each LOOP_STATE_CHANGED replaces the cell wholesale — partial
+        merges would let stale park_reason / interrupt_cause leak past a
+        transition."""
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "interrupted", "park_reason": "user_stopped"},
+            )
+        )
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "executing"},
+            )
+        )
+        cell = bus._latest_loop_state
+        assert cell["activity"] == "executing"
+        assert cell["park_reason"] is None
+        assert cell["interrupt_cause"] is None
+
+    @pytest.mark.asyncio
+    async def test_cell_ignores_worker_stream(self) -> None:
+        """Workers run their own LoopActivity but it must not overwrite
+        the queen's state in the snapshot's authoritative cell."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "executing"},
+            )
+        )
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="worker-1",
+                data={"activity": "interrupted", "interrupt_cause": "crashed"},
+            )
+        )
+        cell = bus._latest_loop_state
+        assert cell["activity"] == "executing"  # worker did NOT overwrite
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] == "executing"
+        assert snap["interrupted"] is False
+
+    @pytest.mark.asyncio
+    async def test_cell_survives_ring_buffer_eviction(self) -> None:
+        """The whole reason the cell exists: when the LOOP_STATE_CHANGED
+        event ages out of the bounded event history, the snapshot still
+        reflects the loop's last announcement. Without the cell, an
+        aged-out announcement would force the snapshot into a "no
+        activity" verdict and the renderer's debug panel would go dark
+        mid-session."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        # Small buffer so we can blow past it cheaply.
+        bus = EventBus(max_history=4)
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "awaiting_user", "park_reason": "turn_done"},
+            )
+        )
+        # Now flood the buffer past max_history.
+        for i in range(10):
+            await bus.publish(
+                AgentEvent(
+                    type=EventType.TOOL_CALL_STARTED,
+                    stream_id="queen",
+                    data={"tool_use_id": f"t{i}", "tool_name": "noop"},
+                )
+            )
+
+        # The LOOP_STATE_CHANGED event is no longer in history…
+        types_in_history = [e.type for e in bus._event_history]
+        assert EventType.LOOP_STATE_CHANGED not in types_in_history
+
+        # …but the cell preserves the loop's verdict.
+        snap = compute_session_snapshot(bus)
+        assert snap["activity"] == "awaiting_user"
+        assert snap["awaiting_input"] is True
+        assert snap["park_reason"] == "turn_done"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_does_not_re_derive_from_events(self) -> None:
+        """Discipline regression: even with a parade of EXECUTION_STARTED
+        / TOOL_CALL_STARTED events, the snapshot reports whatever the
+        cell says — including ``interrupted=True`` while side-effect
+        events suggest activity. The cell wins; the events do not."""
+        from framework.host.event_bus import compute_session_snapshot
+
+        bus = EventBus()
+        await bus.publish(AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="queen"))
+        await bus.publish(AgentEvent(type=EventType.TOOL_CALL_STARTED, stream_id="queen", data={"tool_use_id": "t1", "tool_name": "ls"}))
+        await bus.publish(
+            AgentEvent(
+                type=EventType.LOOP_STATE_CHANGED,
+                stream_id="queen",
+                data={"activity": "interrupted", "park_reason": "user_stopped"},
+            )
+        )
+        # More events that USED TO flip is_executing in the legacy walk.
+        await bus.publish(AgentEvent(type=EventType.TOOL_CALL_COMPLETED, stream_id="queen", data={"tool_use_id": "t1"}))
+        await bus.publish(AgentEvent(type=EventType.NODE_LOOP_ITERATION, stream_id="queen"))
+
+        snap = compute_session_snapshot(bus)
+        # The cell still says interrupted; the trailing side-effect events
+        # do NOT re-derive is_executing.
+        assert snap["activity"] == "interrupted"
+        assert snap["is_executing"] is False
+        assert snap["interrupted"] is True
+        assert snap["park_reason"] == "user_stopped"

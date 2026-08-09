@@ -1,8 +1,7 @@
 """Wire task tools into a ToolRegistry.
 
 The four session task tools are registered for every agent that gets a
-ToolRegistry. The colony template tools are queen-only and registered
-separately by ``register_colony_template_tools``.
+ToolRegistry.
 """
 
 from __future__ import annotations
@@ -34,15 +33,21 @@ def register_task_tools(
     registry: ToolRegistry,
     *,
     store: TaskStore | None = None,
+    pivot_handler=None,
 ) -> None:
     """Register the four session task tools on ``registry``.
 
     Idempotent: re-registering overwrites the previous executor (which is
     fine — they share the same TaskStore singleton anyway).
+
+    ``pivot_handler`` — passed through to ``build_session_tools``. When
+    set (queen only), ``task_create`` gains the handler's pivot field
+    (``new_session`` for DM, ``new_colony`` for colony queens) for
+    forking the plan into a fresh context.
     """
     from framework.tasks.tools.session_tools import build_session_tools
 
-    pairs = build_session_tools(store=store)
+    pairs = build_session_tools(store=store, pivot_handler=pivot_handler)
     for tool, async_executor in pairs:
         registry.register(tool.name, tool, _wrap_async_executor(async_executor))
         # Also stamp into the concurrency-safe set if appropriate so the
@@ -53,22 +58,3 @@ def register_task_tools(
             # object itself (already done) and trust the dispatcher to read it.
             pass
     logger.debug("Registered task tools on %s", registry)
-
-
-def register_colony_template_tools(
-    registry: ToolRegistry,
-    *,
-    colony_id: str,
-    store: TaskStore | None = None,
-) -> None:
-    """Register the queen-only colony_template_* tools on ``registry``.
-
-    Should only be called for the queen of a colony — workers and queen-DM
-    do not get these tools.
-    """
-    from framework.tasks.tools.colony_tools import build_colony_template_tools
-
-    pairs = build_colony_template_tools(colony_id=colony_id, store=store)
-    for tool, async_executor in pairs:
-        registry.register(tool.name, tool, _wrap_async_executor(async_executor))
-    logger.debug("Registered colony_template_* tools (colony_id=%s)", colony_id)

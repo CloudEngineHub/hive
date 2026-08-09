@@ -17,7 +17,7 @@ export NOTION_API_TOKEN=your-notion-integration-token
 
 **Important:** You must share each page or database with your integration. Open the page in Notion, click the `...` menu, select "Connections", and add your integration.
 
-Alternatively, configure via the credential store (`CredentialStoreAdapter`) using the key `notion_token`.
+Alternatively, configure via the credential store (`CredentialStoreAdapter`) using the key `notion`.
 
 ## Tools (13)
 

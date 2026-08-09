@@ -138,10 +138,7 @@ def register_tools(mcp: FastMCP) -> None:
                 spec = json.loads(spec)
             except json.JSONDecodeError as exc:
                 return {
-                    "error": (
-                        f"spec was a string but not valid JSON: {exc}. "
-                        "Pass the spec as a dict, not a JSON-encoded string."
-                    ),
+                    "error": (f"spec was a string but not valid JSON: {exc}. Pass the spec as a dict, not a JSON-encoded string."),
                     "kind": kind,
                     "spec": spec,
                 }

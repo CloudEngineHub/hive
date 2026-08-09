@@ -146,17 +146,13 @@ def register_skill_commands(subparsers) -> None:
     init_parser.set_defaults(func=cmd_skill_init)
 
     # hive skill validate
-    validate_parser = skill_sub.add_parser(
-        "validate", help="Strictly validate a SKILL.md against the Agent Skills spec"
-    )
+    validate_parser = skill_sub.add_parser("validate", help="Strictly validate a SKILL.md against the Agent Skills spec")
     validate_parser.add_argument("path", help="Path to SKILL.md or its parent directory")
     validate_parser.add_argument("--json", action="store_true", help="Output as JSON")
     validate_parser.set_defaults(func=cmd_skill_validate)
 
     # hive skill doctor
-    doctor_parser = skill_sub.add_parser(
-        "doctor", help="Health-check skills (parseable, scripts executable, tools available)"
-    )
+    doctor_parser = skill_sub.add_parser("doctor", help="Health-check skills (parseable, scripts executable, tools available)")
     doctor_parser.add_argument(
         "name",
         nargs="?",

@@ -513,24 +513,12 @@ def register_tools(
             endpoints.append(
                 {
                     "name": ep.get("name", ""),
-                    "model": (
-                        ep.get("model", {}).get("repository", "")
-                        if isinstance(ep.get("model"), dict)
-                        else ep.get("model", "")
-                    ),
-                    "status": (
-                        ep.get("status", {}).get("state", "")
-                        if isinstance(ep.get("status"), dict)
-                        else ep.get("status", "")
-                    ),
+                    "model": (ep.get("model", {}).get("repository", "") if isinstance(ep.get("model"), dict) else ep.get("model", "")),
+                    "status": (ep.get("status", {}).get("state", "") if isinstance(ep.get("status"), dict) else ep.get("status", "")),
                     "url": (ep.get("status", {}).get("url", "") if isinstance(ep.get("status"), dict) else ""),
                     "type": ep.get("type", ""),
-                    "provider": (
-                        ep.get("provider", {}).get("vendor", "") if isinstance(ep.get("provider"), dict) else ""
-                    ),
-                    "region": (
-                        ep.get("provider", {}).get("region", "") if isinstance(ep.get("provider"), dict) else ""
-                    ),
+                    "provider": (ep.get("provider", {}).get("vendor", "") if isinstance(ep.get("provider"), dict) else ""),
+                    "region": (ep.get("provider", {}).get("region", "") if isinstance(ep.get("provider"), dict) else ""),
                 }
             )
         return {"endpoints": endpoints, "count": len(endpoints)}

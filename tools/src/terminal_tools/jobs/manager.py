@@ -115,10 +115,7 @@ class JobManager:
     ) -> JobRecord:
         """Spawn a process and start pumping its output into ring buffers."""
         if self.active_count() >= self._max_jobs:
-            raise JobLimitExceeded(
-                f"terminal-tools job cap reached ({self._max_jobs}). "
-                "Wait for a job to finish or raise TERMINAL_TOOLS_MAX_JOBS."
-            )
+            raise JobLimitExceeded(f"terminal-tools job cap reached ({self._max_jobs}). Wait for a job to finish or raise TERMINAL_TOOLS_MAX_JOBS.")
 
         proc = self._spawn(command, cwd=cwd, env=env, shell=shell, merge_stderr=merge_stderr, preexec_fn=preexec_fn)
         record = self._adopt(proc, command, name=name, merged=merge_stderr)
@@ -148,9 +145,7 @@ class JobManager:
                 proc.terminate()
             except Exception:
                 pass
-            raise JobLimitExceeded(
-                f"terminal-tools job cap reached ({self._max_jobs}); foreground exec was killed during auto-promotion."
-            )
+            raise JobLimitExceeded(f"terminal-tools job cap reached ({self._max_jobs}); foreground exec was killed during auto-promotion.")
         record = self._wrap(
             proc,
             command,
@@ -222,7 +217,16 @@ class JobManager:
         try:
             record.proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
-            pass
+            return record
+        # The process has exited, but ``exited_at`` / ``exit_code`` and the
+        # final ring-buffer bytes are stamped by the separate _watch_for_exit
+        # thread (which drains the pumps first). Without bridging that gap the
+        # caller races and reads status="running"/exit_code=None for a job
+        # that's actually done — visible on Windows where pump EOF lags the
+        # process exit. Give the watcher a bounded moment to finalize.
+        deadline = time.monotonic() + 5.0
+        while record.exited_at is None and time.monotonic() < deadline:
+            time.sleep(0.01)
         return record
 
     def shutdown_all(self, grace_sec: float = 2.0) -> None:
@@ -257,17 +261,24 @@ class JobManager:
         merge_stderr: bool,
         preexec_fn,
     ) -> subprocess.Popen[bytes]:
-        # Resolve shell: a string shell is coerced to ``[<shell>, "-c", command]``,
-        # bool=True means /bin/bash with the same shape.
-        from terminal_tools.common.limits import _resolve_shell
+        # Resolve shell: a string shell is coerced to ``[<shell>, <prefix>, command]``,
+        # bool=True means the platform shell (POSIX bash; Windows Git Bash →
+        # PowerShell → cmd) with the appropriate invocation flags.
+        from terminal_tools.common.limits import resolve_shell_spec
 
-        resolved = _resolve_shell(shell)
-        if resolved is not None:
+        spec = resolve_shell_spec(shell)
+        # Windows has no useful direct-exec path (see exec.py) — route
+        # coreutil-style jobs through the resolved platform shell so they
+        # reach a real interpreter instead of FileNotFound.
+        if spec.executable is None and os.name == "nt":
+            spec = resolve_shell_spec(True)
+
+        if spec.executable is not None:
             if isinstance(command, (list, tuple)):
                 command_str = " ".join(str(c) for c in command)
             else:
                 command_str = str(command)
-            argv: list[str] = [resolved, "-c", command_str]
+            argv: list[str] = [spec.executable, *spec.argv_prefix, command_str]
             shell_arg = False
         else:
             argv = list(command) if isinstance(command, (list, tuple)) else command  # type: ignore[assignment]
@@ -277,6 +288,9 @@ class JobManager:
             argv,
             cwd=cwd,
             env=env,
+            # Fresh stdin pipe (so terminal_job_manage(action="stdin") works) —
+            # NOT inherited, so a background job can't grab the MCP server's
+            # JSON-RPC stdin the way the exec path's old stdin=None did.
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE),
@@ -284,6 +298,8 @@ class JobManager:
             preexec_fn=preexec_fn,
             close_fds=True,
             bufsize=0,
+            # Headless: don't pop or attach a console for the child process.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def _adopt(
@@ -398,12 +414,7 @@ def _default_name(command: str | Sequence[str]) -> str:
 
 
 _SIGNAL_NUMBERS = {
-    signal.SIGINT,
-    signal.SIGTERM,
-    signal.SIGKILL,
-    signal.SIGHUP,
-    signal.SIGUSR1,
-    signal.SIGUSR2,
+    sig for name in ("SIGINT", "SIGTERM", "SIGKILL", "SIGHUP", "SIGUSR1", "SIGUSR2") if (sig := getattr(signal, name, None)) is not None
 }
 
 

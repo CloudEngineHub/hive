@@ -155,7 +155,7 @@ class TestPhaseAwareCompaction:
                 }
             ],
         )
-        await conv.add_tool_result("call_1", "x" * 20000)  # big tool result
+        await conv.add_tool_result("call_1", "x" * 20000, spillover_path="/data/search_1.txt")  # big tool result
 
         # Transition marker
         await conv.add_user_message(
@@ -196,7 +196,7 @@ class TestPhaseAwareCompaction:
             "tool call",
             tool_calls=[{"id": "c1", "type": "function", "function": {"name": "s", "arguments": "{}"}}],
         )
-        await conv.add_tool_result("c1", "old_data " * 5000)
+        await conv.add_tool_result("c1", "old_data " * 5000, spillover_path="/data/s_old.txt")
 
         # Current phase
         conv.set_current_phase("report")
@@ -229,7 +229,7 @@ class TestPhaseAwareCompaction:
             "tool call",
             tool_calls=[{"id": "c1", "type": "function", "function": {"name": "s", "arguments": "{}"}}],
         )
-        await conv.add_tool_result("c1", "data " * 5000)  # ~6250 tokens
+        await conv.add_tool_result("c1", "data " * 5000, spillover_path="/data/s1.txt")  # ~6250 tokens
 
         await conv.add_assistant_message(
             "another tool call",
@@ -252,7 +252,7 @@ class TestPhaseAwareCompaction:
             "tool call",
             tool_calls=[{"id": "c1", "type": "function", "function": {"name": "s", "arguments": "{}"}}],
         )
-        await conv.add_tool_result("c1", "data " * 5000)
+        await conv.add_tool_result("c1", "data " * 5000, spillover_path="/data/s1.txt")
 
         # Switch to new phase so research messages become pruneable
         conv.set_current_phase("report")
@@ -266,3 +266,23 @@ class TestPhaseAwareCompaction:
 
         pruned_msg = [m for m in conv.messages if m.content.startswith("Pruned")][0]
         assert pruned_msg.phase_id == "research"
+
+    @pytest.mark.asyncio
+    async def test_pathless_result_not_pruned(self):
+        """Recoverability invariant: a result with no spill path is left intact
+        rather than stranded as an unrecoverable 'Pruned tool result'."""
+        conv = NodeConversation(system_prompt="test")
+        conv.set_current_phase("research")
+        await conv.add_assistant_message(
+            "tool call",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "s", "arguments": "{}"}}],
+        )
+        # No spillover_path and no path in text → not recoverable → not pruned.
+        await conv.add_tool_result("c1", "big_unrecoverable " * 5000)
+        conv.set_current_phase("report")
+
+        pruned = await conv.prune_old_tool_results(protect_tokens=0, min_prune_tokens=100)
+        assert pruned == 0
+        tool = [m for m in conv.messages if m.role == "tool"][0]
+        assert tool.content.startswith("big_unrecoverable")
+        assert not tool.content.startswith("Pruned")

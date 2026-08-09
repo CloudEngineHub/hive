@@ -822,9 +822,7 @@ def register_tools(
             return {
                 "error": "Linear credentials not configured",
                 "help": (
-                    "Set LINEAR_API_KEY environment variable "
-                    "or configure via credential store. "
-                    "Get an API key at https://linear.app/settings/api"
+                    "Set LINEAR_API_KEY environment variable or configure via credential store. Get an API key at https://linear.app/settings/api"
                 ),
             }
         return _LinearClient(api_key)

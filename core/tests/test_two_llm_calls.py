@@ -108,11 +108,7 @@ SCAN_TOOLS = [
             "properties": {
                 "scan_results": {
                     "type": "string",
-                    "description": (
-                        "JSON string with consolidated scan results"
-                        " including ssl, headers, dns, ports, tech,"
-                        " and subdomain data."
-                    ),
+                    "description": ("JSON string with consolidated scan results including ssl, headers, dns, ports, tech, and subdomain data."),
                 },
             },
             "required": ["scan_results"],

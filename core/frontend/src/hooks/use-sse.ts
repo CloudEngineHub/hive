@@ -1,11 +1,25 @@
 import { useEffect, useRef, useCallback, useState } from "react";
+import { subscribeSse } from "@/api/client";
 import type { AgentEvent, EventTypeName } from "@/api/types";
+import { trace as traceLoad } from "@/lib/session-load-trace";
 
 interface UseSSEOptions {
   sessionId: string;
   eventTypes?: EventTypeName[];
   onEvent?: (event: AgentEvent) => void;
   enabled?: boolean;
+  /**
+   * Opt in to a specific worker's per-turn chatter (text deltas, tool calls).
+   *
+   * By default the server sends only worker META events (start / progress /
+   * finish) — enough to render a worker's bubble, and nothing more. Pass a
+   * stream id (`worker:<uuid>`) to also receive that ONE worker's detail, or
+   * `"*"` for every worker (debug only).
+   *
+   * This exists because the runtime may live on another machine: a human can
+   * only look at one worker at a time, so we only pay to ship one.
+   */
+  watch?: string;
 }
 
 export function useSSE({
@@ -13,10 +27,11 @@ export function useSSE({
   eventTypes,
   onEvent,
   enabled = true,
+  watch,
 }: UseSSEOptions) {
   const [connected, setConnected] = useState(false);
   const [lastEvent, setLastEvent] = useState<AgentEvent | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const unsubscribeRef = useRef<(() => void) | null>(null);
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
 
@@ -25,112 +40,285 @@ export function useSSE({
   useEffect(() => {
     if (!enabled || !sessionId) return;
 
-    let url = `/api/sessions/${sessionId}/events`;
-    if (eventTypes?.length) {
-      url += `?types=${eventTypes.join(",")}`;
-    }
+    const params = new URLSearchParams();
+    if (eventTypes?.length) params.set("types", eventTypes.join(","));
+    if (watch) params.set("watch", watch);
+    const qs = params.toString();
+    const path = `/sessions/${sessionId}/events${qs ? `?${qs}` : ""}`;
 
-    const es = new EventSource(url);
-    eventSourceRef.current = es;
+    let cancelled = false;
+    let localUnsub: (() => void) | null = null;
 
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
-
-    const handler = (e: MessageEvent) => {
-      try {
-        const event: AgentEvent = JSON.parse(e.data);
-        setLastEvent(event);
-        onEventRef.current?.(event);
-      } catch {
-        // Ignore parse errors (keepalive comments)
+    subscribeSse(path, {
+      onOpen: () => setConnected(true),
+      onEvent: (_evt, data) => {
+        try {
+          const event: AgentEvent = JSON.parse(data);
+          setLastEvent(event);
+          onEventRef.current?.(event);
+        } catch {
+          // Ignore parse errors (keepalive comments)
+        }
+      },
+      onError: () => setConnected(false),
+      onClose: () => setConnected(false),
+    }).then((unsub) => {
+      if (cancelled) {
+        unsub();
+        return;
       }
-    };
-
-    es.onmessage = handler;
+      localUnsub = unsub;
+      unsubscribeRef.current = unsub;
+    });
 
     return () => {
-      es.close();
-      eventSourceRef.current = null;
+      cancelled = true;
+      localUnsub?.();
+      unsubscribeRef.current = null;
       setConnected(false);
     };
-  }, [sessionId, enabled, typesKey]);
+  }, [sessionId, enabled, typesKey, watch]);
 
   const close = useCallback(() => {
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
+    unsubscribeRef.current?.();
+    unsubscribeRef.current = null;
     setConnected(false);
   }, []);
 
   return { connected, lastEvent, close };
 }
 
-// --- Multi-session SSE hook ---
+// --- Global app-wide SSE hook ---
 
-interface UseMultiSSEOptions {
-  /** Map of agentType → backendSessionId. Only non-empty IDs get an EventSource. */
-  sessions: Record<string, string>;
-  onEvent: (agentType: string, event: AgentEvent) => void;
+/** Event types streamed by the global SSE channel (see backend
+ * `_GLOBAL_EVENT_TYPES` in routes_events.py). Cross-cutting events
+ * that aren't scoped to a particular session — credential
+ * connect/disconnect, tool catalog refreshes, tools-config edits in
+ * other tabs/windows, CRM writes made by an agent's `hive-crm` CLI. */
+const GLOBAL_EVENT_TYPES: ReadonlySet<EventTypeName> = new Set<EventTypeName>([
+  "credential_provider_connected",
+  "credential_provider_disconnected",
+  "tool_catalog_refreshed",
+  "tools_config_changed",
+  "crm_changed",
+]);
+
+interface UseGlobalEventsOptions {
+  /** Subset of GLOBAL_EVENT_TYPES to react to. Omit to receive all
+   * global events. */
+  eventTypes?: readonly EventTypeName[];
+  onEvent: (event: AgentEvent) => void;
+  enabled?: boolean;
 }
 
 /**
- * Manages one EventSource per loaded session. Diffs `sessions` on each render:
- * opens new connections, closes removed ones, leaves existing ones alone.
+ * Subscribe to the process-wide global SSE channel
+ * (`/events/global`). Used by the Tool Library and Integrations
+ * pages to refetch silently when credentials connect/disconnect or
+ * a sibling tab edits a queen's allowlist. Stays open for the
+ * lifetime of the calling component.
  */
-export function useMultiSSE({ sessions, onEvent }: UseMultiSSEOptions) {
+export function useGlobalEvents({
+  eventTypes,
+  onEvent,
+  enabled = true,
+}: UseGlobalEventsOptions) {
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const filterRef = useRef<ReadonlySet<EventTypeName> | null>(null);
+  filterRef.current = eventTypes && eventTypes.length > 0 ? new Set(eventTypes) : null;
 
-  // Track both the EventSource and its session ID so we can detect session changes
-  const sourcesRef = useRef(new Map<string, { es: EventSource; sessionId: string }>());
+  useEffect(() => {
+    if (!enabled) return;
 
-  // Diff-based open/close — runs on every `sessions` change
+    let cancelled = false;
+    let localUnsub: (() => void) | null = null;
+
+    subscribeSse("/events/global", {
+      onEvent: (_evt, data) => {
+        try {
+          const event: AgentEvent = JSON.parse(data);
+          if (!GLOBAL_EVENT_TYPES.has(event.type)) return;
+          const filter = filterRef.current;
+          if (filter && !filter.has(event.type)) return;
+          onEventRef.current(event);
+        } catch {
+          // Ignore parse errors (keepalive comments)
+        }
+      },
+    }).then((unsub) => {
+      if (cancelled) {
+        unsub();
+        return;
+      }
+      localUnsub = unsub;
+    });
+
+    return () => {
+      cancelled = true;
+      localUnsub?.();
+    };
+  }, [enabled]);
+}
+
+
+// --- Multi-session SSE hook ---
+
+/** Connection state for one session's SSE subscription, surfaced to
+ * callers so the UI can show "Reconnecting…" instead of going silent
+ * while the main-side bridge is sleeping between attempts. */
+export type SseConnectionState = "live" | "reconnecting" | "closed";
+
+interface UseMultiSSEOptions {
+  /** Map of agentType → backendSessionId. Only non-empty IDs get a subscription. */
+  sessions: Record<string, string>;
+  onEvent: (agentType: string, event: AgentEvent) => void;
+  /** Optional: receives state changes per agentType. Lets the queen
+   * page render a "Reconnecting…" pill, the sidebar mark a queen as
+   * offline, etc. Same callback identity is fine across renders. */
+  onConnectionState?: (agentType: string, state: SseConnectionState) => void;
+  /** Fires when the runtime confirms the session id is gone (HTTP 404
+   * on SSE pre-open). Happens after a hive-serve restart drops the
+   * in-memory session_manager entry while the on-disk queen_dir
+   * survives. Consumers should call sessionsApi.create with
+   * queenResumeFrom = sessionId to have the runtime re-load the same
+   * session id from disk, then bump ``resumeNonce`` below to force a
+   * fresh SSE mount. */
+  onSessionGone?: (agentType: string, sessionId: string) => void;
+  /** Consumer-controlled nonce. Bumping this forces every subscription
+   * to re-mount, which is how a caller signals "I've fixed the
+   * underlying condition (e.g. resumed a session that had gone 404),
+   * please retry now." Unchanged sessions map alone won't re-trigger. */
+  resumeNonce?: number;
+}
+
+/**
+ * Manages one SSE subscription per loaded session. Diffs `sessions` on each
+ * render: opens new subscriptions, closes removed ones, leaves existing alone.
+ */
+export function useMultiSSE({
+  sessions,
+  onEvent,
+  onConnectionState,
+  onSessionGone,
+  resumeNonce = 0,
+}: UseMultiSSEOptions) {
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+  const onStateRef = useRef(onConnectionState);
+  onStateRef.current = onConnectionState;
+  const onGoneRef = useRef(onSessionGone);
+  onGoneRef.current = onSessionGone;
+
+  // agentType → { unsub, sessionId, pending }
+  // `unsub` is null while the IPC round-trip is in flight.
+  const sourcesRef = useRef(
+    new Map<
+      string,
+      { unsub: (() => void) | null; sessionId: string; aborted: boolean }
+    >(),
+  );
+
   useEffect(() => {
     const current = sourcesRef.current;
     const desired = new Set(Object.keys(sessions));
 
-    // Close connections for removed agents OR changed session IDs
+    // Close removed agents OR changed session IDs
     for (const [agentType, entry] of current) {
       if (!desired.has(agentType) || sessions[agentType] !== entry.sessionId) {
-        console.log('[SSE] closing:', agentType, entry.sessionId, desired.has(agentType) ? '(session changed)' : '(removed)');
-        entry.es.close();
+        console.log(
+          "[SSE] closing:",
+          agentType,
+          entry.sessionId,
+          desired.has(agentType) ? "(session changed)" : "(removed)",
+        );
+        traceLoad("sse-conn", "close", {
+          agentType,
+          sessionId: entry.sessionId,
+          reason: desired.has(agentType) ? "session-changed" : "removed",
+          unsubReady: entry.unsub !== null,
+        });
+        entry.aborted = true;
+        entry.unsub?.();
         current.delete(agentType);
       }
     }
 
-    // Open connections for new/changed sessions
+    // Open subscriptions for new/changed sessions
     for (const [agentType, sessionId] of Object.entries(sessions)) {
       if (!sessionId || current.has(agentType)) continue;
 
-      const url = `/api/sessions/${sessionId}/events`;
-      console.log('[SSE] opening:', agentType, sessionId);
-      const es = new EventSource(url);
+      const path = `/sessions/${sessionId}/events`;
+      console.log("[SSE] opening:", agentType, sessionId);
+      traceLoad("sse-conn", "open", { agentType, sessionId });
 
-      es.onopen = () => {
-        console.log('[SSE] connected:', agentType, sessionId);
-      };
+      const entry: {
+        unsub: (() => void) | null;
+        sessionId: string;
+        aborted: boolean;
+      } = { unsub: null, sessionId, aborted: false };
+      current.set(agentType, entry);
 
-      es.onerror = () => {
-        console.error('[SSE] error:', agentType, sessionId, 'readyState:', es.readyState);
-      };
-
-      es.onmessage = (e: MessageEvent) => {
-        try {
-          const event: AgentEvent = JSON.parse(e.data);
-          console.log('[SSE] received:', agentType, event.type, event.stream_id, event.node_id);
-          onEventRef.current(agentType, event);
-        } catch {
-          // Ignore parse errors (keepalive comments)
+      subscribeSse(path, {
+        onOpen: () => {
+          console.log("[SSE] connected:", agentType, sessionId);
+          traceLoad("sse-conn", "connected", { agentType, sessionId });
+          onStateRef.current?.(agentType, "live");
+        },
+        onEvent: (_name, data) => {
+          try {
+            const event: AgentEvent = JSON.parse(data);
+            onEventRef.current(agentType, event);
+          } catch {
+            // Ignore parse errors (keepalive comments)
+          }
+        },
+        onError: (msg, status) => {
+          console.error("[SSE] error:", agentType, sessionId, msg, "status", status);
+          // status === 404 on a session-scoped SSE URL is definitive:
+          // the runtime's session_manager doesn't know this id. Almost
+          // always this is a post-crash recovery scenario — hive-serve
+          // restarted, in-memory _sessions is empty, but the on-disk
+          // queen_dir is intact. Tell the caller so it can resume the
+          // session from disk (sessionsApi.create + queen_resume_from).
+          if (status === 404) {
+            onGoneRef.current?.(agentType, sessionId);
+          }
+        },
+        onReconnecting: () => {
+          onStateRef.current?.(agentType, "reconnecting");
+        },
+        onClose: () => {
+          onStateRef.current?.(agentType, "closed");
+          // Drop the entry from the internal registry so a bumped
+          // ``resumeNonce`` (or any other effect re-run) will treat this
+          // agentType as un-subscribed and mount a fresh SSE. Without
+          // this the entry lingers as "closed", the effect skips it via
+          // ``current.has(agentType) → continue``, and the auto-resume
+          // never reopens the stream.
+          current.delete(agentType);
+        },
+      }).then((unsub) => {
+        if (entry.aborted) {
+          unsub();
+          return;
         }
-      };
-
-      current.set(agentType, { es, sessionId });
+        entry.unsub = unsub;
+      });
     }
-  }, [sessions]);
+    // resumeNonce is a caller-controlled dependency: bumping it re-runs
+    // the effect, which finds any missing entries (deleted in onClose
+    // above) and re-mounts them. This is how "auto-resume a session
+    // that went 404" plumbs end-to-end.
+  }, [sessions, resumeNonce]);
 
-  // Close all on unmount only
+  // Close all on unmount
   useEffect(() => {
     return () => {
-      for (const entry of sourcesRef.current.values()) entry.es.close();
+      for (const entry of sourcesRef.current.values()) {
+        entry.aborted = true;
+        entry.unsub?.();
+      }
       sourcesRef.current.clear();
     };
   }, []);

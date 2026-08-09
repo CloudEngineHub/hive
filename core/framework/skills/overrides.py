@@ -2,13 +2,13 @@
 
 Sits between :mod:`framework.skills.discovery` and
 :class:`framework.skills.catalog.SkillCatalog`: records the user's
-per-queen and per-colony decisions about which skills are enabled,
-who created them (provenance), and any parameter tweaks.
+per-queen decisions about which skills are enabled, who created them
+(provenance), and any parameter tweaks. Colonies have no store of their
+own — they inherit their owning queen's.
 
-Two well-known paths back this module:
+One well-known path backs this module:
 
 * Queen scope:   ``~/.hive/agents/queens/{queen_id}/skills_overrides.json``
-* Colony scope:  ``~/.hive/colonies/{colony_name}/skills_overrides.json``
 
 The schema is intentionally small; see :class:`SkillOverrideStore` for
 the JSON shape. Atomic writes mirror

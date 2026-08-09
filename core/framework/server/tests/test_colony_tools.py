@@ -84,9 +84,8 @@ class TestColonyFilter:
 
 @dataclass
 class _FakeSession:
-    colony_name: str
+    colony_id: str
     colony: Any = None
-    colony_runtime: Any = None
     id: str = "sess-1"
 
 
@@ -110,7 +109,7 @@ def colony_dir(tmp_path, monkeypatch):
     (cdir / "metadata.json").write_text(
         json.dumps(
             {
-                "colony_name": name,
+                "colony_id": name,
                 "queen_name": "queen_technology",
                 "created_at": "2026-04-20T00:00:00+00:00",
             }
@@ -197,7 +196,7 @@ async def test_patch_refreshes_live_runtime(colony_dir):
     rt._mcp_tool_names_all = {"read_file", "write_file"}
     rt.set_tool_allowlist(None)
 
-    session = _FakeSession(colony_name=name, colony=rt)
+    session = _FakeSession(colony_id=name, colony=rt)
     manager = _FakeManager(
         _sessions={session.id: session},
         _mcp_tool_catalog={
@@ -261,15 +260,15 @@ def test_queen_allowlist_inherits_into_new_colony(tmp_path, monkeypatch):
         update_colony_tools_config,
     )
 
-    colony_name = "forked_child"
-    (colonies / colony_name).mkdir()
+    colony_id = "forked_child"
+    (colonies / colony_id).mkdir()
 
     # Simulate: queen has a curated allowlist (e.g. role default resolved
     # to a concrete list). The inheritance hook copies it verbatim.
     queen_live_allowlist = ["read_file", "web_scrape", "csv_read"]
-    update_colony_tools_config(colony_name, list(queen_live_allowlist))
+    update_colony_tools_config(colony_id, list(queen_live_allowlist))
 
-    assert load_colony_tools_config(colony_name) == queen_live_allowlist
+    assert load_colony_tools_config(colony_id) == queen_live_allowlist
 
 
 def test_legacy_metadata_field_migrates_to_sidecar(colony_dir):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -87,13 +88,12 @@ def _register_open(subparsers: argparse._SubParsersAction) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     """Start the HTTP API server (the runtime hub)."""
     import atexit
-    import logging
     import signal
 
     from aiohttp import web
 
-    _build_frontend()
-
+    # Desktop-only fork: the web frontend is owned by the Electron renderer,
+    # so we never build a Python-served frontend here.
     from framework.observability import configure_logging
     from framework.server.app import create_app
 
@@ -118,6 +118,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     model = getattr(args, "model", None)
     app = create_app(model=model)
+
+    # Browser-bridge startup is owned by _bridge_keepalive_loop (in run_server
+    # below), NOT ensured here. That loop calls ensure_bridge_host_running on its
+    # first iteration — off the event loop via asyncio.to_thread — so the bridge
+    # comes up without gating site.start() on the up-to-8s cold-spawn poll (which
+    # would otherwise add the full wait to the desktop's loading screen).
+    #
+    # We deliberately do NOT also ensure it here. ensure_bridge_host_running is
+    # check-then-Popen with no cross-caller lock, and its spawned supervisor's
+    # singleton guard only runs at entry — so two callers racing during the ~1-2s
+    # window before the fresh worker binds the control port can each spawn a
+    # supervisor. The loser's worker self-heals its bind failure and exits, but
+    # its supervisor's respawn loop has no port re-check and crash-loops a doomed
+    # worker for the session. Keeping the keepalive loop as the sole startup
+    # ensurer makes that spawn single-owner and race-free. The side panel may
+    # show "connecting" for a beat during boot — a window in which the desktop UI
+    # is on its own loading screen anyway.
+
+    # Advertise our port to every process we go on to spawn. The desktop picks a
+    # random free port, so a child has no way to guess it — and the `hive-crm`
+    # CLI needs to reach us to report a write it just landed, which is what keeps
+    # an open CRM board live (framework.crm.notify). Inherited by MCP servers and,
+    # through them, by the agent's shell commands.
+    #
+    # Set here rather than after site.start() so it is in place before ANYTHING
+    # can spawn — the --colony preload below runs first. A bind failure exits the
+    # process, so there is no window in which this names a port nobody is on.
+    os.environ["HIVE_RUNTIME_PORT"] = str(args.port)
 
     async def run_server() -> None:
         manager = app["manager"]
@@ -161,6 +189,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 # handlers (KeyboardInterrupt for SIGINT; SIGTERM kills).
                 pass
 
+        # Desktop-mode keepalive: hold a single control-RPC connection
+        # open to the bridge_host for the runtime's lifetime. Without
+        # this, the bridge_host's idle watchdog self-exits 30s after
+        # any window where no gcu MCP is connected — which is the steady
+        # state immediately after app startup (user opened Hive but
+        # hasn't triggered an agent yet). The Chrome extension then
+        # tells the user "Hive isn't running" against a fully alive
+        # runtime. Identifying via client_hello(electron_pid) lets the
+        # bridge's reaper distinguish a healthy keepalive from a zombie
+        # if this runtime ever crashes mid-connection.
+        bridge_keepalive_task: asyncio.Task | None = None
+        if os.environ.get("HIVE_DESKTOP_MODE") == "1":
+            bridge_keepalive_task = asyncio.create_task(_bridge_keepalive_loop(manager))
+
         # Preload colonies specified via --colony
         for colony_arg in getattr(args, "colony", []) or []:
             colony_path = _resolve_colony_path(colony_arg)
@@ -168,10 +210,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 print(f"Colony not found: {colony_arg}")
                 continue
             try:
-                session = await manager.create_session_with_worker_colony(str(colony_path), model=model)
-                info = session.worker_info
-                name = info.name if info else session.colony_id
-                print(f"Loaded colony: {session.colony_id} ({name}) → session {session.id}")
+                session = await manager.create_session(colony_id=Path(colony_path).name, model=model)
+                print(f"Loaded colony: {session.colony_id} → session {session.id}")
             except Exception as e:  # noqa: BLE001
                 print(f"Error loading colony {colony_arg}: {e}")
 
@@ -180,11 +220,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
         site = web.TCPSite(runner, args.host, args.port)
         await site.start()
 
+        # Sentinel: colony-queen autopilot. The manager owns outbound
+        # escalation delivery + the inbound Telegram/Slack listeners and
+        # routes replies back into the parked queen. No-op unless the global
+        # ``sentinel`` config enables it.
+        sentinel_mgr = None
+        try:
+            from framework.sentinel.manager import SentinelManager, set_sentinel_manager
+
+            sentinel_mgr = SentinelManager(session_manager=manager)
+            set_sentinel_manager(sentinel_mgr)
+            await sentinel_mgr.start()
+        except Exception:  # noqa: BLE001 — never let Sentinel block server start
+            logging.getLogger(__name__).warning(
+                "sentinel: failed to start (continuing without it)", exc_info=True
+            )
+
         dashboard_url = f"http://{args.host}:{args.port}"
         has_frontend = _frontend_dist_exists()
 
-        live_count = sum(1 for s in manager.list_sessions() if s.colony_runtime is not None)
-        queen_only = sum(1 for s in manager.list_sessions() if s.colony_runtime is None)
+        live_count = sum(1 for s in manager.list_sessions() if s.colony_id is not None)
+        queen_only = sum(1 for s in manager.list_sessions() if s.colony_id is None)
 
         print()
         print(f"Hive API server running on {dashboard_url}")
@@ -203,6 +259,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             pass
         finally:
+            if bridge_keepalive_task is not None:
+                bridge_keepalive_task.cancel()
+                try:
+                    await bridge_keepalive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if sentinel_mgr is not None:
+                try:
+                    from framework.sentinel.manager import set_sentinel_manager
+
+                    await sentinel_mgr.stop()
+                    set_sentinel_manager(None)
+                except Exception:  # noqa: BLE001
+                    pass
             await manager.shutdown_all()
             await runner.cleanup()
 
@@ -211,6 +281,155 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nServer stopped.")
     return 0
+
+
+async def _bridge_keepalive_loop(manager: Any = None) -> None:
+    """Hold a control-RPC connection open to bridge_host for our lifetime.
+
+    See call site in cmd_serve for the motivation. Reconnects with
+    exponential backoff if the bridge restarts, re-issuing client_hello
+    each time (the bridge's per-WS state is wiped on disconnect).
+
+    When ``manager`` (the SessionManager) is supplied we additionally
+    subscribe to server-initiated notify frames and route them into the
+    right agent's inject_event — that's the delivery path for "user
+    detached / handed over tab X" messages from the Chrome side panel.
+
+    Cancelled cleanly by run_server's finally clause on shutdown — the
+    WS close on our side triggers the bridge's idle-watchdog grace,
+    which then exits the bridge_host process. That's the desktop-quit
+    cleanup path now: runtime exits → keepalive WS closes → bridge_host
+    sees zero alive clients → 30s grace → bridge_host exits.
+    """
+    try:
+        from gcu.bridge_host import ensure_bridge_host_running
+        from gcu.browser.bridge_rpc import BridgeClient, BridgeClientError
+    except ImportError:
+        return
+
+    pid_str = os.environ.get("HIVE_DESKTOP_PARENT_PID")
+    if not pid_str or not pid_str.isdigit():
+        # No owner PID → we can't run the identified keepalive (client_hello
+        # needs it). But this loop is also the sole startup bridge ensurer in
+        # desktop mode, so bailing here without ensuring would leave the bridge
+        # unspawned — narrowing parity with the old synchronous cmd_serve call
+        # (which ensured whenever HIVE_DESKTOP_MODE==1, regardless of PARENT_PID).
+        # Do a best-effort one-shot ensure before returning. Off-thread because
+        # ensure_bridge_host_running blocks on Popen + an up-to-8s poll.
+        try:
+            await asyncio.to_thread(ensure_bridge_host_running)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    owner_pid = int(pid_str)
+
+    logger = logging.getLogger(__name__)
+
+    async def _on_notify(profile: str, text: str, extra: dict) -> None:
+        """Route a side-panel notify frame to the matching agent.
+
+        The bridge's ``profile`` is globally unique: it's the queen's
+        session.id for queens (set in queen_orchestrator) and the
+        worker's worker.id for workers (set in worker.py:run). So one of
+        the two lookups below will match — first session.id (queen
+        loop), then worker.id under each session's colony.
+        """
+        if manager is None:
+            return
+        for session in manager.list_sessions():
+            # Queen match: session.id == profile.
+            if session.id == profile:
+                executor = getattr(session, "queen_executor", None)
+                if executor is None:
+                    continue
+                node = executor.node_registry.get("queen") if hasattr(executor, "node_registry") else None
+                if node is None or not hasattr(node, "inject_event"):
+                    continue
+                try:
+                    await node.inject_event(text, is_client_input=True)
+                except Exception:
+                    logger.debug("notify: queen inject failed for session=%s", session.id, exc_info=True)
+                return
+            # Worker match: colony.inject_input is a worker_id lookup
+            # and returns False on no match, so this is a cheap probe.
+            colony = getattr(session, "colony", None)
+            if colony is None:
+                continue
+            try:
+                delivered = await colony.inject_input(profile, text, is_client_input=True)
+            except Exception:
+                logger.debug("notify: worker inject raised for profile=%s", profile, exc_info=True)
+                continue
+            if delivered:
+                return
+        logger.info("notify: no live agent matched profile=%s (extra=%s)", profile, extra)
+
+    backoff = 1.0
+    while True:
+        # Make sure a bridge_host is running before we attempt to connect.
+        # This loop is the SOLE startup ensurer — the first iteration here is
+        # what spawns the bridge at boot (cmd_serve deliberately doesn't, to
+        # keep the spawn single-owner; see the note there). If the bridge then
+        # dies mid-session (e.g. it inherited a previous desktop's parent PID
+        # and idle-exited 30s after the user closed that desktop) there's no
+        # other respawn path until a gcu MCP happens to start — which leaves the
+        # side panel stuck on "Hive isn't running" with a dead Reconnect button.
+        # Calling ensure_bridge_host_running on every reconnect attempt covers
+        # both: it's a cheap no-op when a bridge is already serving and spawns a
+        # fresh supervisor (with the *current* desktop's PID baked in) when
+        # nothing is. Runs in a thread because it blocks on subprocess.Popen +
+        # a polling wait, which would otherwise stall this event loop for up to
+        # 8s.
+        try:
+            await asyncio.to_thread(ensure_bridge_host_running)
+        except Exception:  # noqa: BLE001
+            # Spawn failure is non-fatal — fall through to the connect
+            # attempt, which will raise BridgeClientError and back off
+            # the same as any other unreachable-bridge case.
+            pass
+
+        client = BridgeClient()
+        client.set_notify_handler(_on_notify)
+        try:
+            await client.connect()
+            await client.call("client_hello", owner_pid)
+            # Opt in to notify frames. Best-effort — old bridge builds
+            # that don't speak the method get an "unknown_method" error
+            # which we swallow; everything else still works without
+            # the side-panel-message integration.
+            try:
+                await client.call("subscribe_notifications")
+            except BridgeClientError as exc:
+                logger.debug("bridge keepalive: subscribe_notifications failed (%s)", exc)
+            backoff = 1.0
+            # Hold the connection. BridgeClient's _read_loop runs in
+            # background; we poll its is_connected flag (which it clears
+            # when the socket drops) to detect bridge restart.
+            while client.is_connected:
+                await asyncio.sleep(5.0)
+        except BridgeClientError as exc:
+            # Bridge unreachable or call failed. Old bridge build that
+            # doesn't speak client_hello: still keep the raw connection
+            # open — even un-identified, it counts toward active clients
+            # during the identify-grace window, which is enough to keep
+            # the watchdog from firing until a fresh bridge is up.
+            logger.debug("bridge keepalive: %s — retrying in %.1fs", exc, backoff)
+        except asyncio.CancelledError:
+            await client.close()
+            return
+        finally:
+            # The connect-then-close roundtrip is harmless if connect
+            # failed (close is idempotent). Don't await here on cancel —
+            # the cancel-path above already closed.
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            return
+        backoff = min(backoff * 2, 30.0)
 
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -400,9 +619,7 @@ def cmd_colony_list(args: argparse.Namespace) -> int:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 meta = {}
-        worker_count = sum(
-            1 for f in path.iterdir() if f.is_file() and f.suffix == ".json" and f.stem not in _RESERVED_JSON_STEMS
-        )
+        worker_count = sum(1 for f in path.iterdir() if f.is_file() and f.suffix == ".json" and f.stem not in _RESERVED_JSON_STEMS)
         rows.append(
             {
                 "name": path.name,
@@ -565,7 +782,7 @@ def cmd_session_list(args: argparse.Namespace) -> int:
     print("-" * 90)
     for r in rows:
         sid = r.get("session_id", "?")
-        colony = r.get("colony_name") or r.get("colony_id") or ""
+        colony = r.get("colony_id") or r.get("colony_id") or ""
         phase = r.get("queen_phase", "?")
         has_worker = "yes" if r.get("has_worker") else "no"
         print(f"{sid:<40}  {colony:<20}  {phase:<12}  {has_worker}")

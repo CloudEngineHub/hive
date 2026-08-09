@@ -22,9 +22,7 @@ from urllib.request import urlopen
 logger = logging.getLogger(__name__)
 
 # Default registry index URL (Phase 3 repo, may not exist yet)
-_DEFAULT_REGISTRY_URL = (
-    "https://raw.githubusercontent.com/hive-skill-registry/hive-skill-registry/main/skill_index.json"
-)
+_DEFAULT_REGISTRY_URL = "https://raw.githubusercontent.com/hive-skill-registry/hive-skill-registry/main/skill_index.json"
 
 
 def _cache_dir() -> Path:

@@ -980,11 +980,7 @@ class _StripeClient:
             "reason": d.reason,
             "status": d.status,
             "created": d.created,
-            "evidence_due_by": (
-                getattr(d, "evidence_details", {}).get("due_by")
-                if hasattr(d, "evidence_details") and d.evidence_details
-                else None
-            ),
+            "evidence_due_by": (getattr(d, "evidence_details", {}).get("due_by") if hasattr(d, "evidence_details") and d.evidence_details else None),
         }
 
     # --- Events ---
@@ -1093,9 +1089,7 @@ def register_tools(
 
         return {
             "error": "Stripe credentials not configured",
-            "help": (
-                "Set STRIPE_API_KEY environment variable. Get your credentials at https://dashboard.stripe.com/apikeys"
-            ),
+            "help": ("Set STRIPE_API_KEY environment variable. Get your credentials at https://dashboard.stripe.com/apikeys"),
         }
 
     def _get_client() -> _StripeClient | dict[str, str]:

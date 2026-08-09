@@ -115,9 +115,7 @@ class TestLLMJudgeWithProvider:
 
     def test_evaluate_failing_result(self):
         """Test evaluation that returns a failing result."""
-        provider = MockLLMProvider(
-            response_content='{"passes": false, "explanation": "Summary has hallucinated facts"}'
-        )
+        provider = MockLLMProvider(response_content='{"passes": false, "explanation": "Summary has hallucinated facts"}')
         judge = LLMJudge(llm_provider=provider)
 
         result = judge.evaluate(

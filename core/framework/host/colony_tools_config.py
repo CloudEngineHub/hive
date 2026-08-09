@@ -1,6 +1,6 @@
 """Per-colony tool configuration sidecar (``tools.json``).
 
-Lives at ``~/.hive/colonies/{colony_name}/tools.json`` alongside
+Lives at ``~/.hive/colonies/{colony_id}/tools.json`` alongside
 ``metadata.json``. Kept separate so provenance (queen_name,
 created_at, workers) stays in metadata while the user-editable tool
 allowlist gets its own file.
@@ -8,13 +8,18 @@ allowlist gets its own file.
 Schema::
 
     {
-      "enabled_mcp_tools": ["read_file", ...] | null,
-      "updated_at": "2026-04-21T12:34:56+00:00"
+      "enabled_mcp_tools": ["pdf_read", ...] | null,
+      "updated_at": "2026-04-21T12:34:56+00:00",
+      "saved_on_version": "0.2.19"
     }
 
 - ``null`` / missing file → default "allow every MCP tool".
 - ``[]`` → explicitly disable every MCP tool.
 - ``["foo", "bar"]`` → only those MCP tool names pass the filter.
+
+``saved_on_version`` records the app version that wrote the sidecar so
+the GA tool migration can grant additions a user couldn't have seen on
+the version they last saved on. Missing field → treated as ``0.0.0``.
 
 Atomic writes via ``os.replace`` mirror
 ``framework.host.colony_metadata.update_colony_metadata``.
@@ -35,13 +40,24 @@ from framework.config import COLONIES_DIR
 logger = logging.getLogger(__name__)
 
 
-def tools_config_path(colony_name: str) -> Path:
+def tools_config_path(colony_id: str) -> Path:
     """Return the on-disk path to a colony's ``tools.json``."""
-    return COLONIES_DIR / colony_name / "tools.json"
+    return COLONIES_DIR / colony_id / "tools.json"
 
 
-def _metadata_path(colony_name: str) -> Path:
-    return COLONIES_DIR / colony_name / "metadata.json"
+def _metadata_path(colony_id: str) -> Path:
+    return COLONIES_DIR / colony_id / "metadata.json"
+
+
+def _make_sidecar_payload(enabled_mcp_tools: list[str] | None) -> dict[str, Any]:
+    """Build a complete sidecar payload — keeps the version stamp in one place."""
+    from framework.agents.queen.queen_tools_defaults import _current_app_version
+
+    return {
+        "enabled_mcp_tools": enabled_mcp_tools,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "saved_on_version": _current_app_version(),
+    }
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -65,20 +81,20 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
-def _migrate_from_metadata_if_needed(colony_name: str) -> list[str] | None:
+def _migrate_from_metadata_if_needed(colony_id: str) -> list[str] | None:
     """Hoist a legacy ``enabled_mcp_tools`` field out of ``metadata.json``.
 
     Returns the migrated value (or ``None`` if nothing to migrate). After
     migration the sidecar exists and ``metadata.json`` no longer contains
     ``enabled_mcp_tools``. Safe to call repeatedly.
     """
-    meta_path = _metadata_path(colony_name)
+    meta_path = _metadata_path(colony_id)
     if not meta_path.exists():
         return None
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        logger.warning("Could not read metadata.json during tools migration: %s", colony_name)
+        logger.warning("Could not read metadata.json during tools migration: %s", colony_id)
         return None
     if not isinstance(data, dict) or "enabled_mcp_tools" not in data:
         return None
@@ -92,28 +108,25 @@ def _migrate_from_metadata_if_needed(colony_name: str) -> list[str] | None:
     else:
         logger.warning(
             "Legacy enabled_mcp_tools on colony %s had unexpected shape %r; dropping",
-            colony_name,
+            colony_id,
             raw,
         )
         enabled = None
 
     # Sidecar first so a partial failure leaves the config recoverable.
     _atomic_write_json(
-        tools_config_path(colony_name),
-        {
-            "enabled_mcp_tools": enabled,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
+        tools_config_path(colony_id),
+        _make_sidecar_payload(enabled),
     )
     _atomic_write_json(meta_path, data)
     logger.info(
         "Migrated enabled_mcp_tools for colony %s from metadata.json to tools.json",
-        colony_name,
+        colony_id,
     )
     return enabled
 
 
-def load_colony_tools_config(colony_name: str) -> list[str] | None:
+def load_colony_tools_config(colony_id: str) -> list[str] | None:
     """Return the colony's MCP tool allowlist, or ``None`` for default-allow.
 
     Order of resolution:
@@ -121,7 +134,7 @@ def load_colony_tools_config(colony_name: str) -> list[str] | None:
     2. Legacy ``metadata.json`` field (migrated and deleted on first read).
     3. ``None`` — default "allow every MCP tool".
     """
-    path = tools_config_path(colony_name)
+    path = tools_config_path(colony_id)
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -138,25 +151,22 @@ def load_colony_tools_config(colony_name: str) -> list[str] | None:
         logger.warning("Unexpected enabled_mcp_tools shape in %s; ignoring", path)
         return None
 
-    return _migrate_from_metadata_if_needed(colony_name)
+    return _migrate_from_metadata_if_needed(colony_id)
 
 
 def update_colony_tools_config(
-    colony_name: str,
+    colony_id: str,
     enabled_mcp_tools: list[str] | None,
 ) -> list[str] | None:
     """Persist a colony's MCP allowlist to ``tools.json``.
 
     Raises ``FileNotFoundError`` if the colony's directory is missing.
     """
-    colony_dir = COLONIES_DIR / colony_name
+    colony_dir = COLONIES_DIR / colony_id
     if not colony_dir.exists():
-        raise FileNotFoundError(f"Colony directory not found: {colony_name}")
+        raise FileNotFoundError(f"Colony directory not found: {colony_id}")
     _atomic_write_json(
-        tools_config_path(colony_name),
-        {
-            "enabled_mcp_tools": enabled_mcp_tools,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
+        tools_config_path(colony_id),
+        _make_sidecar_payload(enabled_mcp_tools),
     )
     return enabled_mcp_tools

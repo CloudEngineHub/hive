@@ -33,9 +33,7 @@ class TestInputValidation:
 
     def test_strips_https_prefix(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 import dns.resolver
 
                 mock = MagicMock()
@@ -49,9 +47,7 @@ class TestInputValidation:
 
     def test_strips_http_prefix(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 import dns.resolver
 
                 mock = MagicMock()
@@ -65,9 +61,7 @@ class TestInputValidation:
 
     def test_strips_trailing_slash(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 import dns.resolver
 
                 mock = MagicMock()
@@ -81,9 +75,7 @@ class TestInputValidation:
 
     def test_strips_path(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 import dns.resolver
 
                 mock = MagicMock()
@@ -97,9 +89,7 @@ class TestInputValidation:
 
     def test_strips_port(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 import dns.resolver
 
                 mock = MagicMock()
@@ -137,9 +127,7 @@ class TestSpfChecks:
 
     def test_spf_hardfail_detected(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
                 mock_rdata = MagicMock()
                 mock_rdata.to_text.return_value = '"v=spf1 include:_spf.google.com -all"'
@@ -155,9 +143,7 @@ class TestSpfChecks:
 
     def test_spf_softfail_detected(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
                 mock_rdata = MagicMock()
                 mock_rdata.to_text.return_value = '"v=spf1 include:_spf.google.com ~all"'
@@ -173,9 +159,7 @@ class TestSpfChecks:
 
     def test_spf_pass_all_dangerous(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
                 mock_rdata = MagicMock()
                 mock_rdata.to_text.return_value = '"v=spf1 +all"'
@@ -199,9 +183,7 @@ class TestDmarcChecks:
 
     def test_dmarc_reject_policy(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
 
                 def mock_resolve(domain, record_type):
@@ -225,9 +207,7 @@ class TestDmarcChecks:
 
     def test_dmarc_none_policy(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
 
                 def mock_resolve(domain, record_type):
@@ -259,9 +239,7 @@ class TestGradeInput:
 
     def test_grade_input_keys_present(self, scan_fn):
         with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner._DNS_AVAILABLE", True):
-            with patch(
-                "aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver"
-            ) as MockResolver:
+            with patch("aden_tools.tools.dns_security_scanner.dns_security_scanner.dns.resolver.Resolver") as MockResolver:
                 mock = MagicMock()
                 import dns.resolver
 

@@ -1,9 +1,50 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
+import { useNavigate } from "react-router-dom";
 import { cn } from "@/lib/utils";
+import { parseAppLink } from "@/lib/appLinks";
 import { parseThinkingTags } from "@/lib/thinking-tags";
 import ThinkingBlock from "./ThinkingBlock";
+
+/**
+ * A link in agent output. `hive://…` links navigate in-app (e.g. an agent
+ * handing the user a pre-filled sender form it couldn't finish itself);
+ * everything else opens in the browser as before.
+ */
+function MarkdownLink({
+  href,
+  children,
+}: {
+  href?: string;
+  children: React.ReactNode;
+}) {
+  const navigate = useNavigate();
+  const appPath = parseAppLink(href);
+
+  if (appPath) {
+    return (
+      <button
+        type="button"
+        onClick={() => navigate(appPath)}
+        className="text-primary underline underline-offset-2 hover:opacity-80 text-left"
+      >
+        {children}
+      </button>
+    );
+  }
+
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-primary underline underline-offset-2 hover:opacity-80"
+    >
+      {children}
+    </a>
+  );
+}
 
 const components: Components = {
   // Headers: same size as body text, just bold — keeps chat bubbles compact
@@ -43,17 +84,8 @@ const components: Components = {
     </pre>
   ),
 
-  // Links
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="text-primary underline underline-offset-2 hover:opacity-80"
-    >
-      {children}
-    </a>
-  ),
+  // Links — hive:// navigates in-app, everything else opens externally
+  a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
 
   // Tables
   table: ({ children }) => (
@@ -86,16 +118,24 @@ const remarkPlugins = [remarkGfm];
 interface MarkdownContentProps {
   content: string;
   className?: string;
+  // Per-instance component overrides merged over the defaults. Lets a caller
+  // (e.g. the skills drawer) restyle code/pre without affecting chat rendering.
+  components?: Partial<Components>;
 }
 
-export default function MarkdownContent({ content, className }: MarkdownContentProps) {
+export default function MarkdownContent({
+  content,
+  className,
+  components: overrides,
+}: MarkdownContentProps) {
+  const merged = overrides ? { ...components, ...overrides } : components;
   const segments = parseThinkingTags(content);
 
   // Fast path: no thinking tags — render as before
   if (segments.length === 1 && segments[0].type === "text") {
     return (
       <div className={cn("break-words text-foreground", className)}>
-        <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={merged}>
           {content}
         </ReactMarkdown>
       </div>
@@ -108,7 +148,7 @@ export default function MarkdownContent({ content, className }: MarkdownContentP
         seg.type === "thinking" ? (
           <ThinkingBlock key={i} content={seg.content} />
         ) : (
-          <ReactMarkdown key={i} remarkPlugins={remarkPlugins} components={components}>
+          <ReactMarkdown key={i} remarkPlugins={remarkPlugins} components={merged}>
             {seg.content}
           </ReactMarkdown>
         ),

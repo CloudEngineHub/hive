@@ -33,54 +33,6 @@ async def publish_loop_started(
         )
 
 
-async def generate_action_plan(
-    event_bus: EventBus | None,
-    ctx: NodeContext,
-    stream_id: str,
-    node_id: str,
-    execution_id: str,
-) -> None:
-    """Generate a brief action plan via LLM and emit it as an SSE event.
-
-    Runs as a fire-and-forget task so it never blocks the main loop.
-    """
-    try:
-        system_prompt = ctx.agent_spec.system_prompt or ""
-        # Trim to keep the prompt small
-        prompt_summary = system_prompt[:500]
-        if len(system_prompt) > 500:
-            prompt_summary += "..."
-
-        tool_names = [t.name for t in ctx.available_tools]
-        output_keys = ctx.agent_spec.output_keys or []
-
-        prompt = (
-            f'You are about to work on a task as node "{node_id}".\n\n'
-            f"System prompt:\n{prompt_summary}\n\n"
-            f"Tools available: {tool_names}\n"
-            f"Required outputs: {output_keys}\n\n"
-            f"Write a brief action plan (2-5 bullet points) describing "
-            f"what you will do to complete this task. Be specific and concise.\n"
-            f"Return ONLY the plan text, no preamble."
-        )
-
-        response = await ctx.llm.acomplete(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-        )
-
-        plan = response.content.strip()
-        if plan and event_bus:
-            await event_bus.emit_node_action_plan(
-                stream_id=stream_id,
-                node_id=node_id,
-                plan=plan,
-                execution_id=execution_id,
-            )
-    except Exception as e:
-        logger.warning("Action plan generation failed for node '%s': %s", node_id, e)
-
-
 async def publish_iteration(
     event_bus: EventBus | None,
     stream_id: str,
@@ -110,8 +62,13 @@ async def publish_llm_turn_complete(
     cached_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cost_usd: float = 0.0,
+    credits: float | None = None,
     execution_id: str = "",
     iteration: int | None = None,
+    system_prefix_sha: str | None = None,
+    system_suffix_sha: str | None = None,
+    history_anchor_idx: int | None = None,
+    message_count: int | None = None,
 ) -> None:
     if event_bus:
         await event_bus.emit_llm_turn_complete(
@@ -124,8 +81,13 @@ async def publish_llm_turn_complete(
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cost_usd=cost_usd,
+            credits=credits,
             execution_id=execution_id,
             iteration=iteration,
+            system_prefix_sha=system_prefix_sha,
+            system_suffix_sha=system_suffix_sha,
+            history_anchor_idx=history_anchor_idx,
+            message_count=message_count,
         )
 
 
@@ -176,16 +138,91 @@ async def publish_context_usage(
     ctx: NodeContext,
     conversation: NodeConversation,
     trigger: str,
+    *,
+    tools: list | None = None,
 ) -> None:
-    """Emit a CONTEXT_USAGE_UPDATED event with current context window state."""
+    """Emit CONTEXT_USAGE_UPDATED with a real-time estimate of the NEXT prompt.
+
+    The reported ``estimated_tokens`` is a char-based projection of everything
+    the next LLM request will carry: conversation messages (content + tool
+    args + image blocks), the rendered system prompt (static + dynamic
+    suffix), and the JSON tool definitions. This is the number the debug
+    panel should show as "how full is the request that's about to go out".
+
+    Unlike ``conversation.estimate_tokens()`` which is conversation-only and
+    intentionally narrow (used by compaction triggers), this estimate always
+    uses the char-based heuristic so the value updates immediately as
+    messages are added — without waiting for the next API response to
+    re-calibrate the cached ``_last_api_input_tokens``.
+
+    ``tools`` is optional; when omitted, the tool-definitions component is
+    counted as 0. Callers in the inner tool loop should pass it for the most
+    accurate readout.
+    """
     if not event_bus:
         return
 
+    import json
+
     from framework.host.event_bus import AgentEvent, EventType
 
-    estimated = conversation.estimate_tokens()
+    # Conversation portion (always char-based here, not the cached API value,
+    # so the readout reflects "size right now" rather than "size at the last
+    # LLM call").
+    conv_chars, image_blocks = conversation.conversation_chars_and_images()
+
+    # System prompt as it would be sent next: static + dynamic suffix already
+    # concatenated by the conversation's ``system_prompt`` property.
+    system_chars = len(conversation.system_prompt)
+
+    # Tool definitions as the LLM wrapper will serialise them: name +
+    # description + JSON-encoded parameters per tool. Cheap to compute and
+    # rare to be large enough to matter on its own, but for queens with 100+
+    # tools registered this contributes meaningfully.
+    tool_defs_chars = 0
+    if tools:
+        for t in tools:
+            tool_defs_chars += len(getattr(t, "name", "") or "")
+            tool_defs_chars += len(getattr(t, "description", "") or "")
+            params = getattr(t, "parameters", None)
+            if params:
+                try:
+                    tool_defs_chars += len(json.dumps(params))
+                except (TypeError, ValueError):
+                    # Non-serialisable parameters shouldn't crash telemetry.
+                    pass
+
+    total_chars = conv_chars + system_chars + tool_defs_chars
+    # 4/3 safety margin (chars/4 with a 4/3 correction = chars/3).
+    char_tokens = (total_chars * 4) // (3 * 4)
+    image_tokens = image_blocks * 2000
+    estimated = char_tokens + image_tokens
+
     max_tokens = conversation._max_context_tokens
     ratio = estimated / max_tokens if max_tokens > 0 else 0.0
+
+    # NOTE: this event intentionally carries only the lightweight metrics
+    # below — never a `full_request` snapshot of the whole prompt. It used
+    # to embed one (~280 KB: system text + every message + tool defs) for a
+    # debug panel, but it fires on every context tick, so events.jsonl
+    # ballooned to tens of MB and the desktop could no longer load the
+    # session. The metrics here are enough to drive the usage gauge.
+
+    # Diagnostic for "why does the UI show window=X?" — single line at the
+    # final emission boundary so future regressions on context_usage_updated
+    # can be traced without re-instrumenting the agent loop.
+    logger.debug(
+        "context_usage emit agent=%s trigger=%s max=%d estimated=%d (conv=%d sys=%d tools=%d imgs=%d) msgs=%d",
+        ctx.agent_id,
+        trigger,
+        max_tokens,
+        estimated,
+        conv_chars,
+        system_chars,
+        tool_defs_chars,
+        image_blocks,
+        conversation.message_count,
+    )
     await event_bus.publish(
         AgentEvent(
             type=EventType.CONTEXT_USAGE_UPDATED,
@@ -198,6 +235,15 @@ async def publish_context_usage(
                 "estimated_tokens": estimated,
                 "max_context_tokens": max_tokens,
                 "trigger": trigger,
+                # Component breakdown so the debug panel can show where the
+                # tokens go, not just the total.
+                "breakdown": {
+                    "conversation_chars": conv_chars,
+                    "system_chars": system_chars,
+                    "tool_defs_chars": tool_defs_chars,
+                    "image_blocks": image_blocks,
+                    "image_tokens": image_tokens,
+                },
             },
         )
     )

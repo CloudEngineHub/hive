@@ -39,6 +39,7 @@ export default function QuestionWidget({ question, options, onSubmit, onDismiss,
   const canSubmit = selected !== null && (!isOtherSelected || customText.trim().length > 0);
 
   const handleSubmit = useCallback(() => {
+    console.error("[hook] QuestionWidget.handleSubmit", { canSubmit, submitted, selected });
     if (!canSubmit || submitted) return;
     setSubmitted(true);
     if (isOtherSelected) {
@@ -54,7 +55,19 @@ export default function QuestionWidget({ question, options, onSubmit, onDismiss,
     if (inline) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (submitted) return;
-      const inTextInput = e.target === inputRef.current;
+      const target = e.target as HTMLElement | null;
+      const inTextInput = target === inputRef.current;
+
+      // Ignore keys typed into any other input (e.g. the Create Colony modal
+      // opened over the chat) — otherwise preventDefault swallows the character
+      // and selecting "Other" steals focus away from that input.
+      if (
+        !inTextInput &&
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
 
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();

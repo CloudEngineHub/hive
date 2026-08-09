@@ -1,7 +1,13 @@
 """DefaultSkillManager — load, configure, and inject built-in default skills.
 
-Default skills are SKILL.md packages shipped with the framework that provide
-runtime operational protocols (note-taking, batch tracking, error recovery, etc.).
+Default skills are SKILL.md packages shipped with the framework. The
+worker-facing operational protocols (note-taking, context-preservation,
+error-recovery, quality-monitor) that used to live here were folded into
+the worker system prompt — they hardly added behavior on top of the
+tracker.db + report_to_parent loop. What remains are the substantive
+skills: ``writing-hive-skills`` (skill authoring reference) and
+``browser-automation`` (tool-gated decision tree for browser-capable
+agents).
 """
 
 from __future__ import annotations
@@ -19,73 +25,44 @@ logger = logging.getLogger(__name__)
 # Default skills directory relative to this module
 _DEFAULT_SKILLS_DIR = Path(__file__).parent / "_default_skills"
 
-# Default config values per skill — used for {{placeholder}} substitution
-_SKILL_DEFAULTS: dict[str, dict[str, Any]] = {
-    "hive.quality-monitor": {"assessment_interval": 5},
-    "hive.error-recovery": {"max_retries_per_tool": 3},
-    "hive.context-preservation": {"warn_at_usage_ratio_pct": 45},
-}
-
-
-def is_batch_scenario(text: str) -> bool:
-    """Deprecated: batch auto-detection is no longer used.
-
-    Kept as a no-op so the agent_loop call site (which wraps it in an
-    ``if ctx.default_skill_batch_nudge:`` guard that's also now always
-    empty) can stay unchanged until a broader cleanup.  The old
-    ``_batch_ledger`` shared-buffer feature was replaced by the
-    per-colony SQLite task queue (``hive.colony-progress-tracker``),
-    which lives in ``progress.db`` and is authoritative for batch
-    state across workers and runs.
-    """
-    return False
+# Default config values per skill — used for {{placeholder}} substitution.
+# Currently empty (all remaining default skills are static text). Kept
+# as the override mechanism if a future skill needs runtime-substituted
+# values.
+_SKILL_DEFAULTS: dict[str, dict[str, Any]] = {}
 
 
 def _apply_overrides(skill_name: str, body: str, overrides: dict[str, Any]) -> str:
     """Substitute {{placeholder}} values in a skill body using overrides + defaults."""
     defaults = _SKILL_DEFAULTS.get(skill_name, {})
-    # Convert float warn_at_usage_ratio → warn_at_usage_ratio_pct for the placeholder
-    if "warn_at_usage_ratio" in overrides:
-        overrides = dict(overrides)
-        overrides.setdefault("warn_at_usage_ratio_pct", int(float(overrides["warn_at_usage_ratio"]) * 100))
     values = {**defaults, **overrides}
     for key, val in values.items():
         body = body.replace(f"{{{{{key}}}}}", str(val))
     return body
 
 
-# Ordered list of default skills (name → directory).
-#
-# Removed on 2026-04-15 as part of the colony-progress-tracker rollout:
-#   - hive.task-decomposition — steps table in progress.db supersedes
-#     in-memory ``_working_notes → Current Plan`` decomposition.
-#   - hive.batch-ledger       — tasks table in progress.db supersedes
-#     the ``_batch_ledger`` dict-shaped queue with its pending →
-#     in_progress → completed/failed/skipped state machine.
-# Both were duplicating state that belongs in SQLite.
+# Ordered list of default skills (name → directory). Worker-facing
+# operational protocols were retired into WORKER_SYSTEM_PROMPT; the
+# remaining defaults are reference skills (writing-hive-skills) and
+# tool-gated decision trees (browser-automation).
 SKILL_REGISTRY: dict[str, str] = {
-    "hive.note-taking": "note-taking",
-    "hive.context-preservation": "context-preservation",
-    "hive.quality-monitor": "quality-monitor",
-    "hive.error-recovery": "error-recovery",
-    "hive.colony-progress-tracker": "colony-progress-tracker",
     "hive.writing-hive-skills": "writing-hive-skills",
+    # browser-automation lives alongside the protocol skills because
+    # every queen runs in a browser-capable colony today; classifying
+    # it as a default makes the startup log explicit ("loaded") rather
+    # than relying on tool-gating to silently pre-activate it.
+    "hive.browser-automation": "browser-automation",
+    # pdf is a reference skill — body stays out of the prompt until an
+    # agent activates it via progressive disclosure on the description.
+    "hive.pdf": "pdf",
 }
 
-# Shared buffer keys referenced by the remaining default skills (used
-# for permission auto-inclusion). The dead keys for batch-ledger,
-# task-decomposition, the handoff buffer, and the error-log buffers
-# were removed when those features migrated to progress.db.
-DATA_BUFFER_KEYS: list[str] = [
-    # note-taking
-    "_working_notes",
-    "_notes_updated_at",
-    # context-preservation
-    "_preserved_data",
-    # quality-monitor
-    "_quality_log",
-    "_quality_degradation_count",
-]
+# Shared buffer keys default skills used to read/write. None remaining —
+# the protocol skills that needed scratch buffers (_working_notes,
+# _preserved_data, _quality_log) were removed in favor of tracker.db
+# upserts. Kept as an empty list so the auto-permission loop in
+# ``orchestrator/context.py`` still has something to import.
+DATA_BUFFER_KEYS: list[str] = []
 
 
 class DefaultSkillManager:
@@ -233,27 +210,3 @@ class DefaultSkillManager:
     def active_skills(self) -> dict[str, ParsedSkill]:
         """All active default skills keyed by name."""
         return dict(self._skills)
-
-    @property
-    def batch_init_nudge(self) -> str | None:
-        """Deprecated: always returns None.
-
-        The ``hive.batch-ledger`` default skill was removed when batch
-        tracking moved into ``progress.db`` (``hive.colony-progress-
-        tracker``). Callers in agent_host, colony_runtime, and
-        orchestrator still read this property; returning None keeps
-        them functional with no system-prompt nudge.
-        """
-        return None
-
-    @property
-    def context_warn_ratio(self) -> float | None:
-        """Token usage ratio at which to inject a context preservation warning (DS-13).
-
-        Returns None if ``hive.context-preservation`` is disabled.
-        Defaults to 0.45 when the skill is active but no override is set.
-        """
-        if "hive.context-preservation" not in self._skills:
-            return None
-        overrides = self._config.get_default_overrides("hive.context-preservation")
-        return float(overrides.get("warn_at_usage_ratio", 0.45))

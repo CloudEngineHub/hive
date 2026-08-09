@@ -8,9 +8,11 @@ Requires NOTION_API_TOKEN.
 from .base import CredentialSpec
 
 NOTION_CREDENTIALS = {
-    # Spec key drives the user-visible label in the credentials page;
-    # ``credential_id`` stays as ``notion_token`` so existing local
-    # encrypted store entries remain readable across the rename.
+    # ``credential_id`` matches ``aden_provider_name`` so the credentials
+    # page, the OAuth provider index, and the per-tool ``provider`` field
+    # all line up. (Other providers — google, github, slack — already use
+    # the same string for both, and the divergence here was the source of
+    # several lookup-by-wrong-key bugs.)
     "notion": CredentialSpec(
         env_var="NOTION_API_TOKEN",
         tools=[
@@ -44,7 +46,7 @@ NOTION_CREDENTIALS = {
 6. Set environment variable:
    export NOTION_API_TOKEN=your-integration-token""",
         health_check_endpoint="https://api.notion.com/v1/users/me",
-        credential_id="notion_token",
+        credential_id="notion",
         credential_key="api_key",
     ),
 }

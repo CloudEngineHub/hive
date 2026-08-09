@@ -290,9 +290,7 @@ class TestHuggingFaceRunInference:
 class TestHuggingFaceRunEmbedding:
     def test_missing_token(self, tool_fns):
         with patch.dict("os.environ", {}, clear=True):
-            result = tool_fns["huggingface_run_embedding"](
-                model_id="sentence-transformers/all-MiniLM-L6-v2", inputs="Hello"
-            )
+            result = tool_fns["huggingface_run_embedding"](model_id="sentence-transformers/all-MiniLM-L6-v2", inputs="Hello")
         assert "error" in result
 
     def test_missing_model_id(self, tool_fns):

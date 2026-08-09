@@ -1,13 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
-import { X, MessageSquare, Crown, ChevronRight, Briefcase, Award, Pencil, Check, Loader2, Camera, Plus } from "lucide-react";
+import { X, MessageSquare, Crown, ChevronRight, Briefcase, Award, Pencil, Check, Loader2, Camera, Plus, Trash2, UserMinus, UserPlus, Wrench, Library } from "lucide-react";
+import { apiUrl } from "@/api/client";
 import { useColony } from "@/context/ColonyContext";
+import { useQueenDecommission } from "@/lib/me";
+import QueenPortraitGlyph from "./QueenPortraitGlyph";
 import { queensApi, type QueenProfile } from "@/api/queens";
-import { executionApi } from "@/api/execution";
+import { sessionsApi } from "@/api/sessions";
 import { compressImage } from "@/lib/image-utils";
 import type { Colony } from "@/types/colony";
 import { slugToColonyId } from "@/lib/colony-registry";
-import QueenToolsSection from "./QueenToolsSection";
 
 interface QueenProfilePanelProps {
   queenId: string;
@@ -30,8 +32,10 @@ function SectionHeader({ children, onEdit }: { children: React.ReactNode; onEdit
 
 export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenProfilePanelProps) {
   const navigate = useNavigate();
-  const { queenProfiles, refresh } = useColony();
+  const { queenProfiles, refresh, bumpQueenAvatar, queenHasAvatar } = useColony();
   const summary = queenProfiles.find((q) => q.id === queenId);
+  const { isDecommissioned, setDecommissioned, saving: decommissionSaving } =
+    useQueenDecommission(queenId);
   const [profile, setProfile] = useState<QueenProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -40,6 +44,7 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
   // Avatar state
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [deletingAvatar, setDeletingAvatar] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Edit form state
@@ -49,13 +54,44 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
   const [editSkills, setEditSkills] = useState("");
   const [editAchievement, setEditAchievement] = useState("");
 
+  // The panel is rendered unkeyed, so switching from queen A to queen B
+  // reuses this instance (only `queenId` changes). These refs let async
+  // work capture "the queen currently shown" and bail if it changed.
+  const queenIdRef = useRef(queenId);
+  queenIdRef.current = queenId;
+  // Read avatar-existence without making it an effect dependency:
+  // `queenHasAvatar`'s identity churns on every colony refresh, which would
+  // otherwise re-run the reset effect and discard an in-progress edit.
+  const queenHasAvatarRef = useRef(queenHasAvatar);
+  queenHasAvatarRef.current = queenHasAvatar;
+
   useEffect(() => {
+    // Guard against a stale getProfile: if the user switches to another queen
+    // before this resolves, an earlier-queen response must not overwrite the
+    // new queen's panel (it would show A's about/skills under B's header).
+    let cancelled = false;
     setLoading(true);
     setProfile(null);
     setEditing(false);
-    // Set avatar URL with cache buster
-    setAvatarUrl(`/api/queen/${queenId}/avatar?t=${Date.now()}`);
-    queensApi.getProfile(queenId).then(setProfile).catch(() => {}).finally(() => setLoading(false));
+    // Only set the avatar URL when the runtime confirms a file exists —
+    // otherwise the `<img>` request 404s on every panel open.
+    setAvatarUrl(
+      queenHasAvatarRef.current(queenId)
+        ? apiUrl(`/queen/${queenId}/avatar?t=${Date.now()}`)
+        : null,
+    );
+    queensApi
+      .getProfile(queenId)
+      .then((p) => {
+        if (!cancelled) setProfile(p);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [queenId]);
 
   const startEditing = () => {
@@ -80,6 +116,9 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
         skills: editSkills.trim(),
         signature_achievement: editAchievement.trim(),
       });
+      // Don't apply A's save result onto B's panel if the user switched queens
+      // while the request was in flight.
+      if (queenIdRef.current !== queenId) return;
       setProfile(updated);
       setEditing(false);
       refresh();
@@ -104,11 +143,35 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
     try {
       const compressed = await compressImage(file);
       await queensApi.uploadAvatar(queenId, compressed);
-      setAvatarUrl(`/api/queen/${queenId}/avatar?t=${Date.now()}`);
+      // Notify every avatar consumer (org chart, sidebar, chat panel) that
+      // the image bytes changed so they re-request without a hard reload.
+      bumpQueenAvatar(queenId);
+      // Don't point B's panel at A's freshly-uploaded avatar after a switch.
+      if (queenIdRef.current !== queenId) return;
+      setAvatarUrl(apiUrl(`/queen/${queenId}/avatar?t=${Date.now()}`));
     } catch (err) {
       console.error("Failed to upload avatar:", err);
     } finally {
       setUploadingAvatar(false);
+    }
+  };
+
+  const handleAvatarDelete = async () => {
+    if (!avatarUrl || deletingAvatar) return;
+    // Direct delete, mirroring the decommission/upload buttons elsewhere in
+    // the panel that also commit without a confirm step. A re-upload is one
+    // click away if the user changes their mind.
+    setDeletingAvatar(true);
+    try {
+      await queensApi.deleteAvatar(queenId);
+      setAvatarUrl(null);
+      // Same cache-bust signal as upload — consumers re-check `queenHasAvatar`
+      // and drop the cached <img>.
+      bumpQueenAvatar(queenId);
+    } catch (err) {
+      console.error("Failed to delete avatar:", err);
+    } finally {
+      setDeletingAvatar(false);
     }
   };
 
@@ -122,16 +185,23 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
     const cname = colonyName.trim();
     if (!cname || creatingColony) return;
     setCreatingColony(true);
+    const goal = colonyTask.trim();
     try {
-      // Create a fresh queen session, then fork it into a colony
-      const { session_id } = await queensApi.createNewSession(queenId, colonyTask.trim() || undefined);
-      await executionApi.colonySpawn(session_id, cname, colonyTask.trim() || undefined);
+      const created = await sessionsApi.create({
+        colonyId: cname,
+        colonyGoal: goal || undefined,
+        queenName: queenId,
+        initialPhase: "colony",
+      });
       setColonyDialogOpen(false);
       setColonyName("");
       setColonyTask("");
       refresh();
       onClose();
-      navigate(`/colony/${slugToColonyId(cname)}`);
+      const actualColonyId = slugToColonyId(created.colony_id ?? cname);
+      navigate(`/colony/${actualColonyId}`, {
+        state: goal ? { initialGoal: goal } : undefined,
+      });
     } catch (err) {
       console.error("Failed to create colony:", err);
     } finally {
@@ -143,9 +213,14 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
   const title = profile?.title ?? summary?.title ?? "";
 
   // ── Resizable width ──────────────────────────────────────────────────
-  const MIN_WIDTH = 280;
+  // Floor sized so Message + Create Colony (flex-1, icon + label) stay on
+  // one row in both density modes. Spacious bumps font-size ~12.5%, and
+  // the buttons themselves have no horizontal padding so the label sits
+  // edge-to-edge — keep generous headroom to avoid the label wrapping to
+  // a second line.
+  const MIN_WIDTH = 420;
   const MAX_WIDTH = 600;
-  const [width, setWidth] = useState(340);
+  const [width, setWidth] = useState(420);
   const dragging = useRef(false);
   const startX = useRef(0);
   const startWidth = useRef(0);
@@ -178,6 +253,12 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
   const inputCls = "w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40";
   const textareaCls = `${inputCls} resize-none`;
 
+  // When a custom avatar exists, the hover overlay splits in two: left
+  // half = change photo, right half = remove photo. With no avatar uploaded
+  // there's nothing to delete, so the overlay collapses back to a single
+  // edge-to-edge change-photo button.
+  const hasUploadedAvatar = avatarUrl !== null;
+  const avatarBusy = uploadingAvatar || deletingAvatar;
   const avatarElement = (
     <div className="relative group">
       <div className="w-16 h-16 rounded-full bg-primary/15 flex items-center justify-center overflow-hidden">
@@ -188,36 +269,57 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
             className="w-full h-full object-cover"
             onError={() => setAvatarUrl(null)}
           />
+        ) : summary?.portrait ? (
+          <QueenPortraitGlyph p={summary.portrait} className="w-full h-full" />
         ) : (
           <span className="text-xl font-bold text-primary">{name.charAt(0)}</span>
         )}
       </div>
-      <button
-        onClick={handleAvatarClick}
-        disabled={uploadingAvatar}
-        className="absolute inset-0 w-16 h-16 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 cursor-pointer"
-        title="Change photo"
-      >
-        {uploadingAvatar ? (
-          <Loader2 className="w-4 h-4 text-white animate-spin" />
-        ) : (
-          <Camera className="w-4 h-4 text-white" />
+      <div className="absolute inset-0 w-16 h-16 rounded-full flex opacity-0 group-hover:opacity-100 overflow-hidden">
+        <button
+          onClick={handleAvatarClick}
+          disabled={avatarBusy}
+          className={`${hasUploadedAvatar ? "w-1/2" : "w-full"} h-full flex items-center justify-center bg-black/50 hover:bg-black/60 cursor-pointer disabled:cursor-default`}
+          title="Change photo"
+        >
+          {uploadingAvatar ? (
+            <Loader2 className="w-4 h-4 text-white animate-spin" />
+          ) : (
+            <Camera className="w-4 h-4 text-white" />
+          )}
+        </button>
+        {hasUploadedAvatar && (
+          <button
+            onClick={handleAvatarDelete}
+            disabled={avatarBusy}
+            className="w-1/2 h-full flex items-center justify-center bg-black/50 hover:bg-red-600/70 cursor-pointer disabled:cursor-default"
+            title="Remove photo"
+          >
+            {deletingAvatar ? (
+              <Loader2 className="w-4 h-4 text-white animate-spin" />
+            ) : (
+              <Trash2 className="w-4 h-4 text-white" />
+            )}
+          </button>
         )}
-      </button>
+      </div>
       <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
     </div>
   );
 
   return (
     <aside
-      className="flex-shrink-0 border-l border-border/60 bg-card overflow-y-auto overscroll-contain relative"
+      className="flex-shrink-0 border-l border-border/60 bg-card relative flex flex-col"
       style={{ width }}
     >
-      {/* Drag handle */}
+      {/* Drag handle — pinned to the non-scrolling aside so it stays
+          flush against the full panel height regardless of how far the
+          user has scrolled the inner content. */}
       <div
         onMouseDown={onDragStart}
         className="absolute top-0 left-0 w-1 h-full cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors z-10"
       />
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
       {/* Header */}
       <div className="flex items-center justify-between px-5 py-3.5 border-b border-border/60">
         <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -295,18 +397,44 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
               </button>
             </div>
 
-            <div className="flex items-center gap-2 mb-6">
-              <button onClick={() => { navigate(`/queen/${queenId}`); onClose(); }}
-                className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-border/60 py-2.5 text-sm font-medium text-foreground hover:bg-muted/40">
-                <MessageSquare className="w-4 h-4" />
-                Message
-              </button>
-              <button onClick={() => setColonyDialogOpen(true)}
-                className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-primary/30 bg-primary/[0.04] py-2.5 text-sm font-medium text-primary hover:bg-primary/[0.08]">
-                <Plus className="w-4 h-4" />
-                Create Colony
-              </button>
-            </div>
+            {isDecommissioned ? (
+              <div className="mb-6 space-y-2">
+                <p className="text-xs text-muted-foreground italic">
+                  This queen is decommissioned. Hire her back to bring her back into your sidebar, colonies, and pickers.
+                </p>
+                <button
+                  onClick={() => void setDecommissioned(false)}
+                  disabled={decommissionSaving}
+                  className="w-full flex items-center justify-center gap-2 rounded-lg border border-primary/30 bg-primary/[0.04] py-2.5 text-sm font-medium text-primary hover:bg-primary/[0.08] disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {decommissionSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
+                  Hire back
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 mb-3">
+                  <button onClick={() => { navigate(`/queen/${queenId}`); onClose(); }}
+                    className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-border/60 px-2 py-2.5 text-sm font-medium text-foreground hover:bg-muted/40 whitespace-nowrap">
+                    <MessageSquare className="w-4 h-4 flex-shrink-0" />
+                    Message
+                  </button>
+                  <button onClick={() => setColonyDialogOpen(true)}
+                    className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-primary/30 bg-primary/[0.04] px-2 py-2.5 text-sm font-medium text-primary hover:bg-primary/[0.08] whitespace-nowrap">
+                    <Plus className="w-4 h-4 flex-shrink-0" />
+                    Create Colony
+                  </button>
+                </div>
+                <button
+                  onClick={() => void setDecommissioned(true)}
+                  disabled={decommissionSaving}
+                  className="w-full flex items-center justify-center gap-2 mb-6 py-2 text-xs font-medium text-red-600 hover:text-red-700 hover:bg-red-500/[0.06] rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {decommissionSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <UserMinus className="w-3.5 h-3.5" />}
+                  Decommission
+                </button>
+              </>
+            )}
 
             {profile?.summary && (
               <div className="mb-6">
@@ -334,17 +462,6 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
               </div>
             )}
 
-            {profile?.skills && (
-              <div className="mb-6">
-                <SectionHeader onEdit={startEditing}>Skills</SectionHeader>
-                <div className="flex flex-wrap gap-1.5">
-                  {profile.skills.split(",").map((skill, i) => (
-                    <span key={i} className="px-2 py-0.5 rounded-full bg-muted/60 text-xs text-muted-foreground">{skill.trim()}</span>
-                  ))}
-                </div>
-              </div>
-            )}
-
             {profile?.signature_achievement && (
               <div className="mb-6">
                 <SectionHeader onEdit={startEditing}>Signature Achievement</SectionHeader>
@@ -355,8 +472,39 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
               </div>
             )}
 
+            {profile?.skills && (
+              <div className="mb-6">
+                <SectionHeader onEdit={startEditing}>Skills</SectionHeader>
+                <div className="flex flex-wrap gap-1.5 mb-2.5">
+                  {profile.skills.split(",").map((skill, i) => (
+                    <span key={i} className="px-2 py-0.5 rounded-full bg-muted/60 text-xs text-muted-foreground">{skill.trim()}</span>
+                  ))}
+                </div>
+                <button
+                  onClick={() => { navigate(`/skills-library?queen=${queenId}`); onClose(); }}
+                  className="w-full flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5 text-sm text-foreground hover:bg-muted/40"
+                >
+                  <span className="flex items-center gap-2">
+                    <Library className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    Configure skills
+                  </span>
+                  <ChevronRight className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+                </button>
+              </div>
+            )}
+
             <div className="mb-6">
-              <QueenToolsSection queenId={queenId} />
+              <SectionHeader>Tools</SectionHeader>
+              <button
+                onClick={() => { navigate(`/skills-library?tab=mcp&queen=${queenId}`); onClose(); }}
+                className="w-full flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5 text-sm text-foreground hover:bg-muted/40"
+              >
+                <span className="flex items-center gap-2">
+                  <Wrench className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  Configure tools
+                </span>
+                <ChevronRight className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+              </button>
             </div>
 
             {colonies.length > 0 && (
@@ -376,6 +524,7 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
           </>
         )}
       </div>
+      </div>
 
       {/* Create Colony dialog */}
       {colonyDialogOpen && (
@@ -390,8 +539,8 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
               <div>
                 <label className="block text-[11px] font-medium text-muted-foreground mb-1">Colony name <span className="text-primary">*</span></label>
                 <input type="text" value={colonyName} autoFocus
-                  onChange={(e) => setColonyName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
-                  placeholder="e.g. research_team"
+                  onChange={(e) => setColonyName(e.target.value.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, ""))}
+                  placeholder="e.g. research team"
                   className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary" />
               </div>
               <div>

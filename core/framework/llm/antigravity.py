@@ -53,20 +53,16 @@ _TOKEN_REFRESH_BUFFER_SECS = 60
 
 # Credentials file in $HIVE_HOME (native implementation)
 _ACCOUNTS_FILE = _HIVE_HOME / "antigravity-accounts.json"
-_IDE_STATE_DB_MAC = (
-    Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
-)
+_IDE_STATE_DB_MAC = Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 _IDE_STATE_DB_LINUX = Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 _IDE_STATE_DB_KEY = "antigravityUnifiedStateSync.oauthToken"
 
 _BASE_HEADERS: dict[str, str] = {
     # Mimic the Antigravity Electron app so the API accepts the request.
-    # Google deprecates older client versions over time, so this needs periodic
-    # bumping to match whatever the current Antigravity desktop release advertises.
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Antigravity/1.23.2 Chrome/138.0.7204.235 "
-        "Electron/39.2.3 Safari/537.36"
+        "(KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 "
+        "Electron/37.3.1 Safari/537.36"
     ),
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"MACOS","pluginType":"GEMINI"}',
@@ -206,8 +202,7 @@ def _do_token_refresh(refresh_token: str) -> tuple[str, float] | None:
     client_secret = get_antigravity_client_secret()
     if not client_secret:
         logger.debug(
-            "Antigravity client secret not configured — attempting refresh without it. "
-            "Set ANTIGRAVITY_CLIENT_SECRET or run quickstart to configure."
+            "Antigravity client secret not configured — attempting refresh without it. Set ANTIGRAVITY_CLIENT_SECRET or run quickstart to configure."
         )
 
     import urllib.error  # noqa: PLC0415
@@ -254,56 +249,6 @@ def _clean_tool_name(name: str) -> str:
     if name and not (name[0].isalpha() or name[0] == "_"):
         name = "_" + name
     return name[:64]
-
-
-def _sanitize_schema_for_gemini(schema: Any) -> Any:
-    """Convert JSON Schema 2020-12 features to the OpenAPI 3.0 dialect Gemini accepts.
-
-    Gemini's function_declarations parser rejects union ``"type": ["string", "null"]``.
-    Translate any such union to a single type plus ``"nullable": true``. Recurse into
-    ``properties``, ``items``, and the ``anyOf``/``oneOf``/``allOf`` combinators.
-    """
-    if isinstance(schema, list):
-        return [_sanitize_schema_for_gemini(s) for s in schema]
-    if not isinstance(schema, dict):
-        return schema
-
-    out = dict(schema)
-    t = out.get("type")
-    if isinstance(t, list):
-        non_null = [x for x in t if x != "null"]
-        has_null = "null" in t
-        if len(non_null) == 1:
-            out["type"] = non_null[0]
-            if has_null:
-                out["nullable"] = True
-        elif not non_null and has_null:
-            # Pure null type: fall back to string-nullable.
-            out["type"] = "string"
-            out["nullable"] = True
-        else:
-            # Multi-type non-null unions (e.g. ["string", "integer", "null"])
-            # have no faithful Gemini equivalent. Silently picking one type
-            # changes the contract for callers who rely on the others, so
-            # fail loud and let the schema author rewrite it as anyOf or
-            # narrow to a single type.
-            raise ValueError(
-                f"Unsupported Gemini schema union: {t!r}. "
-                "Gemini accepts a single primitive type plus optional 'nullable: true'. "
-                "Rewrite as anyOf or pick a single type."
-            )
-
-    if "properties" in out and isinstance(out["properties"], dict):
-        out["properties"] = {k: _sanitize_schema_for_gemini(v) for k, v in out["properties"].items()}
-    if "items" in out:
-        out["items"] = _sanitize_schema_for_gemini(out["items"])
-    if "additionalProperties" in out and isinstance(out["additionalProperties"], dict):
-        out["additionalProperties"] = _sanitize_schema_for_gemini(out["additionalProperties"])
-    for combinator in ("anyOf", "oneOf", "allOf"):
-        if combinator in out:
-            out[combinator] = _sanitize_schema_for_gemini(out[combinator])
-
-    return out
 
 
 def _to_gemini_contents(
@@ -563,11 +508,7 @@ class AntigravityProvider(LLMProvider):
 
     def _ensure_token(self) -> str:
         """Return a valid access token, refreshing via OAuth if needed."""
-        if (
-            self._access_token
-            and self._token_expires_at
-            and time.time() < self._token_expires_at - _TOKEN_REFRESH_BUFFER_SECS
-        ):
+        if self._access_token and self._token_expires_at and time.time() < self._token_expires_at - _TOKEN_REFRESH_BUFFER_SECS:
             return self._access_token
 
         if self._refresh_token:
@@ -580,9 +521,7 @@ class AntigravityProvider(LLMProvider):
             logger.warning("Using potentially stale Antigravity access token")
             return self._access_token
 
-        raise RuntimeError(
-            "No valid Antigravity credentials. Run: uv run python core/antigravity_auth.py auth account add"
-        )
+        raise RuntimeError("No valid Antigravity credentials. Run: uv run python core/antigravity_auth.py auth account add")
 
     # --- Request building -------------------------------------------------- #
 
@@ -607,13 +546,11 @@ class AntigravityProvider(LLMProvider):
                         {
                             "name": _clean_tool_name(t.name),
                             "description": t.description,
-                            "parameters": _sanitize_schema_for_gemini(
-                                t.parameters
-                                or {
-                                    "type": "object",
-                                    "properties": {},
-                                }
-                            ),
+                            "parameters": t.parameters
+                            or {
+                                "type": "object",
+                                "properties": {},
+                            },
                         }
                         for t in tools
                     ]

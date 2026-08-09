@@ -4,7 +4,7 @@ Verifies that:
 - Timer triggers fire inject_trigger() on the queen node
 - Webhook triggers fire inject_trigger() via EventBus WEBHOOK_RECEIVED
 - Queen node unavailable → trigger skipped silently
-- colony_runtime=None → trigger discarded (gating)
+- colony_id=None → trigger discarded (gating)
 - remove_trigger cleans up webhook subscription
 - run_agent_with_input is in _QUEEN_RUNNING_TOOLS
 - System prompts reference run_agent_with_input, not start_graph()
@@ -39,7 +39,7 @@ async def test_interval_timer_fires_inject_trigger_on_queen_node() -> None:
 
     bus = EventBus()
     session = _make_session(bus)
-    session.colony_runtime = object()  # non-None → colony is loaded
+    session.colony_id = "test_colony"  # colony is bound
 
     queen_node = SimpleNamespace(inject_trigger=AsyncMock())
     session.queen_executor = _make_executor(queen_node)
@@ -76,13 +76,61 @@ async def test_interval_timer_fires_inject_trigger_on_queen_node() -> None:
 
 
 @pytest.mark.asyncio
+async def test_timer_fire_persists_last_and_next_due(tmp_path) -> None:
+    """After firing, last_fired_at + next_due_at must be stamped on the
+    TriggerDefinition and written to triggers.json. The activation-missed
+    handshake reads these from disk on the next activation."""
+    from framework.tools.queen_lifecycle_tools import (
+        _read_agent_triggers_json,
+        _start_trigger_timer,
+    )
+
+    bus = EventBus()
+    session = _make_session(bus)
+    session.colony_id = "test_colony"
+    session.worker_path = tmp_path  # _save_trigger_to_agent writes here
+
+    queen_node = SimpleNamespace(inject_trigger=AsyncMock())
+    session.queen_executor = _make_executor(queen_node)
+
+    tdef = TriggerDefinition(
+        id="persist-timer",
+        trigger_type="timer",
+        trigger_config={"interval_minutes": 0.001},
+        task="persist it",
+    )
+
+    await _start_trigger_timer(session, "persist-timer", tdef)
+    await asyncio.sleep(0.15)
+
+    task = session.active_timer_tasks.get("persist-timer")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # In-memory: TriggerDefinition was stamped.
+    assert tdef.last_fired_at is not None
+    assert tdef.next_due_at is not None
+
+    # On-disk: triggers.json carries the same fields. This is the
+    # signal the missed-handshake reads from on next activation.
+    raw = _read_agent_triggers_json(tmp_path)
+    persisted = next(t for t in raw if t["id"] == "persist-timer")
+    assert persisted["last_fired_at"] == tdef.last_fired_at
+    assert persisted["next_due_at"] == tdef.next_due_at
+
+
+@pytest.mark.asyncio
 async def test_timer_skipped_when_queen_node_unavailable() -> None:
     """No inject_trigger call and no exception when queen executor is not set."""
     from framework.tools.queen_lifecycle_tools import _start_trigger_timer
 
     bus = EventBus()
     session = _make_session(bus)
-    session.colony_runtime = object()
+    session.colony_id = "test_colony"
     session.queen_executor = None  # queen not ready
 
     tdef = TriggerDefinition(
@@ -114,7 +162,7 @@ async def test_webhook_trigger_fires_inject_trigger() -> None:
 
     bus = EventBus()
     session = _make_session(bus)
-    session.colony_runtime = object()
+    session.colony_id = "test_colony"
 
     queen_node = SimpleNamespace(inject_trigger=AsyncMock())
     session.queen_executor = _make_executor(queen_node)
@@ -162,7 +210,7 @@ async def test_webhook_trigger_discarded_when_no_worker() -> None:
 
     bus = EventBus()
     session = _make_session(bus)
-    session.colony_runtime = None  # no colony
+    session.colony_id = None  # no colony bound
 
     queen_node = SimpleNamespace(inject_trigger=AsyncMock())
     session.queen_executor = _make_executor(queen_node)
@@ -201,7 +249,7 @@ async def test_remove_trigger_cleans_up_webhook_subscription() -> None:
 
     bus = EventBus()
     session = _make_session(bus)
-    session.colony_runtime = object()
+    session.colony_id = "test_colony"
 
     queen_node = SimpleNamespace(inject_trigger=AsyncMock())
     session.queen_executor = _make_executor(queen_node)
@@ -240,16 +288,38 @@ async def test_remove_trigger_cleans_up_webhook_subscription() -> None:
     assert "removable-webhook" not in session.active_webhook_subs
 
 
-def test_run_parallel_workers_in_working_tools() -> None:
-    """run_parallel_workers must be available to the queen in WORKING phase."""
-    from framework.agents.queen.nodes import _QUEEN_WORKING_TOOLS
+def test_run_worker_in_colony_tools() -> None:
+    """run_worker must be available to the queen in COLONY phase."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
 
-    assert "run_parallel_workers" in _QUEEN_WORKING_TOOLS
+    assert "run_worker" in _QUEEN_COLONY_TOOLS
 
 
-def test_working_tools_include_monitoring() -> None:
-    """WORKING-phase queen must be able to monitor and reply to escalations."""
-    from framework.agents.queen.nodes import _QUEEN_WORKING_TOOLS
+def test_colony_tools_include_monitoring_and_review() -> None:
+    """COLONY-phase queen must be able to monitor live workers AND review finished ones."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
 
-    for required in ("get_worker_status", "inject_message", "reply_to_worker"):
-        assert required in _QUEEN_WORKING_TOOLS, f"{required} missing from working tools"
+    for required in (
+        # Live-worker controls
+        "get_worker_status",
+        "inject_message",
+        "stop_worker",
+        # Post-run review / scheduling
+        "set_trigger",
+        "remove_trigger",
+        "list_triggers",
+    ):
+        assert required in _QUEEN_COLONY_TOOLS, f"{required} missing from colony tools"
+
+
+def test_colony_tools_include_tracker_for_parallel_workers() -> None:
+    """COLONY prompt requires tracker setup, so the callable tool list must expose it."""
+    from framework.agents.queen.nodes import _QUEEN_COLONY_TOOLS
+
+    for required in (
+        "tracker_sql",
+        "tracker_register_writable",
+        "tracker_upsert",
+        "tracker_query",
+    ):
+        assert required in _QUEEN_COLONY_TOOLS, f"{required} missing from colony tools"

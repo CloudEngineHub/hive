@@ -111,8 +111,7 @@ def _auth_error() -> dict[str, Any]:
     """Return standardized missing-API-key error payload."""
     return {
         "error": "FRESHDESK_API_KEY environment variable not set",
-        "help": "Get your API key from Freshdesk profile settings and set "
-        "FRESHDESK_API_KEY, or configure it via the credential store.",
+        "help": "Get your API key from Freshdesk profile settings and set FRESHDESK_API_KEY, or configure it via the credential store.",
     }
 
 

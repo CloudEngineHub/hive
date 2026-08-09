@@ -99,7 +99,7 @@ class TestCredentialStoreAdapter:
         with patch(f"{PATCH_BASE}.httpx.post", return_value=_mock_resp(data)) as mock_post:
             result = fn(query="test")
 
-        mock_creds.get.assert_called_with("notion_token")
+        mock_creds.get.assert_called_with("notion")
         assert result["count"] == 0
         # Verify the token from the store was used in the Authorization header
         call_kwargs = mock_post.call_args

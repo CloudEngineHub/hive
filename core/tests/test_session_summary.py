@@ -99,9 +99,7 @@ def test_update_summary_increments(tmp_path: Path) -> None:
 def test_update_summary_skips_non_client_parts(tmp_path: Path) -> None:
     d = _make_session_dir(tmp_path)
     session_summary.update_summary(d, {"role": "tool", "content": "x", "seq": 0, "created_at": 1.0})
-    session_summary.update_summary(
-        d, {"role": "assistant", "content": "", "tool_calls": [{"id": "x"}], "seq": 1, "created_at": 2.0}
-    )
+    session_summary.update_summary(d, {"role": "assistant", "content": "", "tool_calls": [{"id": "x"}], "seq": 1, "created_at": 2.0})
     # Neither part bumps the count or creates a summary file
     assert session_summary.read_summary(d) is None
 

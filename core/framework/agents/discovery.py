@@ -19,7 +19,7 @@ class WorkerEntry:
     task: str = ""
     spawned_at: str = ""
     queen_name: str = ""
-    colony_name: str = ""
+    colony_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -30,7 +30,7 @@ class WorkerEntry:
             "task": self.task,
             "spawned_at": self.spawned_at,
             "queen_name": self.queen_name,
-            "colony_name": self.colony_name,
+            "colony_id": self.colony_id,
         }
 
 
@@ -56,22 +56,19 @@ class AgentEntry:
 def _get_last_active(agent_path: Path) -> str | None:
     """Return the most recent updated_at timestamp across all sessions.
 
-    Checks both worker sessions (``~/.hive/agents/{name}/sessions/``) and
-    queen sessions (``~/.hive/agents/queens/default/sessions/``) whose
-    ``meta.json`` references the same *agent_path*.
+    Checks both worker sessions (``colonies/<c>/workers/<sid>/``) and
+    queen-as-overseer sessions (``colonies/<c>/queens/<q>/sessions/<sid>/``)
+    for this colony.
     """
     from datetime import datetime
 
-    agent_name = agent_path.name
     latest: str | None = None
 
-    # 1. Worker sessions
-    from framework.config import HIVE_HOME
-
-    sessions_dir = HIVE_HOME / "agents" / agent_name / "sessions"
-    if sessions_dir.exists():
-        for session_dir in sessions_dir.iterdir():
-            if not session_dir.is_dir() or not session_dir.name.startswith("session_"):
+    # 1. Worker sessions live under colonies/<c>/workers/<sid>/.
+    workers_root = agent_path / "workers"
+    if workers_root.exists():
+        for session_dir in workers_root.iterdir():
+            if not session_dir.is_dir():
                 continue
             state_file = session_dir / "state.json"
             if not state_file.exists():
@@ -84,52 +81,58 @@ def _get_last_active(agent_path: Path) -> str | None:
             except Exception:
                 continue
 
-    # 2. Queen sessions (scan all queen identity directories)
-    from framework.config import QUEENS_DIR
-
-    if QUEENS_DIR.exists():
-        resolved = agent_path.resolve()
-        for queen_dir in QUEENS_DIR.iterdir():
+    # 2. Queen-as-overseer sessions live under
+    # colonies/<c>/queens/<queen>/sessions/<sid>/.
+    queens_root = agent_path / "queens"
+    if queens_root.exists():
+        for queen_dir in queens_root.iterdir():
             if not queen_dir.is_dir():
                 continue
-            sessions_dir = queen_dir / "sessions"
-            if not sessions_dir.exists():
+            sessions_root = queen_dir / "sessions"
+            if not sessions_root.is_dir():
                 continue
-            for d in sessions_dir.iterdir():
-                if not d.is_dir():
-                    continue
-                meta_file = d / "meta.json"
-                if not meta_file.exists():
+            for session_dir in sessions_root.iterdir():
+                if not session_dir.is_dir():
                     continue
                 try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    stored = meta.get("agent_path")
-                    if not stored or Path(stored).resolve() != resolved:
-                        continue
-                    ts = datetime.fromtimestamp(d.stat().st_mtime).isoformat()
+                    ts = datetime.fromtimestamp(session_dir.stat().st_mtime).isoformat()
                     if latest is None or ts > latest:
                         latest = ts
-                except Exception:
+                except OSError:
                     continue
 
     return latest
 
 
 def _count_sessions(agent_name: str) -> int:
-    """Count session directories under ~/.hive/agents/{agent_name}/sessions/."""
-    from framework.config import HIVE_HOME
+    """Count colony queen+worker session directories for the given colony."""
+    from framework.config import colony_dir
 
-    sessions_dir = HIVE_HOME / "agents" / agent_name / "sessions"
-    if not sessions_dir.exists():
+    cdir = colony_dir(agent_name)
+    if not cdir.exists():
         return 0
-    return sum(1 for d in sessions_dir.iterdir() if d.is_dir() and d.name.startswith("session_"))
+    n = 0
+    # workers/<sid>/
+    workers_dir = cdir / "workers"
+    if workers_dir.exists():
+        n += sum(1 for d in workers_dir.iterdir() if d.is_dir())
+    # queens/<queen>/sessions/<sid>/
+    queens_dir = cdir / "queens"
+    if queens_dir.exists():
+        for q in queens_dir.iterdir():
+            if not q.is_dir():
+                continue
+            sess = q / "sessions"
+            if sess.exists():
+                n += sum(1 for d in sess.iterdir() if d.is_dir())
+    return n
 
 
 def _count_runs(agent_name: str) -> int:
-    """Count unique run_ids across all sessions for an agent."""
-    from framework.config import HIVE_HOME
+    """Count unique run_ids across all worker sessions for a colony."""
+    from framework.config import colony_workers_dir
 
-    sessions_dir = HIVE_HOME / "agents" / agent_name / "sessions"
+    sessions_dir = colony_workers_dir(agent_name)
     if not sessions_dir.exists():
         return 0
     run_ids: set[str] = set()
@@ -164,9 +167,7 @@ def _is_colony_dir(path: Path) -> bool:
 
 def _find_worker_configs(colony_dir: Path) -> list[Path]:
     """Find all worker config JSON files in a colony directory."""
-    return sorted(
-        p for p in colony_dir.iterdir() if p.is_file() and p.suffix == ".json" and p.stem not in _EXCLUDED_JSON_STEMS
-    )
+    return sorted(p for p in colony_dir.iterdir() if p.is_file() and p.suffix == ".json" and p.stem not in _EXCLUDED_JSON_STEMS)
 
 
 def _extract_agent_stats(agent_path: Path) -> tuple[int, int, list[str]]:
@@ -222,6 +223,7 @@ def discover_agents() -> dict[str, list[AgentEntry]]:
             colony_queen_name = ""
             colony_created_at: str | None = None
             colony_icon: str | None = None
+            colony_deleted = False
             metadata_path = path / "metadata.json"
             if metadata_path.exists():
                 try:
@@ -229,8 +231,12 @@ def discover_agents() -> dict[str, list[AgentEntry]]:
                     colony_queen_name = mdata.get("queen_name", "")
                     colony_created_at = mdata.get("created_at")
                     colony_icon = mdata.get("icon")
+                    colony_deleted = bool(mdata.get("deleted"))
                 except Exception:
                     pass
+            # Soft-deleted colonies stay on disk but are hidden from discovery.
+            if colony_deleted:
+                continue
             # Fallback: use directory creation time if metadata lacks created_at
             if not colony_created_at:
                 try:
@@ -255,7 +261,7 @@ def discover_agents() -> dict[str, list[AgentEntry]]:
                             task=data.get("goal", {}).get("description", ""),
                             spawned_at=data.get("spawned_at", ""),
                             queen_name=colony_queen_name,
-                            colony_name=path.name,
+                            colony_id=path.name,
                         )
                         worker_entries.append(w)
                         if not desc:

@@ -1,9 +1,8 @@
 """Bridge from the task store to the EventBus.
 
 The store is intentionally event-free — it's pure storage. The tool
-executors (and run_parallel_workers, and any future colony_template_*
-caller) are responsible for emitting the lifecycle events to the bus
-after successful mutations.
+executors (and run_worker) are responsible for emitting the
+lifecycle events to the bus after successful mutations.
 
 Events are scoped to a stream_id pulled from the execution context if
 available; otherwise they fan out at the global ``primary`` stream so the
@@ -13,6 +12,7 @@ UI's broad subscriptions still see them.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from framework.host.event_bus import AgentEvent, EventBus, EventType
@@ -21,7 +21,17 @@ from framework.tasks.models import TaskRecord
 logger = logging.getLogger(__name__)
 
 # Process-global default — set by the runner / orchestrator at bringup.
+# Last-writer-wins, so with multiple live colonies/sessions it points at
+# whichever booted last. Used only as a fallback now; prefer the resolver.
 _DEFAULT_BUS: EventBus | None = None
+
+# Resolver: session_id -> that session's EventBus. Registered at server
+# bringup (backed by SessionManager). Task events for session X must land on
+# session X's OWN bus — the bus its SSE clients subscribe to — not whatever
+# the global default last happened to be. Without this, an SSE-connected task
+# panel for an earlier colony silently misses live diffs once a newer colony
+# overwrites the default (the snapshot still works, masking it).
+_BUS_RESOLVER: Callable[[str], EventBus | None] | None = None
 
 
 def set_default_event_bus(bus: EventBus | None) -> None:
@@ -29,8 +39,23 @@ def set_default_event_bus(bus: EventBus | None) -> None:
     _DEFAULT_BUS = bus
 
 
-def _get_bus(bus: EventBus | None = None) -> EventBus | None:
-    return bus or _DEFAULT_BUS
+def set_bus_resolver(resolver: Callable[[str], EventBus | None] | None) -> None:
+    global _BUS_RESOLVER
+    _BUS_RESOLVER = resolver
+
+
+def _get_bus(bus: EventBus | None = None, session_id: str | None = None) -> EventBus | None:
+    if bus is not None:
+        return bus
+    if session_id and _BUS_RESOLVER is not None:
+        try:
+            resolved = _BUS_RESOLVER(session_id)
+        except Exception:
+            logger.debug("task bus resolver failed for %s", session_id, exc_info=True)
+            resolved = None
+        if resolved is not None:
+            return resolved
+    return _DEFAULT_BUS
 
 
 def _serialize_record(rec: TaskRecord) -> dict[str, Any]:
@@ -51,12 +76,12 @@ def _serialize_record(rec: TaskRecord) -> dict[str, Any]:
 
 async def emit_task_created(
     *,
-    task_list_id: str,
+    session_id: str,
     record: TaskRecord,
     stream_id: str = "primary",
     bus: EventBus | None = None,
 ) -> None:
-    b = _get_bus(bus)
+    b = _get_bus(bus, session_id)
     if b is None:
         return
     try:
@@ -65,7 +90,7 @@ async def emit_task_created(
                 type=EventType.TASK_CREATED,
                 stream_id=stream_id,
                 data={
-                    "task_list_id": task_list_id,
+                    "session_id": session_id,
                     "task": _serialize_record(record),
                 },
             )
@@ -76,13 +101,13 @@ async def emit_task_created(
 
 async def emit_task_updated(
     *,
-    task_list_id: str,
+    session_id: str,
     record: TaskRecord,
     fields: list[str],
     stream_id: str = "primary",
     bus: EventBus | None = None,
 ) -> None:
-    b = _get_bus(bus)
+    b = _get_bus(bus, session_id)
     if b is None or not fields:
         return
     try:
@@ -91,7 +116,7 @@ async def emit_task_updated(
                 type=EventType.TASK_UPDATED,
                 stream_id=stream_id,
                 data={
-                    "task_list_id": task_list_id,
+                    "session_id": session_id,
                     "task_id": record.id,
                     "after": _serialize_record(record),
                     "fields": fields,
@@ -104,13 +129,13 @@ async def emit_task_updated(
 
 async def emit_task_deleted(
     *,
-    task_list_id: str,
+    session_id: str,
     task_id: int,
     cascade: list[int],
     stream_id: str = "primary",
     bus: EventBus | None = None,
 ) -> None:
-    b = _get_bus(bus)
+    b = _get_bus(bus, session_id)
     if b is None:
         return
     try:
@@ -119,7 +144,7 @@ async def emit_task_deleted(
                 type=EventType.TASK_DELETED,
                 stream_id=stream_id,
                 data={
-                    "task_list_id": task_list_id,
+                    "session_id": session_id,
                     "task_id": task_id,
                     "cascade": cascade,
                 },
@@ -127,32 +152,3 @@ async def emit_task_deleted(
         )
     except Exception:
         logger.debug("emit_task_deleted failed", exc_info=True)
-
-
-async def emit_colony_template_assignment(
-    *,
-    colony_id: str,
-    task_id: int,
-    assigned_session: str | None,
-    assigned_worker_id: str | None,
-    stream_id: str = "primary",
-    bus: EventBus | None = None,
-) -> None:
-    b = _get_bus(bus)
-    if b is None:
-        return
-    try:
-        await b.publish(
-            AgentEvent(
-                type=EventType.COLONY_TEMPLATE_ASSIGNMENT,
-                stream_id=stream_id,
-                data={
-                    "colony_id": colony_id,
-                    "task_id": task_id,
-                    "assigned_session": assigned_session,
-                    "assigned_worker_id": assigned_worker_id,
-                },
-            )
-        )
-    except Exception:
-        logger.debug("emit_colony_template_assignment failed", exc_info=True)

@@ -1,15 +1,17 @@
 """Unit tests for MCP client transport and reconnect behavior."""
 
-import asyncio
-import sys
-import types
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from framework.loader import mcp_client as mcp_client_module
-from framework.loader.mcp_client import MCPClient, MCPServerConfig, MCPTool
+from framework.loader.mcp_client import (
+    MCPClient,
+    MCPServerConfig,
+    MCPTool,
+    _split_mcp_content,
+)
 
 
 class _FakeResponse:
@@ -231,102 +233,97 @@ def test_call_tool_http_preserves_runtime_error_wrapping(monkeypatch):
     assert reconnects == []
 
 
-def test_connect_stdio_times_out_when_not_ready(monkeypatch):
-    mcp = types.ModuleType("mcp")
-    mcp_client = types.ModuleType("mcp.client")
-    mcp_client_stdio = types.ModuleType("mcp.client.stdio")
+# ---------------------------------------------------------------------------
+# _split_mcp_content — text + image/file block translation
+#
+# Layer B established that PDFs must travel as OpenAI `file` blocks (not
+# `image_url` blocks); LiteLLM auto-remaps `file` to each provider's
+# native PDF shape but emits an invalid `{"type":"image",...}` if the
+# data URI sits inside an image_url block (Anthropic rejects it).
+# These tests guard the MCP-side branch for tools (e.g. attach_file)
+# that return PDFs as MCP ImageContent items.
+# ---------------------------------------------------------------------------
 
-    class StdioServerParameters:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
 
-    class ClientSession:
-        async def __aenter__(self):
-            return self
+class _MCPText:
+    def __init__(self, text: str) -> None:
+        self.text = text
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
 
-        async def initialize(self):
-            return None
+class _MCPImage:
+    """Duck-typed stand-in for mcp.types.ImageContent / BlobResourceContents."""
 
-    class NeverEnterContext:
-        async def __aenter__(self):
-            await asyncio.Future()  # Simulate a hung handshake
+    def __init__(self, data: str, mimeType: str, meta: dict | None = None) -> None:
+        self.data = data
+        self.mimeType = mimeType
+        self._meta = meta
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
 
-    def stdio_client(_params):
-        return NeverEnterContext()
+def test_split_mcp_content_text_only():
+    text, images = _split_mcp_content([_MCPText("hello"), _MCPText("world")])
+    assert text == "hello\nworld"
+    assert images == []
 
-    mcp.StdioServerParameters = StdioServerParameters
-    mcp.ClientSession = ClientSession
-    mcp_client_stdio.stdio_client = stdio_client
 
-    monkeypatch.setitem(sys.modules, "mcp", mcp)
-    monkeypatch.setitem(sys.modules, "mcp.client", mcp_client)
-    monkeypatch.setitem(sys.modules, "mcp.client.stdio", mcp_client_stdio)
+def test_split_mcp_content_image_emits_image_url_block():
+    text, images = _split_mcp_content([_MCPText("alt-text"), _MCPImage(data="AAA", mimeType="image/png")])
+    assert text == "alt-text"
+    assert images == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
 
-    # Make the event loop start succeed, but the connection-ready event never set.
-    class FakeEvent:
-        _count = 0
 
-        def __init__(self):
-            type(self)._count += 1
-            self._idx = type(self)._count
-            self._set = False
+def test_split_mcp_content_pdf_emits_file_block_not_image():
+    """Regression: a PDF MUST become a `file` block, never `image_url`,
+    so LiteLLM remaps to Anthropic `document` / Gemini `inline_data` /
+    OpenAI native `file`. The previous code emitted `image_url` with
+    `application/pdf` which Anthropic rejects."""
+    text, images = _split_mcp_content(
+        [
+            _MCPText("here is a PDF"),
+            _MCPImage(data="JVBE", mimeType="application/pdf"),
+        ]
+    )
+    assert text == "here is a PDF"
+    assert len(images) == 1
+    block = images[0]
+    assert block["type"] == "file"
+    assert block["file"]["file_data"] == "data:application/pdf;base64,JVBE"
+    # No image_url shape leaks through.
+    assert "image_url" not in block
 
-        def set(self):
-            self._set = True
 
-        def wait(self, timeout=None):
-            # First event (loop_started) reports ready immediately.
-            # Second event (connection_ready) never becomes ready.
-            return self._idx == 1
+def test_split_mcp_content_pdf_picks_up_filename_from_meta():
+    text, images = _split_mcp_content(
+        [
+            _MCPImage(
+                data="JVBE",
+                mimeType="application/pdf",
+                meta={"filename": "invoice_q3.pdf"},
+            )
+        ]
+    )
+    assert images[0]["file"]["filename"] == "invoice_q3.pdf"
 
-        def is_set(self):
-            return self._set if self._idx == 1 else False
 
-    class FakeLoop:
-        def create_task(self, coro):
-            # Avoid "coroutine was never awaited" warnings.
-            coro.close()
-            return None
+def test_split_mcp_content_pdf_default_filename_when_no_meta():
+    text, images = _split_mcp_content([_MCPImage(data="JVBE", mimeType="application/pdf")])
+    assert images[0]["file"]["filename"] == "document.pdf"
 
-        def run_forever(self):
-            return None
 
-    def fake_new_event_loop():
-        return FakeLoop()
+def test_split_mcp_content_pdf_case_insensitive_mime():
+    """Some MCP tools may use upper-cased mime; the branch must still fire."""
+    _, images = _split_mcp_content([_MCPImage(data="JVBE", mimeType="Application/PDF")])
+    assert images[0]["type"] == "file"
 
-    def fake_set_event_loop(_loop):
-        return None
 
-    class FakeThread:
-        def __init__(self, target, daemon=None):
-            self._target = target
-            self._alive = False
-
-        def start(self):
-            self._alive = True
-            self._target()
-            self._alive = False
-
-        def is_alive(self):
-            return self._alive
-
-        def join(self, timeout=None):
-            return None
-
-    monkeypatch.setattr("threading.Event", FakeEvent)
-    monkeypatch.setattr("threading.Thread", FakeThread)
-    monkeypatch.setattr("asyncio.new_event_loop", fake_new_event_loop)
-    monkeypatch.setattr("asyncio.set_event_loop", fake_set_event_loop)
-
-    monkeypatch.setattr(MCPClient, "_discover_tools", lambda _self: None)
-
-    client = MCPClient(MCPServerConfig(name="demo", transport="stdio", command="dummy"))
-
-    with pytest.raises(RuntimeError, match="Timed out waiting for MCP stdio connection"):
-        client.connect()
+def test_split_mcp_content_mixed_text_image_pdf():
+    items = [
+        _MCPText("a"),
+        _MCPImage(data="img1", mimeType="image/jpeg"),
+        _MCPText("b"),
+        _MCPImage(data="pdf1", mimeType="application/pdf"),
+    ]
+    text, images = _split_mcp_content(items)
+    assert text == "a\nb"
+    assert [b["type"] for b in images] == ["image_url", "file"]
+    assert images[0]["image_url"]["url"] == "data:image/jpeg;base64,img1"
+    assert images[1]["file"]["file_data"] == "data:application/pdf;base64,pdf1"

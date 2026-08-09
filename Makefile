@@ -27,9 +27,9 @@ check: ## Run all checks without modifying files (CI-safe)
 	cd core && uv run ruff format --check .
 	cd tools && uv run ruff format --check .
 
-test: ## Run all tests (core + tools, excludes live)
+test: ## Run all tests except per-tool wrappers and live (use test-tools / test-live for those)
 	cd core && uv run python -m pytest tests/ -v --ignore=tests/dummy_agents
-	cd tools && uv run python -m pytest -v
+	cd tools && uv run python -m pytest -v --ignore=tests/tools
 
 test-tools: ## Run tool tests only (mocked, no credentials needed)
 	cd tools && uv run python -m pytest -v

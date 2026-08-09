@@ -36,10 +36,7 @@ def _get_creds(
     if not token or not store:
         return {
             "error": "Shopify credentials not configured",
-            "help": (
-                "Set SHOPIFY_ACCESS_TOKEN and SHOPIFY_STORE_NAME "
-                "environment variables or configure via credential store"
-            ),
+            "help": ("Set SHOPIFY_ACCESS_TOKEN and SHOPIFY_STORE_NAME environment variables or configure via credential store"),
         }
     return token, store
 
@@ -329,10 +326,7 @@ def register_tools(
                     }
                 )
 
-            images = [
-                {"id": img.get("id"), "src": img.get("src"), "position": img.get("position")}
-                for img in p.get("images", [])
-            ]
+            images = [{"id": img.get("id"), "src": img.get("src"), "position": img.get("position")} for img in p.get("images", [])]
 
             return {
                 "id": p.get("id"),

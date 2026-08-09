@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
-
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="terminal_tools is POSIX-only (uses resource module)")
 
 
 def test_resolve_shell_rejects_zsh():
@@ -18,9 +14,17 @@ def test_resolve_shell_rejects_zsh():
 
 
 def test_resolve_shell_accepts_bash():
+    import os
+
     from terminal_tools.common.limits import _resolve_shell
 
-    assert _resolve_shell(True) == "/bin/bash"
+    if os.name == "nt":
+        # Windows resolves shell=True to the platform shell (Git Bash if
+        # installed, else PowerShell/cmd) — never the POSIX "/bin/bash".
+        assert _resolve_shell(True) is not None
+    else:
+        assert _resolve_shell(True) == "/bin/bash"
+    # An explicit shell path is always honored verbatim.
     assert _resolve_shell("/bin/bash") == "/bin/bash"
     assert _resolve_shell(False) is None
 
@@ -67,6 +71,45 @@ def test_destructive_warning_clean_commands():
 
     for cmd in ["ls -la", "echo hi", "git status", "git commit -m 'x'"]:
         assert get_warning(cmd) is None, f"unexpected warning for {cmd!r}"
+
+
+def test_command_guard_blocks_windows_browser_kills():
+    """On Windows the resolved shell may be PowerShell/cmd — the guard must
+    catch the native kill verbs, not just bash pkill/killall."""
+    from terminal_tools.common.command_guard import check_command
+
+    blocked = [
+        "Stop-Process -Name chrome",
+        "Stop-Process -Name msedge -Force",
+        "Get-Process chrome | Stop-Process -Force",
+        "Get-Process chrome | Where-Object { $_.CPU -gt 1 } | Stop-Process",
+        "taskkill /IM chrome.exe /F",
+        "taskkill /F /IM msedge.exe",
+        "Stop-Process -Name bridge_host",
+    ]
+    for cmd in blocked:
+        assert check_command(cmd) is not None, f"should block: {cmd!r}"
+
+
+def test_command_guard_blocks_windows_browser_launch():
+    from terminal_tools.common.command_guard import check_command
+
+    for cmd in ["Start-Process chrome", "start chrome", 'Start-Process "chrome.exe"']:
+        assert check_command(cmd) is not None, f"should block: {cmd!r}"
+
+
+def test_command_guard_allows_clean_windows_commands():
+    from terminal_tools.common.command_guard import check_command
+
+    for cmd in [
+        "Get-Process | Sort-Object CPU -Descending",
+        "Get-ChildItem C:\\Users",
+        "taskkill /IM mytool.exe",  # not a browser/runtime process
+        "Stop-Process -Name myworker",  # not a protected process
+        "echo chrome",
+        "Start-Process notepad",
+    ]:
+        assert check_command(cmd) is None, f"should allow: {cmd!r}"
 
 
 def test_semantic_exit_grep():

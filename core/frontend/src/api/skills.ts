@@ -1,6 +1,6 @@
 import { api } from "./client";
 
-export type SkillScopeKind = "queen" | "colony" | "user";
+export type SkillScopeKind = "queen" | "user";
 
 export type SkillProvenance =
   | "framework"
@@ -41,10 +41,8 @@ export interface SkillRow {
 
 export interface ScopeSkillsResponse {
   queen_id?: string;
-  colony_name?: string;
   all_defaults_disabled: boolean;
   skills: SkillRow[];
-  inherited_from_queen?: string[];
 }
 
 export interface AggregatedSkillsResponse {
@@ -66,6 +64,9 @@ export interface SkillDetailResponse {
   base_dir: string;
   body: string;
   visibility: string[] | null;
+  // Only the queen-scoped body endpoint sets this; the scope-less detail
+  // endpoint leaves it undefined.
+  editable?: boolean;
 }
 
 export interface SkillCreatePayload {
@@ -85,10 +86,8 @@ export interface SkillPatchPayload {
   all_defaults_disabled?: boolean;
 }
 
-const scopePath = (scope: "queen" | "colony", targetId: string) =>
-  scope === "queen"
-    ? `/queen/${encodeURIComponent(targetId)}/skills`
-    : `/colonies/${encodeURIComponent(targetId)}/skills`;
+const queenPath = (queenId: string) =>
+  `/queen/${encodeURIComponent(queenId)}/skills`;
 
 export const skillsApi = {
   // Aggregated library
@@ -97,49 +96,49 @@ export const skillsApi = {
   getDetail: (name: string) =>
     api.get<SkillDetailResponse>(`/skills/${encodeURIComponent(name)}`),
 
-  // Per-scope
+  // Per-queen (colonies inherit their owning queen's skill config)
   listForQueen: (queenId: string) =>
-    api.get<ScopeSkillsResponse>(`/queen/${encodeURIComponent(queenId)}/skills`),
-  listForColony: (colonyName: string) =>
-    api.get<ScopeSkillsResponse>(
-      `/colonies/${encodeURIComponent(colonyName)}/skills`,
-    ),
+    api.get<ScopeSkillsResponse>(queenPath(queenId)),
 
-  create: (
-    scope: "queen" | "colony",
-    targetId: string,
-    payload: SkillCreatePayload,
-  ) => api.post<SkillRow>(scopePath(scope, targetId), payload),
+  create: (queenId: string, payload: SkillCreatePayload) =>
+    api.post<SkillRow>(queenPath(queenId), payload),
 
-  patch: (
-    scope: "queen" | "colony",
-    targetId: string,
-    skillName: string,
-    payload: SkillPatchPayload,
-  ) =>
+  patch: (queenId: string, skillName: string, payload: SkillPatchPayload) =>
     api.patch<{ name: string; enabled: boolean | null; ok: boolean }>(
-      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}`,
+      `${queenPath(queenId)}/${encodeURIComponent(skillName)}`,
       payload,
     ),
 
+  // Queen-scoped body read: returns THIS queen's copy with a frontmatter-
+  // stripped `body` (round-trips through putBody, which re-adds frontmatter).
+  getBody: (queenId: string, skillName: string) =>
+    api.get<SkillDetailResponse>(
+      `${queenPath(queenId)}/${encodeURIComponent(skillName)}/body`,
+    ),
+
   putBody: (
-    scope: "queen" | "colony",
-    targetId: string,
+    queenId: string,
     skillName: string,
     payload: { body: string; description?: string },
   ) =>
     api.put<{ name: string; installed_path: string }>(
-      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}/body`,
+      `${queenPath(queenId)}/${encodeURIComponent(skillName)}/body`,
       payload,
     ),
 
-  remove: (scope: "queen" | "colony", targetId: string, skillName: string) =>
-    api.delete<{ name: string; removed: boolean }>(
-      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}`,
+  rename: (queenId: string, skillName: string, newName: string) =>
+    api.post<{ old_name: string; new_name: string; ok: boolean }>(
+      `${queenPath(queenId)}/${encodeURIComponent(skillName)}/rename`,
+      { new_name: newName },
     ),
 
-  reload: (scope: "queen" | "colony", targetId: string) =>
-    api.post<{ ok: boolean }>(`${scopePath(scope, targetId)}/reload`),
+  remove: (queenId: string, skillName: string) =>
+    api.delete<{ name: string; removed: boolean }>(
+      `${queenPath(queenId)}/${encodeURIComponent(skillName)}`,
+    ),
+
+  reload: (queenId: string) =>
+    api.post<{ ok: boolean }>(`${queenPath(queenId)}/reload`),
 
   // Multipart upload. File may be a SKILL.md or a .zip bundle.
   upload: (formData: FormData) =>

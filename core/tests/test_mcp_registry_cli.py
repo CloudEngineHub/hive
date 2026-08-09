@@ -40,11 +40,19 @@ def registry_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def registry(registry_home):
-    """Return an initialized MCPRegistry backed by tmp_path."""
+    """Return an initialized MCPRegistry backed by tmp_path.
+
+    initialize() seeds bundled system MCPs (hive_tools, memory-tools, ...)
+    from the repo's tools/ dir. Tests here exercise *user*-facing flows in
+    isolation, so wipe installed.json after init. _read_installed() only
+    re-seeds when the file is missing, so leaving an empty file in place
+    keeps the registry empty for the rest of the test.
+    """
     from framework.loader.mcp_registry import MCPRegistry
 
     reg = MCPRegistry(base_path=registry_home)
     reg.initialize()
+    (registry_home / "installed.json").write_text(json.dumps({"servers": {}}), encoding="utf-8")
     return reg
 
 
@@ -894,6 +902,8 @@ def test_main_dispatches_mcp_list_through_real_argparse(registry_home, monkeypat
 
     reg = MCPRegistry(base_path=registry_home)
     reg.initialize()
+    # Strip system-seeded MCPs so this test's "empty registry" assertion holds.
+    (registry_home / "installed.json").write_text(json.dumps({"servers": {}}), encoding="utf-8")
     monkeypatch.setattr(
         "framework.loader.mcp_registry_cli._get_registry",
         lambda base_path=None: reg,

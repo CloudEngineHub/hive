@@ -1,16 +1,27 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { apiUrl } from "@/api/client";
 import {
   User, Component, X, Calendar, Target, Activity, ArrowRight, Clock,
   Rocket, Globe, Mail, Search, Shield, TrendingUp, Briefcase, Code,
-  Database, FileText, MessageSquare, Zap, BarChart3, Users, Bot,
+  Database, FileText, MessageSquare, Zap, BarChart3, Users, Bot, Network,
   type LucideIcon,
 } from "lucide-react";
 import { useColony } from "@/context/ColonyContext";
+import { isQueenDecommissioned, useMe, useQueenDecommission, useSetQueenLead, useSetQueenPosition, useSetQueenPositions, useResetQueenPositions } from "@/lib/me";
 import { agentsApi } from "@/api/agents";
 import type { QueenProfileSummary, Colony } from "@/types/colony";
 import QueenProfilePanel from "@/components/QueenProfilePanel";
-import { sortQueenProfiles } from "@/lib/colony-registry";
+import QueenPortraitGlyph from "@/components/QueenPortraitGlyph";
+import { orderQueens, QUEEN_DISPLAY_ORDER } from "@/lib/colony-registry";
+import {
+  allPersonaSummaries,
+  queenFunctionLabel,
+  type PersonaSummary,
+} from "@/lib/queen-leaders";
+import { useLiveSessions } from "@/hooks/use-live-sessions";
+import { deriveColonyStatus, describeColonyStatus, STATUS_DOT_CLASS, STATUS_LABEL, STATUS_TEXT_CLASS } from "@/lib/colony-status";
+import { Tooltip } from "@/components/Tooltip";
 
 const COLONY_ICONS: Record<string, LucideIcon> = {
   component: Component, rocket: Rocket, globe: Globe, mail: Mail,
@@ -20,14 +31,44 @@ const COLONY_ICONS: Record<string, LucideIcon> = {
 };
 const COLONY_ICON_KEYS = Object.keys(COLONY_ICONS);
 
+/* ── Canvas layout geometry ──────────────────────────────────────────────
+ * Queen cards are positioned absolutely in this fixed canvas coordinate
+ * space; saved positions (preferences.queens[id].pos) are stored in the same
+ * space so they restore identically. The canvas is centered in the viewport
+ * and pan/zoom move the whole thing. */
+const CANVAS_W = 2200;
+const CANVAS_H = 1500;
+const CENTER_X = CANVAS_W / 2;
+const CARD_W = 140; // 8.75rem queen card
+const CARD_H = 130; // 8.125rem card body (connector anchor; tags hang below)
+const ROW_GAP = 28;
+const CEO_W = 190;
+const CEO_H = 104;
+const CEO_X = CENTER_X - CEO_W / 2;
+const CEO_Y = 56;
+const QUEEN_ROW_Y = 336;
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** Default row position for a queen with no saved position. */
+function defaultQueenPos(index: number, count: number): { x: number; y: number } {
+  const rowW = count * CARD_W + Math.max(0, count - 1) * ROW_GAP;
+  const startX = CENTER_X - rowW / 2;
+  return { x: startX + index * (CARD_W + ROW_GAP), y: QUEEN_ROW_Y };
+}
+
+/* Pointy-top hexagon matching the bee-theme HiveLogo / QueenPortraitGlyph —
+   used to clip org-chart node avatars into honeycomb cells instead of circles. */
+const HEX_CLIP = "polygon(50% 0%, 93.3% 25%, 93.3% 75%, 50% 100%, 6.7% 75%, 6.7% 25%)";
+
 /* ── User avatar (CEO card) ──────────────────────────────────────────── */
 
-function UserAvatar({ initials, avatarVersion }: { initials: string; avatarVersion: number }) {
-  const [hasAvatar, setHasAvatar] = useState(true);
-  const url = `/api/config/profile/avatar?v=${avatarVersion}`;
-  useEffect(() => setHasAvatar(true), [avatarVersion]);
+function UserAvatar({ initials, avatarVersion, userHasAvatar }: { initials: string; avatarVersion: number; userHasAvatar: boolean }) {
+  const [hasAvatar, setHasAvatar] = useState(userHasAvatar);
+  const url = apiUrl(`/config/profile/avatar?v=${avatarVersion}`);
+  useEffect(() => setHasAvatar(userHasAvatar), [avatarVersion, userHasAvatar]);
   return (
-    <div className="w-12 h-12 rounded-full bg-primary/15 mx-auto mb-3 flex items-center justify-center overflow-hidden">
+    <div className="w-12 h-12 bg-primary/15 mx-auto mb-3 flex items-center justify-center overflow-hidden" style={{ clipPath: HEX_CLIP }}>
       {hasAvatar ? (
         <img src={url} alt="" className="w-full h-full object-cover" onError={() => setHasAvatar(false)} />
       ) : initials ? (
@@ -46,6 +87,8 @@ function ColonyTag({ colony, onSelect }: { colony: Colony; onSelect: () => void 
   return (
     <button
       onClick={onSelect}
+      onMouseDown={(e) => e.stopPropagation()}
+      data-tour="tour-colony-tag"
       className="flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground hover:border-primary/30 hover:text-foreground transition-colors w-full text-left"
     >
       <Icon className="w-3 h-3 flex-shrink-0 text-primary/60" />
@@ -61,6 +104,7 @@ function ColonyDetailPanel({ colony, queenName, onClose, onIconChange }: {
   onIconChange: (colonyId: string, icon: string) => void;
 }) {
   const navigate = useNavigate();
+  const { byColony } = useLiveSessions();
   const [iconPickerOpen, setIconPickerOpen] = useState(false);
 
   const formatDate = (iso: string | null) => {
@@ -171,10 +215,18 @@ function ColonyDetailPanel({ colony, queenName, onClose, onIconChange }: {
             <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Current Status</h4>
             <div className="flex items-center gap-2 text-sm">
               <Activity className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
-              <span className={`inline-flex items-center gap-1.5 ${colony.status === "running" ? "text-emerald-500" : "text-muted-foreground"}`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${colony.status === "running" ? "bg-emerald-500" : "bg-muted-foreground/40"}`} />
-                {colony.status === "running" ? "Running" : "Idle"}
-              </span>
+              {(() => {
+                const liveness = byColony.get(colony.id);
+                const s = deriveColonyStatus(colony.sessionId !== null, liveness);
+                return (
+                  <Tooltip label={describeColonyStatus(s, liveness)} atCursor>
+                    <span className={`inline-flex items-center gap-1.5 ${STATUS_TEXT_CLASS[s]}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${STATUS_DOT_CLASS[s]}`} />
+                      {STATUS_LABEL[s]}
+                    </span>
+                  </Tooltip>
+                );
+              })()}
             </div>
           </div>
 
@@ -210,12 +262,20 @@ function ColonyDetailPanel({ colony, queenName, onClose, onIconChange }: {
 /* ── Queen avatar ────────────────────────────────────────────────────── */
 
 function QueenAvatar({ queenId, name, size = "w-11 h-11" }: { queenId: string; name: string; size?: string }) {
-  const [hasAvatar, setHasAvatar] = useState(true);
-  const url = `/api/queen/${queenId}/avatar`;
+  const { queenProfiles, queenAvatarVersion, queenHasAvatar } = useColony();
+  const version = queenAvatarVersion(queenId);
+  const [hasAvatar, setHasAvatar] = useState(() => queenHasAvatar(queenId));
+  const url = apiUrl(`/queen/${queenId}/avatar?v=${version}`);
+  // Re-sync the "has an avatar" guard whenever the version bumps (a fresh
+  // upload just flipped the flag true) or the runtime confirms presence.
+  useEffect(() => setHasAvatar(queenHasAvatar(queenId)), [version, queenId, queenHasAvatar]);
+  const portrait = queenProfiles.find((q) => q.id === queenId)?.portrait;
   return (
-    <div className={`${size} rounded-full bg-primary/15 flex items-center justify-center overflow-hidden`}>
+    <div className={`${size} bg-primary/15 flex items-center justify-center overflow-hidden`} style={{ clipPath: HEX_CLIP }}>
       {hasAvatar ? (
         <img src={url} alt={name} className="w-full h-full object-cover" onError={() => setHasAvatar(false)} />
+      ) : portrait ? (
+        <QueenPortraitGlyph p={portrait} frame={false} className="w-full h-full" />
       ) : (
         <span className="text-sm font-bold text-primary">{name.charAt(0)}</span>
       )}
@@ -229,42 +289,54 @@ function QueenCard({
   queen,
   colonies,
   selected,
-  onSelect,
+  decommissioned,
+  dragging,
+  onCardMouseDown,
   onSelectColony,
 }: {
   queen: QueenProfileSummary;
   colonies: Colony[];
   selected: boolean;
-  onSelect: () => void;
+  decommissioned: boolean;
+  dragging: boolean;
+  onCardMouseDown: (e: React.MouseEvent) => void;
   onSelectColony: (colony: Colony) => void;
 }) {
   return (
-    <div className="flex flex-col items-center w-[140px] flex-shrink-0">
-      {/* Vertical stub from horizontal bar */}
-      <div className="w-px h-6 bg-border" />
-
-      {/* Queen card — fixed height so all cards align */}
-      <button
-        onClick={onSelect}
-        className={`group flex flex-col items-center justify-center rounded-xl border bg-card p-4 w-full h-[130px] transition-all duration-200 text-center ${
+    <div className="flex flex-col items-center w-full">
+      {/* Queen card — drag handle. Fixed height so all cards align. */}
+      <div
+        onMouseDown={onCardMouseDown}
+        data-tour="tour-queen-card"
+        title={decommissioned ? "Decommissioned" : "Drag to move · click to open"}
+        className={`group flex flex-col items-center justify-center rounded-xl border bg-card p-4 w-full h-[8.125rem] text-center select-none ${
+          dragging
+            ? "cursor-grabbing shadow-xl ring-2 ring-primary/40"
+            : "cursor-grab transition-all duration-200"
+        } ${
           selected
             ? "border-primary/40 bg-primary/[0.04] ring-1 ring-primary/20"
             : "border-border/60 hover:border-primary/30 hover:bg-primary/[0.03]"
-        }`}
+        } ${decommissioned ? "opacity-50 grayscale" : ""}`}
       >
         <div className="mb-2.5">
           <QueenAvatar queenId={queen.id} name={queen.name} />
         </div>
-        <span className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors line-clamp-1">
+        <span className={`text-sm font-semibold transition-colors line-clamp-1 ${
+          decommissioned
+            ? "text-muted-foreground line-through"
+            : "text-foreground group-hover:text-primary"
+        }`}>
           {queen.name}
         </span>
         <span className="text-xs text-muted-foreground mt-0.5 line-clamp-1">
-          {queen.title}
+          {decommissioned ? "Decommissioned" : queen.title}
         </span>
-      </button>
+      </div>
 
-      {/* Colony connections */}
-      {colonies.length > 0 && (
+      {/* Colony connections — hidden for decommissioned queens since
+          colonies don't list them either */}
+      {!decommissioned && colonies.length > 0 && (
         <>
           <div className="w-px h-4 bg-border" />
           <div className="flex flex-col gap-1.5 w-full">
@@ -278,14 +350,184 @@ function QueenCard({
   );
 }
 
+/* ── Leader persona card (hireable from the catalog) ─────────────────── */
+
+function PersonaCard({ persona, isCurrent, isSaving, onHire }: {
+  persona: PersonaSummary;
+  isCurrent: boolean;
+  isSaving: boolean;
+  onHire: () => void;
+}) {
+  return (
+    <div
+      className={`flex flex-col items-center w-[7.5rem] flex-shrink-0 rounded-xl border bg-card p-3 text-center ${
+        isCurrent ? "border-primary/40 ring-1 ring-primary/20" : "border-border/60"
+      }`}
+      title={persona.bio}
+    >
+      <div className="w-11 h-11 bg-primary/15 flex items-center justify-center overflow-hidden mb-2" style={{ clipPath: HEX_CLIP }}>
+        <QueenPortraitGlyph p={persona.portrait} frame={false} className="w-full h-full" />
+      </div>
+      <span className="text-xs font-semibold text-foreground line-clamp-1 w-full">
+        {persona.name}
+      </span>
+      <span className="text-[10px] text-muted-foreground mt-0.5 line-clamp-1 w-full">
+        {persona.title}
+      </span>
+      <button
+        onClick={onHire}
+        disabled={isCurrent || isSaving}
+        className={`mt-2 w-full rounded-md border border-primary/30 px-2 py-1 text-[10px] font-medium transition-colors ${
+          isCurrent
+            ? "text-primary cursor-default opacity-80"
+            : "text-primary hover:bg-primary/10 disabled:opacity-50"
+        }`}
+      >
+        {isCurrent ? "Current lead" : isSaving ? "Hiring…" : "Hire"}
+      </button>
+    </div>
+  );
+}
+
+/* ── One function's leaders, with inline decommission/re-enable ──────── */
+
+function FunctionGroup({
+  functionId,
+  label,
+  personas,
+  currentLeaderId,
+  decommissioned,
+  hireSaving,
+  onHire,
+}: {
+  functionId: string;
+  /** Resolved from her profile title — see queenFunctionLabel. */
+  label: string;
+  personas: PersonaSummary[];
+  currentLeaderId: string | null;
+  decommissioned: boolean;
+  hireSaving: boolean;
+  onHire: (functionId: string, persona: PersonaSummary) => void;
+}) {
+  const { setDecommissioned, saving } = useQueenDecommission(functionId);
+  return (
+    <div className={decommissioned ? "opacity-60" : ""}>
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-[11px] font-semibold text-foreground/80">
+          {label}
+        </span>
+        {decommissioned && (
+          <>
+            <span className="text-[9px] uppercase tracking-wider text-muted-foreground rounded bg-muted px-1.5 py-0.5">
+              Decommissioned
+            </span>
+            <button
+              onClick={() => void setDecommissioned(false)}
+              disabled={saving}
+              className="rounded-md border border-primary/30 px-2 py-0.5 text-[10px] font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+            >
+              {saving ? "…" : "Re-enable"}
+            </button>
+          </>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {personas.map((persona) => (
+          <PersonaCard
+            key={persona.id}
+            persona={persona}
+            isCurrent={currentLeaderId === persona.leaderId}
+            isSaving={hireSaving}
+            onHire={() => onHire(functionId, persona)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Leader catalog grouped by function ──────────────────────────────── */
+
+function LeaderCatalog() {
+  const { me } = useMe();
+  const { refresh: refreshColony, queenProfiles } = useColony();
+  const { setLead, savingQueenId } = useSetQueenLead();
+  const personas = allPersonaSummaries(QUEEN_DISPLAY_ORDER);
+  const groups: { functionId: string; personas: PersonaSummary[] }[] = [];
+  for (const p of personas) {
+    let group = groups[groups.length - 1];
+    if (!group || group.functionId !== p.functionId) {
+      group = { functionId: p.functionId, personas: [] };
+      groups.push(group);
+    }
+    group.personas.push(p);
+  }
+  const handleHire = async (functionId: string, persona: PersonaSummary) => {
+    await setLead(functionId, {
+      leaderId: persona.leaderId,
+      name: persona.name,
+      title: persona.title,
+      bio: persona.bio,
+      portrait: persona.portrait,
+    });
+    // Re-pull /queen/profiles so the chart reflects the new lead's persona.
+    refreshColony();
+  };
+  return (
+    <div className="space-y-4">
+      {groups.map((group) => {
+        // Resolve the current lead: an explicit hire preference wins;
+        // otherwise match the runtime queen's live name to a persona in this
+        // group. Falling back to personas[0] is wrong — for a few functions
+        // the catalog's first persona is NOT the runtime default (e.g.
+        // product_strategy lists Chesky first but defaults to Jobs), which
+        // would falsely disable a hireable card. null → nothing is marked
+        // current, so every persona stays hireable.
+        const currentName = queenProfiles.find(
+          (q) => q.id === group.functionId,
+        )?.name;
+        const currentLeaderId =
+          me?.preferences?.queens?.[group.functionId]?.id ??
+          group.personas.find((p) => p.name === currentName)?.leaderId ??
+          null;
+        return (
+          <FunctionGroup
+            key={group.functionId}
+            functionId={group.functionId}
+            label={queenFunctionLabel(queenProfiles, group.functionId)}
+            personas={group.personas}
+            currentLeaderId={currentLeaderId}
+            decommissioned={isQueenDecommissioned(me, group.functionId)}
+            hireSaving={savingQueenId === group.functionId}
+            onHire={handleHire}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 /* ── Main org chart page ──────────────────────────────────────────────── */
 
 // Fixed left-to-right order for queen cards
 export default function OrgChart() {
-  const { queenProfiles: unsortedQueenProfiles, colonies, userProfile, userAvatarVersion } = useColony();
-  const queenProfiles = sortQueenProfiles(unsortedQueenProfiles);
+  const { queenProfiles: unsortedQueenProfiles, colonies, userProfile, userAvatarVersion, userHasAvatar } = useColony();
+  const { me } = useMe();
+  const setQueenPosition = useSetQueenPosition();
+  const setQueenPositions = useSetQueenPositions();
+  const resetQueenPositions = useResetQueenPositions();
+  const orderedQueens = orderQueens(
+    unsortedQueenProfiles,
+    Object.keys(me?.preferences?.queens ?? {}),
+  );
+  // Decommissioned queens are hidden from the chart; they live behind the
+  // "decommissioned" toggle in the header where they can be re-enabled.
+  const queenProfiles = orderedQueens.filter(
+    (q) => !isQueenDecommissioned(me, q.id),
+  );
   const [selectedQueenId, setSelectedQueenId] = useState<string | null>(null);
   const [selectedColony, setSelectedColony] = useState<Colony | null>(null);
+  const [showDecommissioned, setShowDecommissioned] = useState(false);
 
   // Pan & zoom state
   const [zoom, setZoom] = useState(1);
@@ -295,33 +537,141 @@ export default function OrgChart() {
   const MIN_ZOOM = 0.3;
   const MAX_ZOOM = 2;
 
+  // Per-card drag state. `localPositions` holds optimistic positions for cards
+  // moved this session (takes precedence over the saved/default position so
+  // there's no flicker between drop and the /v1/me refetch). `cardDrag` tracks
+  // the in-flight drag; `draggingId` drives cursor/elevation styling.
+  const [localPositions, setLocalPositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const cardDrag = useRef<{
+    id: string; startX: number; startY: number;
+    origX: number; origY: number; lastX: number; lastY: number; moved: boolean;
+  } | null>(null);
+
+  // Effective on-canvas position per visible queen: optimistic > saved > default.
+  const positions: Record<string, { x: number; y: number }> = {};
+  queenProfiles.forEach((q, i) => {
+    const saved = me?.preferences?.queens?.[q.id]?.pos;
+    positions[q.id] =
+      localPositions[q.id] ??
+      (saved && typeof saved.x === "number" && typeof saved.y === "number"
+        ? { x: saved.x, y: saved.y }
+        : defaultQueenPos(i, queenProfiles.length));
+  });
+
+  // True when at least one card has been moved (this session or persisted) —
+  // gates the reset control.
+  const hasCustomPositions =
+    Object.keys(localPositions).length > 0 ||
+    queenProfiles.some((q) => me?.preferences?.queens?.[q.id]?.pos != null);
+
+  // Positions captured at the moment of reset, so the button can offer "Undo"
+  // to put them back. Cleared once the user moves a card again (a new layout).
+  const [undoSnapshot, setUndoSnapshot] = useState<Record<string, { x: number; y: number }> | null>(null);
+
+  const handleResetPositions = () => {
+    const snapshot: Record<string, { x: number; y: number }> = {};
+    for (const q of queenProfiles) {
+      const saved = me?.preferences?.queens?.[q.id]?.pos;
+      const hasCustom =
+        localPositions[q.id] != null ||
+        (saved && typeof saved.x === "number" && typeof saved.y === "number");
+      if (hasCustom) snapshot[q.id] = positions[q.id];
+    }
+    setUndoSnapshot(Object.keys(snapshot).length > 0 ? snapshot : null);
+    setLocalPositions({});
+    void resetQueenPositions();
+  };
+
+  const handleUndoReset = () => {
+    if (!undoSnapshot) return;
+    setLocalPositions(undoSnapshot);
+    void setQueenPositions(undoSnapshot);
+    setUndoSnapshot(null);
+  };
+
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     const delta = e.deltaY > 0 ? 0.93 : 1.07;
     setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z * delta)));
   }, []);
 
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      if (e.button !== 0) return;
-      setDragging(true);
-      dragStart.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
-    },
-    [pan],
-  );
+  const startCardDrag = (e: React.MouseEvent, id: string, pos: { x: number; y: number }) => {
+    if (e.button !== 0) return;
+    e.stopPropagation(); // don't let the canvas start a pan
+    e.preventDefault(); // suppress native image/text drag that steals the mouseup
+    cardDrag.current = {
+      id, startX: e.clientX, startY: e.clientY,
+      origX: pos.x, origY: pos.y, lastX: pos.x, lastY: pos.y, moved: false,
+    };
+    setDraggingId(id);
+  };
 
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent) => {
-      if (!dragging) return;
-      setPan({
-        x: dragStart.current.panX + (e.clientX - dragStart.current.x),
-        y: dragStart.current.panY + (e.clientY - dragStart.current.y),
-      });
-    },
-    [dragging],
-  );
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    setDragging(true);
+    dragStart.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
+  };
 
-  const handleMouseUp = useCallback(() => setDragging(false), []);
+  // Drag move/up live on `window` (not the canvas div) so a release is caught
+  // even when the pointer is over a child that stops propagation or has left
+  // the canvas — otherwise the card "glues" to the cursor after the button is
+  // up. The latest-closure refs keep these in sync without re-subscribing every
+  // render. The effect below attaches them only while a drag is in flight.
+  const onDragMove = (e: MouseEvent) => {
+    const cd = cardDrag.current;
+    if (cd) {
+      const dx = (e.clientX - cd.startX) / zoom;
+      const dy = (e.clientY - cd.startY) / zoom;
+      if (Math.abs(e.clientX - cd.startX) + Math.abs(e.clientY - cd.startY) > 4) cd.moved = true;
+      const nx = clamp(cd.origX + dx, 8, CANVAS_W - CARD_W - 8);
+      const ny = clamp(cd.origY + dy, CEO_Y + CEO_H + 16, CANVAS_H - CARD_H - 8);
+      cd.lastX = nx;
+      cd.lastY = ny;
+      setLocalPositions((prev) => ({ ...prev, [cd.id]: { x: nx, y: ny } }));
+      return;
+    }
+    if (!dragging) return;
+    setPan({
+      x: dragStart.current.panX + (e.clientX - dragStart.current.x),
+      y: dragStart.current.panY + (e.clientY - dragStart.current.y),
+    });
+  };
+
+  const onDragUp = () => {
+    const cd = cardDrag.current;
+    if (cd) {
+      cardDrag.current = null;
+      setDraggingId(null);
+      if (cd.moved) {
+        setUndoSnapshot(null); // a new layout supersedes the post-reset undo
+        void setQueenPosition(cd.id, { x: cd.lastX, y: cd.lastY });
+      } else {
+        // No movement: treat as a click → toggle the queen's side panel.
+        setSelectedColony(null);
+        setSelectedQueenId((prev) => (prev === cd.id ? null : cd.id));
+      }
+      return;
+    }
+    setDragging(false);
+  };
+
+  const dragMoveRef = useRef(onDragMove);
+  const dragUpRef = useRef(onDragUp);
+  dragMoveRef.current = onDragMove;
+  dragUpRef.current = onDragUp;
+
+  useEffect(() => {
+    if (!draggingId && !dragging) return;
+    const move = (e: MouseEvent) => dragMoveRef.current(e);
+    const up = () => dragUpRef.current();
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, [draggingId, dragging]);
 
   // Group colonies by their queen profile ID
   const coloniesByQueen = new Map<string, Colony[]>();
@@ -346,53 +696,85 @@ export default function OrgChart() {
     setSelectedColony(selectedColony?.id === colony.id ? null : colony);
   };
 
-  const handleSelectQueen = (queenId: string) => {
-    setSelectedColony(null);
-    setSelectedQueenId(selectedQueenId === queenId ? null : queenId);
-  };
-
   // Resolve queen name for colony panel
   const colonyQueenName = selectedColony?.queenProfileId
     ? (queenProfiles.find((q) => q.id === selectedColony.queenProfileId)?.name ?? "")
     : "";
 
   return (
-    <div className="flex-1 flex overflow-hidden">
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Page header */}
+      <div className="px-6 py-4 border-b border-border/60">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
+              <Network className="w-5 h-5 text-primary" />
+              Org Chart
+            </h2>
+            <span className="text-xs text-muted-foreground">
+              {queenProfiles.length} queens &middot; {colonies.length} colonies
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 flex overflow-hidden">
       {/* Main chart area — pannable canvas */}
       <div
         className="flex-1 overflow-hidden relative"
         style={{ cursor: dragging ? "grabbing" : "grab", userSelect: "none" }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
       >
-        {/* Header — fixed above the canvas */}
-        <div className="absolute top-0 left-0 right-0 px-6 py-4 z-10 pointer-events-none">
-          <div className="flex items-baseline gap-3">
-            <h2 className="text-lg font-semibold text-foreground">
-              Org Chart
-            </h2>
-            <span className="text-xs text-muted-foreground">
-              {queenProfiles.length} queen bees &middot; {colonies.length}{" "}
-              {colonies.length === 1 ? "colony" : "colonies"}
-            </span>
-          </div>
-        </div>
-
-        {/* Pannable + zoomable content */}
+        {/* Pannable + zoomable content. The canvas is a fixed coordinate
+            space, centered in the viewport (left:50% + translateX(-50%)); cards
+            are positioned absolutely within it from saved/default positions. */}
         <div
           style={{
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            position: "absolute",
+            left: "50%",
+            top: 0,
+            transform: `translate(calc(-50% + ${pan.x}px), ${pan.y}px) scale(${zoom})`,
             transformOrigin: "center top",
-            transition: dragging ? "none" : "transform 100ms ease-out",
+            transition: dragging || draggingId ? "none" : "transform 100ms ease-out",
           }}
         >
-          <div className="min-w-max px-6 pt-16 pb-10 mx-auto flex flex-col items-center">
-            {/* CEO card */}
-            <div className="rounded-xl border border-border/60 bg-card px-8 py-5 text-center">
-              <UserAvatar initials={initials} avatarVersion={userAvatarVersion} />
+          <div className="relative" style={{ width: CANVAS_W, height: CANVAS_H }}>
+            {/* Connector lines: CEO → each queen card. Recomputed from live
+                positions so they follow drags. */}
+            <svg
+              className="absolute left-0 top-0 pointer-events-none text-border"
+              width={CANVAS_W}
+              height={CANVAS_H}
+            >
+              {queenProfiles.map((queen) => {
+                const p = positions[queen.id];
+                // Orthogonal "elbow" routing like a classic org chart: drop
+                // straight down from the CEO, run horizontally, then drop into
+                // the queen card's top — right angles instead of a diagonal.
+                const sx = CENTER_X;
+                const sy = CEO_Y + CEO_H;
+                const ex = p.x + CARD_W / 2;
+                const ey = p.y;
+                const midY = sy + (ey - sy) / 2;
+                return (
+                  <path
+                    key={queen.id}
+                    d={`M ${sx} ${sy} V ${midY} H ${ex} V ${ey}`}
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1}
+                  />
+                );
+              })}
+            </svg>
+
+            {/* CEO card — fixed (it's the user); dragging it pans the canvas. */}
+            <div
+              className="absolute rounded-xl border border-border/60 bg-card px-8 py-5 text-center"
+              style={{ left: CEO_X, top: CEO_Y, width: CEO_W }}
+            >
+              <UserAvatar initials={initials} avatarVersion={userAvatarVersion} userHasAvatar={userHasAvatar} />
               <div className="font-semibold text-sm text-foreground">
                 {userProfile.displayName || "You"}
               </div>
@@ -401,34 +783,60 @@ export default function OrgChart() {
               </div>
             </div>
 
-            {/* Vertical stem from CEO to queens row */}
-            {queenProfiles.length > 0 && (
-              <div className="w-px h-8 bg-border" />
-            )}
-
-            {/* Queens — all on the same level with horizontal connector */}
-            {queenProfiles.length > 0 && (
-              <div className="flex gap-4 justify-center relative">
-                {/* Horizontal bar connecting first to last queen */}
+            {/* Queens — freely positioned, draggable */}
+            {queenProfiles.map((queen) => {
+              const p = positions[queen.id];
+              return (
                 <div
-                  className="absolute top-0 h-px bg-border"
-                  style={{
-                    left: `calc(140px / 2)`,
-                    right: `calc(140px / 2)`,
-                  }}
-                />
-                {queenProfiles.map((queen) => (
+                  key={queen.id}
+                  className="absolute"
+                  style={{ left: p.x, top: p.y, width: CARD_W, zIndex: draggingId === queen.id ? 10 : 1 }}
+                >
                   <QueenCard
-                    key={queen.id}
                     queen={queen}
                     colonies={coloniesByQueen.get(queen.id) ?? []}
                     selected={selectedQueenId === queen.id}
-                    onSelect={() => handleSelectQueen(queen.id)}
+                    decommissioned={isQueenDecommissioned(me, queen.id)}
+                    dragging={draggingId === queen.id}
+                    onCardMouseDown={(e) => startCardDrag(e, queen.id, p)}
                     onSelectColony={handleSelectColony}
                   />
-                ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Floating leader-catalog control, bottom-right of the canvas */}
+        <div
+          className="absolute bottom-4 right-4 z-20 flex flex-col items-end gap-2"
+          onMouseDown={(e) => e.stopPropagation()}
+          onWheel={(e) => e.stopPropagation()}
+          style={{ cursor: "default" }}
+        >
+          {showDecommissioned && (
+            <div className="w-[66rem] max-w-[90vw] max-h-[60vh] overflow-y-auto rounded-xl border border-border/60 bg-card shadow-xl p-4">
+              <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-3">
+                Leader catalog &middot; hire a lead for any function, or re-enable a decommissioned one
               </div>
-            )}
+              <LeaderCatalog />
+            </div>
+          )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={undoSnapshot ? handleUndoReset : handleResetPositions}
+              disabled={!undoSnapshot && !hasCustomPositions}
+              title={undoSnapshot ? "Undo the reset and restore positions" : "Reset queen positions to the default layout"}
+              className="w-32 text-center px-3 py-1.5 rounded-lg border border-border/60 bg-card text-xs font-medium text-muted-foreground shadow-md hover:text-foreground hover:border-primary/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-muted-foreground disabled:hover:border-border/60"
+            >
+              {undoSnapshot ? "Undo" : "Reset"}
+            </button>
+            <button
+              onClick={() => setShowDecommissioned((v) => !v)}
+              className="w-32 text-center px-3 py-1.5 rounded-lg border border-border/60 bg-card text-xs font-medium text-muted-foreground shadow-md hover:text-foreground hover:border-primary/30 transition-colors"
+            >
+              Leader Catalog
+            </button>
           </div>
         </div>
       </div>
@@ -453,6 +861,7 @@ export default function OrgChart() {
           }}
         />
       )}
+      </div>
     </div>
   );
 }

@@ -18,16 +18,17 @@ This module provides:
 
 Both helpers degrade silently — return ``None`` / a placeholder rather
 than raise — so a vision-fallback failure can never kill the main
-agent's run. The agent-loop call site retries the configured model
-once on a None return, then falls back to
+agent's run. On a None return, the agent-loop call site falls back to
 ``gemini/gemini-3-flash-preview`` via the ``model_override`` parameter
 of :func:`caption_tool_image`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -57,9 +58,9 @@ _TOOL_ARGS_MAX_CHARS = 4096
 # system-prompt budget alongside the user message + image. Tells the
 # subagent its role and constrains output format.
 #
-# Coordinate labeling: the main agent's browser tools
-# (browser_click_coordinate / browser_hover_coordinate / browser_press_at)
-# accept VIEWPORT FRACTIONS (x, y) in [0..1] where (0,0) is the top-left
+# Coordinate labeling: the main agent's ``hive-browser interact`` command
+# (left_click / hover / key actions with a ``--coordinate``)
+# accepts VIEWPORT FRACTIONS (x, y) in [0..1] where (0,0) is the top-left
 # and (1,1) is the bottom-right of the screenshot. Without coordinates
 # the text-only agent has no way to act on what we describe — it can
 # read the caption but cannot point. So for every interactive element
@@ -75,10 +76,12 @@ _TOOL_ARGS_MAX_CHARS = 4096
 _VISION_SUBAGENT_SYSTEM = (
     "You are a vision subagent for a text-only main agent. The main "
     "agent invoked a tool that returned the image(s) attached. Their "
-    "intent (their reasoning + the tool call) is below. Describe what "
-    "the image shows in service of their intent — concrete, factual, "
-    "no speculation. If their intent asks a yes/no question, answer it "
-    "directly first.\n\n"
+    "intent (their reasoning + the tool call) is below. The intent "
+    "names a specific entity and target element — anchor your "
+    "description on that entity, locate the target element, and "
+    "provide its coordinates. Describe what the image shows in service "
+    "of their intent — concrete, factual, no speculation. If their "
+    "intent asks a yes/no question, answer it directly first.\n\n"
     "Coordinate labeling: the main agent uses fractional viewport "
     "coordinates (x, y) in [0..1] — (0, 0) is the top-left of the "
     "image, (1, 1) is the bottom-right — to drive its click / hover / "
@@ -96,6 +99,80 @@ _VISION_SUBAGENT_SYSTEM = (
 )
 
 
+# Matches the (fx, fy) coordinate labels the vision subagent appends to
+# element names, e.g. ``"Submit" button (0.83, 0.92)``. Both components
+# are fractions in 0..1 (a bare 0 or 1 is also allowed).
+_COORD_LABEL_RE = re.compile(r"\(\s*(\d?\.\d+|[01])\s*,\s*(\d?\.\d+|[01])\s*\)")
+
+
+def crop_box_from_tool_result(tool_result_text: str | None) -> list[float] | None:
+    """Pull a ``crop_box`` ([vx0, vy0, vx1, vy1]) out of an image tool's
+    JSON text envelope.
+
+    ``crop_box`` is the viewport-fraction rectangle a non-viewport image
+    (zoom crop, element-clip or full_page screenshot) spans. Returns None
+    for a plain viewport screenshot — no crop_box, or crop_box covering
+    the whole viewport — since there is nothing to remap then. Degrades
+    to None on any parse failure.
+    """
+    if not tool_result_text:
+        return None
+    try:
+        meta = json.loads(tool_result_text.strip())
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    cb = meta.get("crop_box")
+    if not isinstance(cb, list) or len(cb) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(v) for v in cb)
+    except (TypeError, ValueError):
+        return None
+    if x1 - x0 <= 0 or y1 - y0 <= 0:
+        return None
+    # Full viewport — coordinates already map 1:1, no remap needed.
+    if abs(x0) < 1e-6 and abs(y0) < 1e-6 and abs(x1 - 1) < 1e-6 and abs(y1 - 1) < 1e-6:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def remap_caption_for_crop(caption: str, tool_result_text: str | None) -> str:
+    """Rewrite the vision subagent's (fx, fy) coordinate labels from
+    crop-relative fractions into full-viewport fractions.
+
+    When the captioned image was a crop (a ``zoom`` action, or an
+    element-clip / full_page screenshot) the subagent — which only ever
+    sees "an image" — labels positions relative to that crop. A
+    coordinate click expects viewport fractions, so without this a
+    text-only main model would click the right fraction of the wrong
+    rectangle. The crop's viewport span comes from ``crop_box`` in the
+    tool result.
+
+    No-op when the result carries no crop_box (plain viewport
+    screenshot) or the caption has no coordinate labels.
+    """
+    crop_box = crop_box_from_tool_result(tool_result_text)
+    if not crop_box:
+        return caption
+    x0, y0, x1, y1 = crop_box
+    w, h = x1 - x0, y1 - y0
+
+    def _remap(m: re.Match[str]) -> str:
+        try:
+            fx, fy = float(m.group(1)), float(m.group(2))
+        except ValueError:
+            return m.group(0)
+        # Coordinate labels are fractions in 0..1; anything else in
+        # parentheses isn't one of ours — leave it untouched.
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            return m.group(0)
+        return f"({round(x0 + fx * w, 4)}, {round(y0 + fy * h, 4)})"
+
+    return _COORD_LABEL_RE.sub(_remap, caption)
+
+
 def extract_intent_for_tool(
     conversation: NodeConversation,
     tool_name: str,
@@ -103,15 +180,31 @@ def extract_intent_for_tool(
 ) -> str:
     """Build the intent string passed to the vision subagent.
 
-    Combines the most recent assistant text (the LLM's reasoning right
-    before invoking the tool) with a structured tool-call descriptor.
-    Truncates to ``_INTENT_MAX_CHARS`` total, favouring the head of the
-    assistant text where goal-stating sentences usually live.
+    If the tool call included an explicit ``intent`` argument (e.g. the
+    required ``--intent`` flag on ``hive-browser screenshot`` and on
+    ``hive-browser interact --action screenshot``), that is used verbatim —
+    it already names the entity, target element, and planned action.
 
-    If no preceding assistant text exists (rare — first turn), falls
-    back to ``"<no preceding reasoning>"`` so the subagent still gets
-    the tool descriptor.
+    Otherwise falls back to combining the most recent assistant text
+    with a structured tool-call descriptor, truncated to
+    ``_INTENT_MAX_CHARS``.
     """
+    # Explicit intent from tool args (hive-browser screenshot / interact
+    # --action screenshot — both take a required ``intent``).
+    explicit = (tool_args or {}).get("intent", "").strip()
+    if not explicit:
+        # Screenshots run via terminal_exec carry their --intent INSIDE the
+        # command string (there's no structured `intent` arg on terminal_exec),
+        # so pull it out — otherwise the caption a text-only model receives loses
+        # the entity/target/action the agent named.
+        cmd = (tool_args or {}).get("command")
+        if isinstance(cmd, str) and "hive-browser" in cmd:
+            mi = re.search(r"--intent(?:=|\s+)(\"[^\"]*\"|'[^']*'|\S+)", cmd)
+            if mi:
+                explicit = mi.group(1).strip("\"'").strip()
+    if explicit:
+        return f"Agent intent: {explicit}"
+
     args_json: str
     try:
         args_json = json.dumps(tool_args or {}, default=str)
@@ -134,8 +227,6 @@ def extract_intent_for_tool(
                 assistant_text = content.strip()
                 break
     except Exception:
-        # Defensive — the agent loop must keep running even if the
-        # conversation structure changes shape.
         assistant_text = ""
 
     if not assistant_text:
@@ -145,7 +236,6 @@ def extract_intent_for_tool(
     head = f"{tool_line}\n\nReasoning before call:\n"
     budget = _INTENT_MAX_CHARS - len(head)
     if budget < 100:
-        # Tool descriptor is huge somehow — truncate it.
         return head[:_INTENT_MAX_CHARS]
     if len(assistant_text) > budget:
         assistant_text = assistant_text[: budget - 1] + "…"
@@ -190,7 +280,29 @@ async def caption_tool_image(
         return None
 
     user_blocks: list[dict[str, Any]] = [{"type": "text", "text": intent}]
-    user_blocks.extend(image_content)
+    # Only include attachments with valid data URIs — skip hive:// or other
+    # non-fetchable URLs that would cause "unsupported image format" errors.
+    # Two block shapes are accepted:
+    #   * legacy {"type":"image_url","image_url":{"url":"data:image/...|data:application/pdf;..."}}
+    #   * native {"type":"file","file":{"file_data":"data:application/pdf;..."}} —
+    #     emitted by the chat upload path so LiteLLM auto-remaps to each
+    #     provider's native PDF shape (Anthropic `document`, Gemini
+    #     `inline_data`, OpenAI native `file`).
+    for block in image_content:
+        block_type = block.get("type") if isinstance(block, dict) else None
+        if block_type == "image_url":
+            iu = block.get("image_url")
+            url = iu.get("url", "") if isinstance(iu, dict) else ""
+            if url.startswith("data:image/") or url.startswith("data:application/pdf"):
+                user_blocks.append(block)
+        elif block_type == "file":
+            file_obj = block.get("file")
+            file_data = file_obj.get("file_data", "") if isinstance(file_obj, dict) else ""
+            if file_data.startswith("data:application/pdf"):
+                user_blocks.append(block)
+    if len(user_blocks) <= 1:
+        # No valid attachments to describe
+        return None
     messages = [
         {"role": "system", "content": _VISION_SUBAGENT_SYSTEM},
         {"role": "user", "content": user_blocks},
@@ -199,7 +311,7 @@ async def caption_tool_image(
     # Apply the same proxy rewrites the main LLM provider uses so a
     # `hive/...` / `kimi/...` model resolves to the right Anthropic-
     # compatible endpoint with the right auth header. Without this,
-    # litellm doesn't know what `hive/kimi-k2.5` is and rejects the call
+    # litellm doesn't know what `hive/kimi-k2.x` is and rejects the call
     # with "LLM Provider NOT provided."
     from framework.llm.litellm import rewrite_proxy_model
 
@@ -222,19 +334,26 @@ async def caption_tool_image(
         kwargs["api_base"] = rewritten_base
     if extra_headers:
         kwargs["extra_headers"] = extra_headers
+        # rewrite_proxy_model returns non-empty extra_headers ONLY for
+        # Hive-proxy-bound calls, so this is the right gate to stamp
+        # X-Hive-Agent for cloud usage attribution. Off for direct
+        # Anthropic/Kimi/OpenRouter traffic.
+        try:
+            from framework.tasks.tools._context import current_usage_agent_id
+
+            agent_id = current_usage_agent_id()
+            if agent_id:
+                kwargs["extra_headers"] = {**kwargs["extra_headers"], "X-Hive-Agent": agent_id}
+        except Exception:
+            pass
 
     # Surface where the request is going so the user can verify the
     # vision fallback is hitting the expected proxy / model. Redacts
-    # the API key to a length+head+tail digest so it can be cross-
-    # correlated with other auth-related log lines.
-    key_digest = (
-        f"len={len(api_key)} {api_key[:8]}…{api_key[-4:]}"
-        if api_key and len(api_key) >= 12
-        else f"len={len(api_key) if api_key else 0}"
-    )
+    # the API key to a length+head+tail digest matching the
+    # [auth] runtime-spawn line so they can be cross-correlated.
+    key_digest = f"len={len(api_key)} {api_key[:8]}…{api_key[-4:]}" if api_key and len(api_key) >= 12 else f"len={len(api_key) if api_key else 0}"
     logger.info(
-        "[vision_fallback] dispatching: configured_model=%s rewritten_model=%s "
-        "api_base=%s api_key=%s images=%d intent_chars=%d timeout_s=%.1f",
+        "[vision_fallback] dispatching: configured_model=%s rewritten_model=%s api_base=%s api_key=%s images=%d intent_chars=%d timeout_s=%.1f",
         model,
         rewritten_model,
         rewritten_base or "<litellm-default>",
@@ -248,6 +367,9 @@ async def caption_tool_image(
     caption: str | None = None
     error_text: str | None = None
     try:
+        from framework.llm.litellm import _log_llm_call
+
+        _log_llm_call(kwargs)
         response = await litellm.acompletion(**kwargs)
         text = (response.choices[0].message.content or "").strip()
         if text:
@@ -259,6 +381,38 @@ async def caption_tool_image(
             (datetime.now() - started).total_seconds(),
             len(text),
         )
+    except asyncio.CancelledError:
+        # CancelledError is BaseException, not Exception — without this
+        # branch it would unwind past the audit log below, leaving no
+        # record of the cancelled subagent call. Log inline, then
+        # re-raise so the parent's cancel propagation is unchanged.
+        try:
+            from framework.tracker.llm_debug_logger import log_llm_turn
+
+            elided_blocks: list[dict[str, Any]] = [{"type": "text", "text": intent}]
+            elided_blocks.extend({"type": "image_url", "image_url": {"url": "<elided>"}} for _ in range(len(image_content)))
+            log_llm_turn(
+                node_id="vision_fallback_subagent",
+                stream_id="vision_fallback",
+                execution_id="vision_fallback_subagent",
+                iteration=0,
+                system_prompt=_VISION_SUBAGENT_SYSTEM,
+                messages=[{"role": "user", "content": elided_blocks}],
+                assistant_text="",
+                tool_calls=[],
+                tool_results=[],
+                token_counts={
+                    "model": model,
+                    "elapsed_s": (datetime.now() - started).total_seconds(),
+                    "error": "cancelled",
+                    "stop_reason": "cancelled",
+                    "num_images": len(image_content),
+                    "intent_chars": len(intent),
+                },
+            )
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         error_text = f"{type(exc).__name__}: {exc}"
         logger.warning(

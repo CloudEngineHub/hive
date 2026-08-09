@@ -48,6 +48,7 @@ def build_exec_envelope(
     auto_backgrounded: bool = False,
     job_id: str | None = None,
     auto_shell: bool = False,
+    shell_kind: str | None = None,
 ) -> dict:
     """Construct the standard exec envelope.
 
@@ -94,6 +95,10 @@ def build_exec_envelope(
         "auto_backgrounded": bool(auto_backgrounded),
         "job_id": job_id,
         "auto_shell": bool(auto_shell),
+        # Which interpreter actually ran the command: "bash" | "powershell" |
+        # "cmd" | "direct". On Windows the agent reads this to adapt syntax
+        # when Git Bash isn't available (see terminal-tools-foundations).
+        "shell_kind": shell_kind,
     }
 
 

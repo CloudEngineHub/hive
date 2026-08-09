@@ -36,10 +36,7 @@ def _get_creds(
     if not token or not instance_url:
         return {
             "error": "Salesforce credentials not configured",
-            "help": (
-                "Set SALESFORCE_ACCESS_TOKEN and SALESFORCE_INSTANCE_URL "
-                "environment variables or configure via credential store"
-            ),
+            "help": ("Set SALESFORCE_ACCESS_TOKEN and SALESFORCE_INSTANCE_URL environment variables or configure via credential store"),
         }
     # Strip trailing slash from instance URL
     instance_url = instance_url.rstrip("/")

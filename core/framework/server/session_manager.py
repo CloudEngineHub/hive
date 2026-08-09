@@ -14,12 +14,15 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from framework.config import QUEENS_DIR, get_max_tokens
+from framework.config import COLONIES_DIR, QUEENS_DIR
+from framework.host.colony_binding import ColonyBinding
+from framework.utils.text import humanize_slug
 from framework.host.triggers import TriggerDefinition
 
 logger = logging.getLogger(__name__)
@@ -31,21 +34,182 @@ def _generate_session_id() -> str:
     return f"session_{ts}_{uuid.uuid4().hex[:8]}"
 
 
-def _queen_session_dir(session_id: str, queen_name: str = "default") -> Path:
-    """Return the on-disk directory for a queen session."""
-    return QUEENS_DIR / queen_name / "sessions" / session_id
+def _queen_session_dir(
+    session_id: str,
+    queen_name: str = "default",
+    colony_id: str | None = None,
+) -> Path:
+    """Return the on-disk directory for a queen session.
+
+    Two homes depending on whether the queen is in a DM or running as
+    a colony's overseer:
+
+    - DM session   → ``queens/<queen>/sessions/<session_id>/``
+    - Colony queen → ``colonies/<colony>/queens/<queen>/sessions/<session_id>/``
+
+    The split lets ``rm -rf colonies/<c>/`` cleanly remove every overseer
+    session tied to that colony, while leaving the queen's DM history alone.
+    """
+    from framework.config import colony_queen_session_dir, queen_session_dir
+
+    if colony_id:
+        return colony_queen_session_dir(colony_id, queen_name, session_id)
+    return queen_session_dir(queen_name, session_id)
+
+
+def _iter_queen_session_dirs(session_id: str) -> Iterator[Path]:
+    """Yield every session dir matching ``session_id`` — across the queen DM
+    tree and every colony's overseer sessions.
+
+    The same ``session_id`` can appear under multiple colonies (a DM session
+    forked into more than one colony keeps its id), so callers that need a
+    *specific* one (e.g. the dir that actually holds a given attachment) must
+    look at all candidates rather than the first match.
+    """
+    from framework.config import colony_queens_dir
+
+    if QUEENS_DIR.exists():
+        for queen_root in QUEENS_DIR.iterdir():
+            if not queen_root.is_dir():
+                continue
+            candidate = queen_root / "sessions" / session_id
+            if candidate.exists():
+                yield candidate
+    if COLONIES_DIR.exists():
+        for colony_root in COLONIES_DIR.iterdir():
+            if not colony_root.is_dir():
+                continue
+            queens_root = colony_queens_dir(colony_root.name)
+            if not queens_root.exists():
+                continue
+            for queen_root in queens_root.iterdir():
+                if not queen_root.is_dir():
+                    continue
+                candidate = queen_root / "sessions" / session_id
+                if candidate.exists():
+                    yield candidate
 
 
 def _find_queen_session_dir(session_id: str) -> Path:
-    """Search all queen directories for a session. Falls back to default."""
-    if QUEENS_DIR.exists():
-        for queen_dir in QUEENS_DIR.iterdir():
-            if not queen_dir.is_dir():
+    """Search both queen DM sessions and every colony's overseer sessions
+    for ``session_id``. Falls back to the default queen's sessions dir."""
+    from framework.config import queen_session_dir
+
+    for candidate in _iter_queen_session_dirs(session_id):
+        return candidate
+    return queen_session_dir("default", session_id)
+
+
+def _colony_id_for_session_dir(session_dir: Path) -> str | None:
+    """The colony slug owning ``session_dir``, or None for a queen DM session.
+
+    The layout is ``colonies/<slug>/queens/<q>/sessions/<sid>``, so the slug is
+    whichever path component sits directly under the ``colonies`` root.
+    """
+    for parent in session_dir.parents:
+        if parent.parent is not None and parent.parent.name == "colonies":
+            return parent.name
+    return None
+
+
+def _derive_resume_colony_id(session_id: str) -> str | None:
+    """Return the colony slug whose tree holds ``session_id``, or None.
+
+    Guards resumes that arrive without colony context (e.g. the desktop's
+    session-gone auto-resume on the queen DM page): binding such a resume
+    to no colony would make ``_start_queen`` materialize a duplicate empty
+    session dir under the queen DM tree, which ``_find_queen_session_dir``
+    then prefers over the real colony copy — the "blank history" bug.
+
+    Reads through ``_iter_queen_session_dirs`` rather than walking the colony
+    tree again. Two independent walks of the same layout is how the two halves
+    of this bug drifted apart in the first place: that generator exists because
+    a session id can match several dirs, which is the same fact this function
+    depends on. Queen-DM candidates yield no colony and are skipped, so the
+    first colony-owned match wins — the original behavior.
+    """
+    try:
+        for candidate in _iter_queen_session_dirs(session_id):
+            colony_id = _colony_id_for_session_dir(candidate)
+            if colony_id is not None:
+                return colony_id
+    except OSError:
+        return None
+    return None
+
+
+def _find_colony_queen_session_dir(
+    colony_id: str,
+    session_id: str,
+    queen_name: str | None = None,
+) -> Path | None:
+    """Locate a colony queen-overseer session in the canonical colony tree.
+
+    Walks ``colonies/<colony_id>/queens/<q>/sessions/<session_id>/``.
+    Skips the queen DM tree entirely — callers with colony context should
+    never accidentally resolve to a stale queen-tree fork snapshot. If
+    ``queen_name`` is provided it's checked first; otherwise every queen
+    under the colony is scanned.
+
+    Returns ``None`` when no match exists. Callers handle absence
+    explicitly rather than receiving a guessed default path.
+    """
+    from framework.config import colony_queens_dir
+
+    root = colony_queens_dir(colony_id)
+    if not root.exists():
+        return None
+    if queen_name:
+        candidate = root / queen_name / "sessions" / session_id
+        if candidate.exists():
+            return candidate
+    try:
+        for queen_root in root.iterdir():
+            if not queen_root.is_dir():
                 continue
-            candidate = queen_dir / "sessions" / session_id
+            candidate = queen_root / "sessions" / session_id
             if candidate.exists():
                 return candidate
-    return _queen_session_dir(session_id)
+    except OSError:
+        return None
+    return None
+
+
+def _latest_colony_queen_session_id(
+    colony_id: str,
+    queen_name: str | None = None,
+) -> str | None:
+    """Newest session id under a colony's own queen tree, or None.
+
+    Repairs legacy colonies whose ``metadata.json`` predates the
+    ``queen_session_id`` field: we adopt the colony's most-recently-active
+    session *scoped to this colony* (so we never pick up a same-id session
+    that belongs to a different colony) when no better hint is available.
+    """
+    from framework.config import colony_queens_dir
+
+    root = colony_queens_dir(colony_id)
+    if not root.exists():
+        return None
+    queen_roots = [root / queen_name] if queen_name else list(root.iterdir())
+    newest: tuple[float, str] | None = None
+    for queen_root in queen_roots:
+        sessions_dir = queen_root / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        try:
+            for session_dir in sessions_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                try:
+                    mtime = session_dir.stat().st_mtime
+                except OSError:
+                    continue
+                if newest is None or mtime > newest[0]:
+                    newest = (mtime, session_dir.name)
+        except OSError:
+            continue
+    return newest[1] if newest else None
 
 
 @dataclass
@@ -59,16 +223,16 @@ class Session:
     # Queen (always present once started)
     queen_executor: Any = None  # GraphExecutor for queen input injection
     queen_task: asyncio.Task | None = None
-    # Loaded colony (optional)
-    colony_id: str | None = None
+    # Loaded colony (optional) — ``colony_id`` is the on-disk identity
+    # (None for DM/queen-only sessions); ``binding`` is the materialized
+    # :class:`ColonyBinding` (None until ``fork_session_into_colony`` or
+    # the session-load path attaches one).
+    binding: ColonyBinding | None = None
     worker_path: Path | None = None
-    runner: Any | None = None  # AgentRunner
-    colony_runtime: Any | None = None  # legacy worker AgentRuntime (Phase 2 deprecation pending)
-    # Phase 2 unified runtime: a real ColonyRuntime hosting the queen as
-    # overseer and (in colony sessions) parallel workers spawned via
-    # run_parallel_workers. Always set once _start_queen has run.
+    # Unified runtime: a real ColonyRuntime hosting the queen as overseer
+    # and (in colony sessions) parallel workers spawned via
+    # run_worker. Always set once _start_queen has run.
     colony: Any | None = None  # ColonyRuntime
-    worker_info: Any | None = None  # AgentInfo
     # Queen phase state (working/reviewing)
     phase_state: Any = None  # QueenPhaseState
     # Worker handoff subscription (colony-scoped escalation receiver)
@@ -78,6 +242,12 @@ class Session:
     # Populated by queen_orchestrator._on_worker_escalation and drained by
     # the reply_to_worker tool.
     pending_escalations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Live SSE client count — incremented/decremented by the events route as
+    # browsers connect/disconnect. Sentinel reads this to tell whether a human
+    # is watching (so it escalates to messaging only when nobody is attached).
+    # A dedicated counter, NOT len(event_bus._subscriptions): that map also
+    # holds webhook-trigger subscriptions, which are not UI clients.
+    sse_client_count: int = 0
     # Memory reflection + recall subscriptions (global memory)
     memory_reflection_subs: list = field(default_factory=list)  # list[str]
     # Trigger definitions loaded from agent's triggers.json (available but inactive)
@@ -96,6 +266,7 @@ class Session:
     # Per-trigger fire stats (session lifetime): {trigger_id: {"fire_count": int, "last_fired_at": epoch_ms}}.
     # Reset on process restart — good enough as a "since this session started" counter.
     trigger_fire_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_catch_up: list[str] = field(default_factory=list)
     # Session directory resumption:
     # When set, _start_queen writes queen conversations to this existing session's
     # directory instead of creating a new one.  This lets cold-restores accumulate
@@ -105,12 +276,18 @@ class Session:
     queen_dir: Path | None = None
     # Multi-queen support: which queen profile this session uses
     queen_name: str = "default"
+    # Opened through one of the desktop's CRM doors ("Set up my CRM" /
+    # "Configure"). NOT derivable from ``queen_name``: the CRM's host queen
+    # (``queen_growth``) is also the default queen and the auto-selection
+    # fallback, so most growth-queen DMs have nothing to do with the CRM.
+    # Setup-only behaviour (the reveal nudge) keys off this.
+    crm_setup: bool = False
     # Colony name: set when a worker is loaded from a colony
-    colony_name: str | None = None
+    colony_id: str | None = None
     # Session mode discriminator. "dm" = queen DM session under
     # ~/.hive/agents/queens/{queen_id}/sessions/. "colony" = forked colony
-    # session under ~/.hive/colonies/{colony_name}/sessions/, with the
-    # queen running as the colony's overseer and the run_parallel_workers
+    # session under ~/.hive/colonies/{colony_id}/sessions/, with the
+    # queen running as the colony's overseer and the run_worker
     # tool unlocked. The mode is the canonical discriminator for storage
     # path, tool exposure, and SSE filtering — see the Phase 2 plan.
     mode: Literal["dm", "colony"] = "dm"
@@ -119,7 +296,77 @@ class Session:
     # fresh session before continuing the conversation. Persisted in
     # meta.json so the lock survives server restarts.
     colony_spawned: bool = False
-    spawned_colony_name: str | None = None
+    spawned_colony_id: str | None = None
+    # Set when this session has been forked into a fresh one via
+    # task_create(new_session=true). The session is retired: its queen
+    # loop is stopped, the chat input is locked, and it is skipped when
+    # auto-resolving which session to resume for the queen. Persisted in
+    # meta.json so the retirement survives server restarts.
+    superseded_by: str | None = None
+    # True for a session freshly created BY a task_create(new_session=true)
+    # fork, until it receives its first genuine user message. While set,
+    # new_session is disarmed — the synthetic kickoff turn must not fork
+    # again (that pivot was already consumed by the fork that made this
+    # session). In-memory only: a cold-resumed session idles for /chat,
+    # so the next message is genuine and the flag is moot after restart.
+    fork_kickoff_pending: bool = False
+
+
+def _deduplicate_colony_id(colony_id: str) -> str:
+    """Return a colony_id that doesn't collide with an existing colony on disk.
+
+    If ``colony_id`` is free, returns it unchanged.  Otherwise appends
+    ``_2``, ``_3``, … until an unused slug is found.
+    """
+    if not (COLONIES_DIR / colony_id / "metadata.json").exists():
+        return colony_id
+    # Strip any existing numeric suffix so we count from the base name.
+    import re
+    m = re.match(r"^(.+?)_(\d+)$", colony_id)
+    base = m.group(1) if m else colony_id
+    n = 2
+    while (COLONIES_DIR / f"{base}_{n}" / "metadata.json").exists():
+        n += 1
+    return f"{base}_{n}"
+
+
+def _ensure_minimal_colony(colony_id: str, *, queen_name: str | None = None) -> Path:
+    """Bootstrap a minimal colony directory at ``~/.hive/colonies/{colony_id}/``.
+
+    Creates the directory, a ``metadata.json``, and a minimal ``worker.json``
+    so the colony is discoverable by the agent discovery system and colony-chat
+    can resolve it via ``agent_path``.  Returns the colony directory path.
+    """
+    from framework.config import COLONIES_DIR
+
+    colony_dir = COLONIES_DIR / colony_id
+    colony_dir.mkdir(parents=True, exist_ok=True)
+
+    meta_path = colony_dir / "metadata.json"
+    if not meta_path.exists():
+        meta: dict = {
+            "name": colony_id,
+            "created_at": time.time(),
+        }
+        if queen_name:
+            meta["queen_name"] = queen_name
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # Minimal worker config so the colony dir is discoverable and
+    # colony-chat can find the session via agent_path.
+    worker_path = colony_dir / "worker.json"
+    if not worker_path.exists():
+        worker_config: dict = {
+            "name": humanize_slug(colony_id),
+            "description": f"Colony {colony_id}",
+            "tools": [],
+            "goal": {"description": f"Work on tasks for colony {colony_id}"},
+        }
+        if queen_name:
+            worker_config["queen_name"] = queen_name
+        worker_path.write_text(json.dumps(worker_config, indent=2), encoding="utf-8")
+
+    return colony_dir
 
 
 class SessionManager:
@@ -141,30 +388,62 @@ class SessionManager:
         self._background_tasks: set[asyncio.Task] = set()
 
         # Run one-time v2 directory structure migration
-        from framework.storage.migrate_v2 import run_migration
+        from framework.storage.migrate_v2 import run_migration as run_v2
 
         try:
-            run_migration()
+            run_v2()
         except Exception:
             logger.warning("v2 migration failed (non-fatal)", exc_info=True)
 
-        # Ensure every existing colony has an up-to-date progress.db
-        # (schema v1, WAL mode) and reclaim any stale claims left behind
-        # by crashed workers from the previous run.  Idempotent and
-        # fast; runs synchronously because the event loop hasn't
-        # started yet at __init__ time.
-        from framework.host.progress_db import ensure_all_colony_dbs
+        # Run one-time v2 → v3 layout migration (queens/, colony self-containment,
+        # tracker/ dir, memory flatten). Ordered after v2 so the v2 paths
+        # the v3 migration reads are populated.
+        from framework.storage.migrate_v3 import run_migration as run_v3
 
         try:
-            ensured = ensure_all_colony_dbs()
-            if ensured:
-                logger.info("progress_db: ensured %d colony DB(s) at startup", len(ensured))
+            run_v3()
         except Exception:
-            logger.warning("progress_db: backfill at startup failed (non-fatal)", exc_info=True)
+            logger.warning("v3 migration failed (non-fatal)", exc_info=True)
+
+        # Consolidate any post-v3 colony_fork sessions that landed in the
+        # queen tree instead of the canonical colony tree. Ordered after
+        # v3 so the colony layout it relies on is already in place.
+        from framework.storage.migrate_colony_sessions import (
+            run_migration as run_colony_sessions,
+        )
+
+        try:
+            run_colony_sessions()
+        except Exception:
+            logger.warning("colony_sessions migration failed (non-fatal)", exc_info=True)
+
+        # Ensure every existing colony has tracker.db and patch worker
+        # configs with the current ColonyBinding. Legacy ProgressDB /
+        # loose tracker_db_path fields are stripped at the same time.
+        from framework.host.tracker_db import ensure_all_colony_tracker_dbs
+
+        try:
+            ensured_tracker = ensure_all_colony_tracker_dbs()
+            if ensured_tracker:
+                logger.info(
+                    "tracker_db: ensured %d colony tracker DB(s) at startup",
+                    len(ensured_tracker),
+                )
+        except Exception:
+            logger.warning("tracker_db: backfill at startup failed (non-fatal)", exc_info=True)
+
+    def get_live_session(self, session_id: str) -> Session | None:
+        """Return the in-memory session for ``session_id``, or None.
+
+        Public accessor used by Sentinel to reach a parked queen for resume
+        and to read ``sse_client_count``. Does not load from disk — a cold
+        session must be restored via ``create_session(queen_resume_from=…)``.
+        """
+        return self._sessions.get(session_id)
 
     def build_llm(self, model: str | None = None):
         """Construct an LLM provider using the server's configured defaults."""
-        from framework.config import RuntimeConfig, get_hive_config
+        from framework.config import RuntimeConfig, get_api_key, get_hive_config
 
         rc = RuntimeConfig(model=model or self._model or RuntimeConfig().model)
         llm_config = get_hive_config().get("llm", {})
@@ -175,11 +454,55 @@ class SessionManager:
 
         from framework.llm.litellm import LiteLLMProvider
 
+        # api_key_resolver lets desktop streamToken refreshes propagate to
+        # this provider on every call — without requiring _hot_swap_sessions
+        # to visit it. The snapshot in rc.api_key remains the default.
         return LiteLLMProvider(
             model=rc.model,
             api_key=rc.api_key,
             api_base=rc.api_base,
+            api_key_resolver=get_api_key,
             **rc.extra_kwargs,
+        )
+
+    def build_worker_llm(self):
+        """Construct a dedicated worker LLM when ``worker_llm`` is configured.
+
+        Returns ``None`` when no ``worker_llm`` section is set in
+        configuration.json — callers should fall back to ``session.llm``
+        (i.e. workers continue to share the queen's LLM, legacy behavior).
+
+        Uses the parallel ``get_worker_*`` accessors so api_key / api_base /
+        extra_kwargs all come from the ``worker_llm`` config section, not
+        the primary ``llm`` section.
+        """
+        from framework.config import (
+            get_hive_config,
+            get_preferred_worker_model,
+            get_worker_api_base,
+            get_worker_api_key,
+            get_worker_llm_extra_kwargs,
+        )
+
+        model = get_preferred_worker_model()
+        if not model:
+            return None
+
+        worker_cfg = get_hive_config().get("worker_llm", {})
+        if worker_cfg.get("use_antigravity_subscription"):
+            from framework.llm.antigravity import AntigravityProvider
+
+            return AntigravityProvider(model=model)
+
+        from framework.llm.litellm import LiteLLMProvider
+
+        # Same resolver-based freshness as build_llm, scoped to worker_llm.
+        return LiteLLMProvider(
+            model=model,
+            api_key=get_worker_api_key(),
+            api_base=get_worker_api_base(),
+            api_key_resolver=get_worker_api_key,
+            **get_worker_llm_extra_kwargs(),
         )
 
     # ------------------------------------------------------------------
@@ -193,7 +516,7 @@ class SessionManager:
     ) -> Session:
         """Create session infrastructure (EventBus, LLM) without starting queen.
 
-        Internal helper — use create_session() or create_session_with_worker_colony().
+        Internal helper — use create_session().
         """
         from framework.host.event_bus import EventBus
 
@@ -287,30 +610,121 @@ class SessionManager:
 
     async def create_session(
         self,
+        *,
+        colony_id: str | None = None,
         session_id: str | None = None,
         model: str | None = None,
         initial_prompt: str | None = None,
         queen_resume_from: str | None = None,
         queen_name: str | None = None,
         initial_phase: str | None = None,
+        crm_setup: bool = False,
     ) -> Session:
-        """Create a new session with a queen but no worker.
+        """Create a new session with a queen, optionally bound to a colony.
 
-        When ``queen_resume_from`` is set the queen writes conversation messages
-        to that existing session's directory instead of creating a new one.
-        This preserves full conversation history across server restarts.
+        Colony resolution is by ``colony_id`` (the on-disk slug). The
+        directory is always ``<COLONIES_DIR>/<colony_id>/``:
+
+        - **Existing colony** (``metadata.json`` present): runs the full
+          AgentLoader pipeline (MCP / skills / credentials), then starts
+          the queen against it.
+        - **Fresh colony** (no ``metadata.json``): bootstraps a minimal
+          colony directory, then starts the queen in colony phase.
+        - **No ``colony_id``**: queen-only DM session.
+
+        When ``queen_resume_from`` is set the queen writes conversation
+        messages to that existing session's directory instead of creating
+        a new one — preserves full conversation history across restarts.
 
         When ``queen_name`` is set the session is pre-bound to that queen
         identity, skipping LLM auto-selection in the identity hook.
         """
-        # Reuse the original session ID when cold-restoring
+        # A resume that arrives without colony context must not rebind the
+        # session's storage: if the resumed session lives in a colony tree,
+        # adopt that colony regardless of what the caller (didn't) pass.
+        if queen_resume_from and not colony_id:
+            derived = _derive_resume_colony_id(queen_resume_from)
+            if derived:
+                logger.info(
+                    "Resume of '%s' arrived without colony context; derived colony_id='%s' from its on-disk location",
+                    queen_resume_from,
+                    derived,
+                )
+                colony_id = derived
+
+        # A soft-deleted colony still has its metadata.json on disk, so without
+        # this it would be treated as "existing" below and silently resurrected.
+        # It's invisible and unrecoverable to the user, so a create_session
+        # naming it can only mean "make a fresh colony here" — park the dead one
+        # aside to free the name. No-op for a live colony (it opens as normal).
+        if colony_id:
+            from framework.host.colony_metadata import vacate_soft_deleted_colony
+
+            vacate_soft_deleted_colony(colony_id)
+
+        # -------- 1. Existing-colony branch (was create_session_with_worker_colony)
+        if colony_id and (COLONIES_DIR / colony_id / "metadata.json").exists():
+            # When initial_prompt is set the caller intends to *create* a new
+            # colony (e.g. deploying a community prompt), not open the
+            # existing one.  Deduplicate the slug so the user gets a fresh
+            # colony instead of silently landing in the old one.
+            #
+            # Exception: a scaffold-only colony (metadata scaffolded=true —
+            # the free-user flow's queen-less placeholder, see
+            # handle_scaffold_colony). It has no history, and this create IS
+            # its upgrade: reuse the dir instead of stranding it as an empty
+            # husk next to a deduped "<name>_2". The flag is consumed inside
+            # _create_session_for_existing_colony, so once a colony has run
+            # it can never be mistaken for a scaffold again.
+            if initial_prompt:
+                from framework.host.colony_metadata import load_colony_metadata
+
+                if load_colony_metadata(colony_id).get("scaffolded"):
+                    return await self._create_session_for_existing_colony(
+                        colony_id=colony_id,
+                        session_id=session_id,
+                        model=model,
+                        initial_prompt=initial_prompt,
+                        queen_resume_from=queen_resume_from,
+                        queen_name=queen_name,
+                        initial_phase=initial_phase,
+                    )
+                colony_id = _deduplicate_colony_id(colony_id)
+                # After dedup the slug is free — fall through to the
+                # fresh-colony-bootstrap branch below.
+            else:
+                return await self._create_session_for_existing_colony(
+                    colony_id=colony_id,
+                    session_id=session_id,
+                    model=model,
+                    initial_prompt=initial_prompt,
+                    queen_resume_from=queen_resume_from,
+                    queen_name=queen_name,
+                    initial_phase=initial_phase,
+                )
+
+        # -------- 2. Queen-only or fresh-colony-bootstrap branch
         resolved_session_id = queen_resume_from or session_id
         session = await self._create_session_core(session_id=resolved_session_id, model=model)
         session.queen_resume_from = queen_resume_from
         if queen_name:
             session.queen_name = queen_name
+        # Only ever set here — never cleared. A resume re-reads it from
+        # meta.json (see prepare_queen_session), so the label survives the
+        # restart a setup conversation is most likely to meet.
+        if crm_setup:
+            session.crm_setup = True
 
-        # Start queen immediately (queen-only, no worker tools yet)
+        if colony_id:
+            # Fresh-colony bootstrap: minimal on-disk colony. Phase is
+            # derived from these bindings inside create_queen — no
+            # explicit phase override needed.
+            colony_path = _ensure_minimal_colony(colony_id, queen_name=queen_name)
+            session.colony_id = colony_id
+            session.binding = ColonyBinding.for_name(colony_id)
+            session.worker_path = colony_path
+            session.mode = "colony"
+
         await self._start_queen(
             session,
             worker_identity=None,
@@ -319,49 +733,32 @@ class SessionManager:
         )
 
         logger.info(
-            "Session '%s' created (queen-only, resume_from=%s)",
+            "Session '%s' created (queen-only, resume_from=%s, colony=%s)",
             session.id,
             queen_resume_from,
+            colony_id,
         )
         return session
 
-    async def create_session_with_worker_colony(
+    async def _create_session_for_existing_colony(
         self,
-        agent_path: str | Path,
-        agent_id: str | None = None,
-        session_id: str | None = None,
-        model: str | None = None,
-        initial_prompt: str | None = None,
-        queen_resume_from: str | None = None,
-        queen_name: str | None = None,
-        initial_phase: str | None = None,
-        worker_name: str | None = None,
+        *,
+        colony_id: str,
+        session_id: str | None,
+        model: str | None,
+        initial_prompt: str | None,
+        queen_resume_from: str | None,
+        queen_name: str | None,
+        initial_phase: str | None,
     ) -> Session:
-        """Create a session and load a worker in one step.
+        """Open an existing colony and start a queen against it.
 
-        When ``worker_name`` is provided, creates a worker-only session
-        (no queen) — the worker runs as the primary interactive loop.
-        Otherwise, creates a queen+worker session (legacy path).
+        Internal helper for the colony-exists branch of ``create_session``.
+        Runs the full AgentLoader pipeline via ``_load_worker_core``.
         """
-        agent_path = Path(agent_path)
-        resolved_colony_id = agent_id or agent_path.name
+        from framework.tools.queen_lifecycle_tools import normalize_legacy_phase
 
-        if worker_name:
-            return await self._create_worker_only_session(
-                agent_path=agent_path,
-                worker_name=worker_name,
-                colony_id=resolved_colony_id,
-                session_id=session_id,
-                model=model,
-                initial_prompt=initial_prompt,
-                queen_resume_from=queen_resume_from,
-                queen_name=queen_name,
-            )
-
-        from framework.tools.queen_lifecycle_tools import build_worker_profile
-
-        agent_path = Path(agent_path)
-        resolved_colony_id = agent_id or agent_path.name
+        agent_path = COLONIES_DIR / colony_id
 
         # Read colony metadata.json for queen provenance (queen_name,
         # queen_session_id) so we can restore the correct queen identity
@@ -369,28 +766,78 @@ class SessionManager:
         # queen_resume_from was provided.
         _colony_metadata: dict = {}
         _colony_metadata_path = agent_path / "metadata.json"
-        if _colony_metadata_path.exists():
+        try:
+            _colony_metadata = json.loads(_colony_metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+        # Consume the scaffold marker (free-user placeholder, see
+        # handle_scaffold_colony): the colony is getting a real session now,
+        # so it must never again be treated as a reusable empty scaffold by
+        # create_session's initial_prompt branch.
+        if _colony_metadata.get("scaffolded"):
             try:
-                _colony_metadata = json.loads(_colony_metadata_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+                from framework.host.colony_metadata import update_colony_metadata
+
+                update_colony_metadata(colony_id, {"scaffolded": False})
+            except OSError:
+                logger.warning(
+                    "Failed to clear scaffolded flag for colony '%s'", colony_id
+                )
 
         if not queen_name:
             queen_name = _colony_metadata.get("queen_name") or None
 
         # Colony metadata's queen_session_id is the authoritative session
-        # for this colony (the forked session).  It takes priority over
-        # whatever the frontend found via history scan, which may be the
-        # source session instead of the fork.
+        # for this colony (the forked session). It takes priority over
+        # whatever the frontend found via history scan.
         _colony_session_id = _colony_metadata.get("queen_session_id")
+        if not _colony_session_id:
+            # Legacy colony: metadata.json predates the queen_session_id
+            # field, so we don't know which session is this colony's own.
+            # Falling back to the frontend-supplied queen_resume_from and
+            # resolving it *globally* is what lets two colonies that share a
+            # session id (a DM session opened into more than one legacy
+            # colony) cross-resolve into each other — the root of the
+            # duplicate-id attachment 404s. Resolve it scoped to THIS colony
+            # instead, then persist it so every later open is unambiguous.
+            # Only repair when the frontend actually asked to resume a
+            # session. If queen_resume_from is a session that lives under
+            # THIS colony, honor it; if it points elsewhere (a stale or
+            # cross-colony id), adopt this colony's own newest session
+            # instead. When no resume was requested, leave the fresh-open
+            # path untouched.
+            _repaired: str | None = None
+            if queen_resume_from:
+                if _find_colony_queen_session_dir(
+                    colony_id, queen_resume_from, queen_name
+                ):
+                    _repaired = queen_resume_from
+                else:
+                    _repaired = _latest_colony_queen_session_id(colony_id, queen_name)
+            if _repaired:
+                _colony_session_id = _repaired
+                try:
+                    from framework.host.colony_metadata import update_colony_metadata
+
+                    update_colony_metadata(colony_id, {"queen_session_id": _repaired})
+                    logger.info(
+                        "Backfilled queen_session_id=%s for legacy colony '%s'",
+                        _repaired,
+                        colony_id,
+                    )
+                except (OSError, FileNotFoundError):
+                    logger.warning(
+                        "Could not backfill queen_session_id for colony '%s'",
+                        colony_id,
+                        exc_info=True,
+                    )
         if _colony_session_id:
             queen_resume_from = _colony_session_id
-        elif not queen_resume_from:
-            queen_resume_from = None
 
-        # When cold-restoring, check meta.json for the phase — if the agent
-        # was still being built we must NOT try to load the worker (the code
-        # is incomplete and will fail to import).
+        # When cold-restoring, check meta.json for the phase — if the
+        # agent was still being built we must NOT try to load the worker
+        # (the code is incomplete and will fail to import).
         _resume_queen_id: str | None = None
         if queen_resume_from:
             _resume_phase = None
@@ -398,14 +845,14 @@ class SessionManager:
             if _meta_path.exists():
                 try:
                     _meta = json.loads(_meta_path.read_text(encoding="utf-8"))
-                    _resume_phase = _meta.get("phase")
+                    _resume_phase = normalize_legacy_phase(_meta.get("phase"))
                     _resume_queen_id = _meta.get("queen_id")
                 except (json.JSONDecodeError, OSError):
                     pass
             if _resume_phase in ("building", "planning"):
-                # Fall back to queen-only session — cold resume handler in
-                # _start_queen will set phase_state.agent_path and switch to
-                # the correct phase.
+                # Fall back to queen-only session — the colony code is
+                # incomplete; opening it would crash. Phase resolves to
+                # whatever meta.json says inside create_queen.
                 return await self.create_session(
                     session_id=session_id,
                     model=model,
@@ -414,20 +861,19 @@ class SessionManager:
                     queen_name=queen_name or _resume_queen_id,
                 )
 
-        # Use the colony's forked session ID as the live session ID.
-        # If it's already live (user navigated back), return it directly
-        # -- but only if it belongs to this colony.
+        # If this colony's live session already exists (user navigated
+        # back), return it directly — but only if it points at the same
+        # colony directory.
         if queen_resume_from and queen_resume_from in self._sessions:
             existing = self._sessions[queen_resume_from]
             if existing.worker_path and str(existing.worker_path) == str(agent_path):
                 return existing
 
         # When the queen forked this colony, the inherited DM transcript
-        # is compacted in the background (see fork_session_into_colony).
-        # Block here until that compactor finishes so _load_worker_core
-        # reads the compacted summary — not the raw transcript (which
-        # would defeat the fork's purpose). Bounded wait: on timeout we
-        # proceed anyway so a stuck compactor can't brick the colony.
+        # is compacted in the background. Block until it finishes so
+        # _load_worker_core reads the compacted summary, not the raw
+        # transcript. Bounded wait so a stuck compactor can't brick the
+        # colony.
         if queen_resume_from:
             try:
                 from framework.server import compaction_status
@@ -454,38 +900,24 @@ class SessionManager:
             session.queen_name = _resume_queen_id
         try:
             # Load the colony FIRST (before queen) so queen gets full tools
-            await self._load_worker_core(
-                session,
-                agent_path,
-                colony_id=resolved_colony_id,
-                model=model,
-            )
+            await self._load_worker_core(session, colony_id=colony_id, model=model)
 
-            # Restore active triggers from persisted state (cold restore)
-            await self._restore_active_triggers(session, session.id)
-
-            # Start queen with worker profile + lifecycle + monitoring tools
-            worker_identity = (
-                build_worker_profile(session.colony_runtime, agent_path=agent_path) if session.colony_runtime else None
-            )
             await self._start_queen(
                 session,
-                worker_identity=worker_identity,
+                worker_identity=None,
                 initial_prompt=initial_prompt,
                 initial_phase=initial_phase,
             )
-
         except Exception:
             if queen_resume_from:
-                # Cold restore: worker load failed (e.g. incomplete code from a
-                # building session, or the colony directory was deleted). Fall
-                # back to queen-only so the user can continue the conversation.
-                # Forward queen_name so the recovered session is stored under
-                # the correct queen identity -- otherwise it lands in default/
-                # and the frontend routes the user to the wrong dir.
+                # Cold restore: worker load failed (e.g. incomplete code
+                # or deleted colony dir). Fall back to queen-only so the
+                # user can continue the conversation. Forward queen_name
+                # so the recovered session is stored under the correct
+                # queen identity.
                 logger.warning(
-                    "Cold restore: worker load failed for '%s', falling back to queen-only",
-                    agent_path,
+                    "Cold restore: worker load failed for colony '%s', falling back to queen-only",
+                    colony_id,
                     exc_info=True,
                 )
                 await self.stop_session(session.id)
@@ -496,261 +928,9 @@ class SessionManager:
                     queen_resume_from=queen_resume_from,
                     queen_name=queen_name or _resume_queen_id,
                 )
-            # If anything fails (non-cold-restore), tear down the session
+            # Non-cold-restore failure: tear down and propagate.
             await self.stop_session(session.id)
             raise
-        return session
-
-    async def _create_worker_only_session(
-        self,
-        agent_path: Path,
-        worker_name: str,
-        colony_id: str,
-        session_id: str | None = None,
-        model: str | None = None,
-        initial_prompt: str | None = None,
-        queen_resume_from: str | None = None,
-        queen_name: str | None = None,
-    ) -> Session:
-        """Create a worker-only session (no queen).
-
-        Loads the worker's {worker_name}.json config, creates an AgentLoop,
-        and sets it as the primary interactive executor so chat/SSE work
-        through the existing infrastructure.
-        """
-        import json as _json
-        import shutil
-
-        from framework.agent_loop.agent_loop import AgentLoop, LoopConfig
-        from framework.agent_loop.types import AgentContext, AgentSpec
-        from framework.orchestrator.graph_executor import GraphExecutor
-        from framework.schemas.goal import Goal
-        from framework.storage.conversation_store import FileConversationStore
-        from framework.tracker.decision_tracker import DecisionTracker
-
-        worker_config_path = agent_path / f"{worker_name}.json"
-        if not worker_config_path.exists():
-            raise FileNotFoundError(f"Worker config not found: {worker_config_path}")
-
-        worker_data = _json.loads(worker_config_path.read_text(encoding="utf-8"))
-
-        session = await self._create_session_core(
-            session_id=queen_resume_from,
-            model=model,
-        )
-        session.queen_resume_from = queen_resume_from
-        if queen_name:
-            session.queen_name = queen_name
-
-        session.colony_id = colony_id
-        session.colony_name = colony_id
-        session.worker_path = agent_path
-
-        # Worker storage: $HIVE_HOME/agents/{colony_name}/{worker_name}/
-        from framework.config import HIVE_HOME
-
-        worker_storage = HIVE_HOME / "agents" / colony_id / worker_name
-        worker_storage.mkdir(parents=True, exist_ok=True)
-
-        # Copy conversations from colony if fresh
-        worker_conv_dir = worker_storage / "conversations"
-        if not worker_conv_dir.exists():
-            colony_conv = agent_path / "conversations"
-            if colony_conv.exists():
-                shutil.copytree(colony_conv, worker_conv_dir)
-        conversation_store = FileConversationStore(worker_conv_dir)
-
-        # Build AgentSpec from worker config
-        spec = AgentSpec(
-            id=worker_name,
-            name=worker_data.get("name", worker_name),
-            description=worker_data.get("description", ""),
-            system_prompt=worker_data.get("system_prompt", ""),
-            tools=worker_data.get("tools", []),
-            tool_access_policy="all",
-            identity_prompt=worker_data.get("identity_prompt", ""),
-        )
-
-        # Build loop config
-        lc_data = worker_data.get("loop_config", {})
-        loop_config = LoopConfig(
-            max_iterations=lc_data.get("max_iterations", 999_999),
-            max_tool_calls_per_turn=lc_data.get("max_tool_calls_per_turn", 30),
-            max_context_tokens=lc_data.get("max_context_tokens", 180_000),
-            spillover_dir=str(agent_path / "data"),
-        )
-
-        # Build goal
-        goal_data = worker_data.get("goal", {})
-        goal = Goal(
-            id=f"{colony_id}-{worker_name}",
-            name=goal_data.get("description", worker_name)[:60],
-            description=goal_data.get("description", ""),
-        )
-
-        # Queen dir for SSE/session metadata (reuse queen session storage)
-        storage_session_id = queen_resume_from or session.id
-        queen_dir = _queen_session_dir(storage_session_id, session.queen_name)
-        queen_dir.mkdir(parents=True, exist_ok=True)
-        session.queen_dir = queen_dir
-
-        # Write meta
-        _meta_path = queen_dir / "meta.json"
-        _existing_meta: dict = {}
-        if _meta_path.exists():
-            try:
-                _existing_meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        _existing_meta.update(
-            {
-                "created_at": time.time(),
-                "queen_id": session.queen_name,
-                "agent_name": worker_name,
-                "agent_path": str(agent_path),
-                "worker_name": worker_name,
-            }
-        )
-        _meta_path.write_text(_json.dumps(_existing_meta), encoding="utf-8")
-
-        # Set up event log
-        iteration_offset = 0
-        events_path = queen_dir / "events.jsonl"
-        if events_path.exists():
-            max_iter = -1
-            with open(events_path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = _json.loads(line)
-                        i = evt.get("iteration", 0)
-                        if i > max_iter:
-                            max_iter = i
-                    except Exception:
-                        pass
-            if max_iter >= 0:
-                iteration_offset = max_iter + 1
-
-        # Load the worker via AgentLoader to get the full pipeline (MCP, skills, creds)
-        from framework.loader import AgentLoader
-
-        loop = asyncio.get_running_loop()
-        runner = await loop.run_in_executor(
-            None,
-            lambda: AgentLoader.load(
-                agent_path,
-                model=model or self._model,
-                interactive=False,
-                skip_credential_validation=True,
-                credential_store=self._credential_store,
-            ),
-        )
-        if runner._agent_runtime is None:
-            await loop.run_in_executor(
-                None,
-                lambda: runner._setup(event_bus=session.event_bus),
-            )
-
-        session.colony_runtime = runner._agent_runtime
-        session.runner = runner
-
-        # Start the AgentHost
-        runtime = runner._agent_runtime
-        if runtime and not runtime.is_running:
-            await runtime.start()
-
-        # Register entry point so we can trigger execution
-        from framework.host.execution_manager import EntryPointSpec
-
-        if not runtime._streams:
-            runtime.register_entry_point(
-                EntryPointSpec(
-                    id="default",
-                    name="Default",
-                    entry_node=worker_name,
-                    trigger_type="manual",
-                    isolation_level="shared",
-                ),
-            )
-
-        # Create a queen-like executor for the worker so chat injection works
-        # We reuse the queen_executor field even though it's a worker
-        queen_registry = runner._tool_registry
-
-        # Start with queen's default tools if available
-        queen_llm = runner._llm or session.llm
-        all_tools = list(queen_registry.get_tools().values())
-        tool_executor = queen_registry.get_executor()
-
-        agent_loop = AgentLoop(
-            event_bus=session.event_bus,
-            config=loop_config,
-            tool_executor=tool_executor,
-            conversation_store=conversation_store,
-        )
-
-        worker_ctx = AgentContext(
-            runtime=DecisionTracker(worker_storage),
-            agent_id=worker_name,
-            agent_spec=spec,
-            input_data={"task": goal_data.get("description", "")},
-            llm=queen_llm,
-            available_tools=all_tools,
-            goal_context=goal.to_prompt_context(),
-            goal=goal,
-            # Worker output cap — pull from configuration.json instead of
-            # hard-coding 8192. glm-5.1/kimi-k2.5 both support 32k out, and
-            # capping at 8k silently truncates long worker turns mid-tool.
-            max_tokens=get_max_tokens(),
-            stream_id=worker_name,
-            execution_id=worker_name,
-            identity_prompt=worker_data.get("identity_prompt", ""),
-            memory_prompt=worker_data.get("memory_prompt", ""),
-            skills_catalog_prompt=worker_data.get("skills_catalog_prompt", ""),
-            protocols_prompt=worker_data.get("protocols_prompt", ""),
-            skill_dirs=worker_data.get("skill_dirs", []),
-        )
-
-        session.queen_executor = GraphExecutor(
-            node_id=worker_name,
-            agent_loop=agent_loop,
-            context=worker_ctx,
-            event_bus=session.event_bus,
-        )
-
-        # Start the worker's agent loop in the background.
-        # Scope browser profile per-session so parallel sessions drive
-        # independent Chrome tab groups. Browser tools live in an MCP
-        # subprocess; we inject `profile` via the ToolRegistry execution
-        # context (a CONTEXT_PARAM) so it flows into every tool call.
-        async def _run_worker():
-            try:
-                from framework.loader.tool_registry import ToolRegistry
-
-                ToolRegistry.set_execution_context(profile=session.id)
-            except Exception:
-                logger.debug("Worker: failed to set browser profile", exc_info=True)
-            await session.queen_executor.run(initial_message=initial_prompt)
-
-        session.queen_task = asyncio.create_task(_run_worker())
-
-        # Set up event persistence
-        if session.event_bus and queen_dir:
-            session.event_bus.start_persistence(queen_dir, iteration_offset=iteration_offset)
-
-        logger.info(
-            "Worker-only session '%s' started: colony=%s worker=%s tools=%d",
-            session.id,
-            colony_id,
-            worker_name,
-            len(all_tools),
-        )
-
-        async with self._lock:
-            self._loading.discard(session.id)
-
         return session
 
     # ------------------------------------------------------------------
@@ -760,21 +940,22 @@ class SessionManager:
     async def _load_worker_core(
         self,
         session: Session,
-        agent_path: str | Path,
-        colony_id: str | None = None,
+        colony_id: str,
         model: str | None = None,
     ) -> None:
-        """Load a worker into a session (core logic).
+        """Bind a colony to a session and load its triggers.
 
-        Sets up the runner, runtime, and session fields. Does NOT notify
-        the queen — callers handle that step.
+        Resolves the colony directory from ``colony_id`` (always
+        ``<COLONIES_DIR>/<colony_id>/``), sets the session's colony
+        identity (``colony_id``, ``binding``, ``worker_path``), and
+        auto-starts any triggers flagged active in ``triggers.json``.
+        Does NOT notify the queen — callers handle that step. ``model``
+        is accepted for caller compatibility but is unused now that
+        workers no longer load a graph runtime.
         """
-        from framework.loader import AgentLoader
+        agent_path = COLONIES_DIR / colony_id
 
-        agent_path = Path(agent_path)
-        resolved_colony_id = colony_id or agent_path.name
-
-        if session.colony_runtime is not None:
+        if session.colony_id is not None:
             raise ValueError(f"Session '{session.id}' already has colony '{session.colony_id}'")
 
         async with self._lock:
@@ -783,45 +964,14 @@ class SessionManager:
             self._loading.add(session.id)
 
         try:
-            # Blocking I/O — load in executor
-            loop = asyncio.get_running_loop()
-            # By default, workers share the session's LLM with the queen so
-            # execution and memory reflection/recall stay on the same model.
-            session_model = getattr(session.llm, "model", None)
-            resolved_model = model or session_model or self._model
-            runner = await loop.run_in_executor(
-                None,
-                lambda: AgentLoader.load(
-                    agent_path,
-                    model=resolved_model,
-                    interactive=False,
-                    skip_credential_validation=True,
-                    credential_store=self._credential_store,
-                ),
-            )
-
-            if model is None:
-                runner._llm = session.llm
-
-            # Setup with session's event bus
-            if runner._agent_runtime is None:
-                await loop.run_in_executor(
-                    None,
-                    lambda: runner._setup(event_bus=session.event_bus),
-                )
-
-            runtime = runner._agent_runtime
-
-            # Load triggers from the agent's triggers.json definition file.
-            # triggers.json is written exclusively by set_trigger, so the
-            # presence of an entry means the user explicitly activated this
-            # trigger in a previous session. We treat the file as the
-            # source of truth and auto-start each trigger on colony load
-            # so the user doesn't have to re-activate after every restart.
-            # The per-session active_triggers tracking still functions, but
-            # is no longer the only path to "running" status.
+            # Triggers live in the colony's triggers.json — one file holding
+            # each trigger's definition plus an ``active`` flag. Load every
+            # definition; auto-start the ones flagged active so they survive
+            # a server restart without the user re-activating them.
             from framework.tools.queen_lifecycle_tools import (
+                _persist_active_triggers,
                 _read_agent_triggers_json,
+                _save_trigger_to_agent,
                 _start_trigger_timer,
                 _start_trigger_webhook,
             )
@@ -831,20 +981,54 @@ class SessionManager:
                 tid = tdata.get("id", "")
                 ttype = tdata.get("trigger_type", "")
                 if tid and ttype in ("timer", "webhook"):
+                    # A missing ``enabled`` key means the trigger was
+                    # registered without an explicit choice; default
+                    # to True — every persisted trigger is enabled
+                    # unless someone has flipped the advanced toggle.
+                    enabled_flag = bool(tdata.get("enabled", True))
                     session.available_triggers[tid] = TriggerDefinition(
                         id=tid,
                         trigger_type=ttype,
                         trigger_config=tdata.get("trigger_config", {}),
                         description=tdata.get("name", tid),
                         task=tdata.get("task", ""),
+                        enabled=enabled_flag,
+                        last_fired_at=tdata.get("last_fired_at"),
+                        next_due_at=tdata.get("next_due_at"),
                     )
-                    triggers_to_autostart.append(tid)
+                    if enabled_flag:
+                        triggers_to_autostart.append(tid)
                     logger.info("Loaded trigger '%s' (%s) from triggers.json", tid, ttype)
 
-            # Auto-start every trigger discovered in triggers.json. The
-            # frontend listens for TRIGGER_ACTIVATED to render the active
-            # state; per-session active_triggers tracking still happens
-            # via _persist_active_triggers below.
+            # Bind the colony identity before starting triggers — the trigger
+            # fire path gates on ``session.colony_id``.
+            session.colony_id = colony_id
+            session.binding = ColonyBinding.for_name(colony_id)
+            session.worker_path = agent_path
+
+            # Silently skip missed triggers: stamp last_fired_at = now so
+            # the gap doesn't resurface on the next reopen. Colonies should
+            # not auto-start work on open — only explicit user messages and
+            # scheduled trigger fires activate them.
+            from framework.host.triggers import compute_missed
+            from datetime import datetime, timezone as tz
+
+            persisted_triggers = _read_agent_triggers_json(agent_path)
+            missed = compute_missed(persisted_triggers)
+            if missed:
+                now_iso = datetime.now(tz=tz.utc).isoformat()
+                for m in missed:
+                    tid = m.trigger_id
+                    tdef = session.available_triggers.get(tid)
+                    if tdef is not None:
+                        tdef.last_fired_at = now_iso
+                        _save_trigger_to_agent(session, tid, tdef)
+                logger.info(
+                    "Silently skipped %d missed trigger(s) on colony load: %s",
+                    len(missed),
+                    [m.trigger_id for m in missed],
+                )
+
             for tid in triggers_to_autostart:
                 tdef = session.available_triggers[tid]
                 try:
@@ -852,7 +1036,6 @@ class SessionManager:
                         await _start_trigger_timer(session, tid, tdef)
                     elif tdef.trigger_type == "webhook":
                         await _start_trigger_webhook(session, tid, tdef)
-                    tdef.active = True
                     session.active_trigger_ids.add(tid)
                     logger.info("Auto-started trigger '%s' on colony load", tid)
                 except Exception:
@@ -862,54 +1045,25 @@ class SessionManager:
                         exc_info=True,
                     )
 
-            if session.active_trigger_ids:
-                # Persist the auto-started set so a subsequent restart
-                # finds them in state.active_triggers and the existing
-                # _restore_active_triggers path also keeps working.
-                from framework.tools.queen_lifecycle_tools import (
-                    _persist_active_triggers,
-                )
-
-                await _persist_active_triggers(session, session.id)
-
             if session.available_triggers:
-                # Emit AVAILABLE for every trigger (so the UI knows the
-                # definition exists) and ACTIVATED for the ones we just
-                # auto-started. The frontend handler treats them as the
-                # same case and uses the latter to flip the card to
-                # active.
+                # Sync triggers.json ``active`` flags with what is running,
+                # then tell the UI which triggers exist and which are active.
+                await _persist_active_triggers(session, session.id)
                 await self._emit_trigger_events(session, "available", session.available_triggers)
                 if session.active_trigger_ids:
-                    activated = {
-                        tid: session.available_triggers[tid]
-                        for tid in session.active_trigger_ids
-                        if tid in session.available_triggers
-                    }
+                    activated = {tid: session.available_triggers[tid] for tid in session.active_trigger_ids if tid in session.available_triggers}
                     if activated:
                         await self._emit_trigger_events(session, "activated", activated)
 
-            # Start runtime on event loop
-            if runtime and not runtime.is_running:
-                await runtime.start()
-
             # Clean up stale "active" sessions from previous (dead) processes
             self._cleanup_stale_active_sessions(agent_path)
-
-            info = runner.info()
-
-            # Update session
-            session.colony_id = resolved_colony_id
-            session.worker_path = agent_path
-            session.runner = runner
-            session.colony_runtime = runtime
-            session.worker_info = info
 
             async with self._lock:
                 self._loading.discard(session.id)
 
             logger.info(
-                "Worker '%s' loaded into session '%s'",
-                resolved_colony_id,
+                "Colony '%s' bound to session '%s'",
+                colony_id,
                 session.id,
             )
 
@@ -1006,108 +1160,35 @@ class SessionManager:
                 return False
             return True
 
-    async def _restore_active_triggers(self, session: "Session", session_id: str) -> None:
-        """Restore previously active triggers from persisted session state.
-
-        Called after worker loading to restart any timer/webhook triggers
-        that were active before a server restart.
-        """
-        if not session.available_triggers or not session.colony_runtime:
-            return
-        try:
-            store = session.colony_runtime._session_store
-            state = await store.read_state(session_id)
-            if state and state.active_triggers:
-                from framework.host.event_bus import AgentEvent, EventType
-                from framework.tools.queen_lifecycle_tools import (
-                    _start_trigger_timer,
-                    _start_trigger_webhook,
-                )
-
-                runner = getattr(session, "runner", None)
-                colony_entry = runner.graph.entry_node if runner else None
-                saved_tasks = getattr(state, "trigger_tasks", {}) or {}
-                for tid in state.active_triggers:
-                    tdef = session.available_triggers.get(tid)
-                    if tdef:
-                        # Restore user-configured task override
-                        saved_task = saved_tasks.get(tid, "")
-                        if saved_task:
-                            tdef.task = saved_task
-                        tdef.active = True
-                        session.active_trigger_ids.add(tid)
-                        if tdef.trigger_type == "timer":
-                            await _start_trigger_timer(session, tid, tdef)
-                            logger.info("Restored trigger timer '%s'", tid)
-                        elif tdef.trigger_type == "webhook":
-                            await _start_trigger_webhook(session, tid, tdef)
-                            logger.info("Restored webhook trigger '%s'", tid)
-                        # Emit TRIGGER_ACTIVATED so the frontend knows this
-                        # trigger is running after a server restart. Without
-                        # this, the previously-available event is the only
-                        # signal the UI ever gets, and the trigger appears
-                        # inactive forever.
-                        if session.event_bus:
-                            await session.event_bus.publish(
-                                AgentEvent(
-                                    type=EventType.TRIGGER_ACTIVATED,
-                                    stream_id="queen",
-                                    data={
-                                        "trigger_id": tdef.id,
-                                        "trigger_type": tdef.trigger_type,
-                                        "trigger_config": tdef.trigger_config,
-                                        "name": tdef.description or tdef.id,
-                                        **({"entry_node": colony_entry} if colony_entry else {}),
-                                    },
-                                )
-                            )
-                    else:
-                        logger.warning(
-                            "Saved trigger '%s' not found in worker entry points, skipping",
-                            tid,
-                        )
-
-            # Restore worker_configured flag
-            if state and getattr(state, "worker_configured", False):
-                session.worker_configured = True
-        except Exception as e:
-            logger.warning("Failed to restore active triggers: %s", e)
-
     async def load_colony(
         self,
         session_id: str,
-        agent_path: str | Path,
-        colony_id: str | None = None,
+        colony_id: str,
         model: str | None = None,
     ) -> Session:
-        """Load a worker colony into an existing session (with running queen).
+        """Load a colony into an existing session (with running queen).
 
-        Starts the colony runtime and notifies the queen.
+        Resolves the colony directory from ``colony_id`` (always
+        ``<COLONIES_DIR>/<colony_id>/``), starts the colony runtime, and
+        notifies the queen.
         """
-        agent_path = Path(agent_path)
-
         session = self._sessions.get(session_id)
         if session is None:
             raise ValueError(f"Session '{session_id}' not found")
 
-        await self._load_worker_core(
-            session,
-            agent_path,
-            colony_id=colony_id,
-            model=model,
-        )
+        await self._load_worker_core(session, colony_id=colony_id, model=model)
+
+        agent_path = COLONIES_DIR / colony_id
 
         # Notify queen about the loaded worker (skip for queen itself).
-        if agent_path.name != "queen" and session.colony_runtime:
+        if colony_id != "queen" and session.colony_id:
             await self._notify_queen_colony_loaded(session)
 
-        # Update meta.json so cold-restore can discover this session by agent_path
+        # Update meta.json so cold-restore can discover this session
         storage_session_id = session.queen_resume_from or session.id
         meta_path = _queen_session_dir(storage_session_id, session.queen_name) / "meta.json"
         try:
-            _agent_name = (
-                session.worker_info.name if session.worker_info else str(agent_path.name).replace("_", " ").title()
-            )
+            _agent_name = humanize_slug(colony_id)
             existing_meta = {}
             if meta_path.exists():
                 existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1116,8 +1197,6 @@ class SessionManager:
             meta_path.write_text(json.dumps(existing_meta), encoding="utf-8")
         except OSError:
             pass
-
-        await self._restore_active_triggers(session, session_id)
 
         # Emit SSE event so the frontend can update UI
         await self._emit_colony_loaded(session)
@@ -1129,15 +1208,8 @@ class SessionManager:
         session = self._sessions.get(session_id)
         if session is None:
             return False
-        if session.colony_runtime is None:
+        if session.colony_id is None:
             return False
-
-        # Cleanup worker
-        if session.runner:
-            try:
-                await session.runner.cleanup_async()
-            except Exception as e:
-                logger.error("Error cleaning up colony '%s': %s", session.colony_id, e)
 
         # Cancel active trigger timers
         for tid, task in session.active_timer_tasks.items():
@@ -1161,10 +1233,8 @@ class SessionManager:
 
         colony_id = session.colony_id
         session.colony_id = None
+        session.binding = None
         session.worker_path = None
-        session.runner = None
-        session.colony_runtime = None
-        session.worker_info = None
 
         # Notify queen
         await self._notify_queen_worker_unloaded(session)
@@ -1215,15 +1285,18 @@ class SessionManager:
                     global_mem_dir = session.phase_state.global_memory_dir or global_mem_dir
                     queen_mem_dir = session.phase_state.queen_memory_dir or queen_mem_dir
 
+                # asyncio.create_task() requires a coroutine — wrapping in
+                # asyncio.shield() (which returns a Future) raised
+                # TypeError on every stop. The task is tracked in
+                # _background_tasks and never cancelled by us, so it
+                # already runs to completion without shielding.
                 task = asyncio.create_task(
-                    asyncio.shield(
-                        run_shutdown_reflection(
-                            session.queen_dir,
-                            session.llm,
-                            global_memory_dir_override=global_mem_dir,
-                            queen_memory_dir=queen_mem_dir,
-                            queen_id=session.queen_name,
-                        )
+                    run_shutdown_reflection(
+                        session.queen_dir,
+                        session.llm,
+                        global_memory_dir_override=global_mem_dir,
+                        queen_memory_dir=queen_mem_dir,
+                        queen_id=session.queen_name,
                     ),
                     name=f"shutdown-reflect-{session_id}",
                 )
@@ -1275,13 +1348,6 @@ class SessionManager:
             except Exception:
                 logger.error("Error stopping queen webhook server", exc_info=True)
             session.queen_webhook_server = None
-
-        # Cleanup worker
-        if session.runner:
-            try:
-                await session.runner.cleanup_async()
-            except Exception as e:
-                logger.error("Error cleaning up worker: %s", e)
 
         # Stop the unified ColonyRuntime (Phase 2 wiring) if it was started
         if session.colony is not None:
@@ -1341,9 +1407,12 @@ class SessionManager:
 
         # Determine which session directory to use for queen storage.
         # When queen_resume_from is set we write to the ORIGINAL session's
-        # directory so that all messages accumulate in one place.
+        # directory so that all messages accumulate in one place. A
+        # colony-attached session writes under
+        # ``colonies/<c>/queens/<q>/sessions/...``; a pure DM session
+        # writes under ``queens/<q>/sessions/...``.
         storage_session_id = session.queen_resume_from or session.id
-        queen_dir = _queen_session_dir(storage_session_id, session.queen_name)
+        queen_dir = _queen_session_dir(storage_session_id, session.queen_name, colony_id=session.colony_id)
         queen_dir.mkdir(parents=True, exist_ok=True)
         session.queen_dir = queen_dir
 
@@ -1352,11 +1421,7 @@ class SessionManager:
         # session directory sorts as "most recent" after a cold-restore resume).
         _meta_path = queen_dir / "meta.json"
         try:
-            _agent_name = (
-                session.worker_info.name
-                if session.worker_info
-                else (str(session.worker_path.name).replace("_", " ").title() if session.worker_path else None)
-            )
+            _agent_name = str(session.worker_path.name).replace("_", " ").title() if session.worker_path else None
             # Merge into existing meta.json to preserve fields written by
             # _update_meta_json (e.g. phase, agent_path set during building).
             _existing_meta: dict = {}
@@ -1366,22 +1431,35 @@ class SessionManager:
                 except (json.JSONDecodeError, OSError):
                     pass
             _new_meta: dict = {
-                "created_at": time.time(),
                 "queen_id": session.queen_name,
             }
+            # Preserve created_at on cold-resume. This used to be
+            # `time.time()` unconditionally — which bumped a session's
+            # creation date to "now" every time it reactivated, so a
+            # session originally created weeks ago would suddenly show
+            # up in the dropdown's "today's sessions" filter after the
+            # user opened the queen DM and triggered an auto-resume.
+            # Only stamp a fresh value when the session is genuinely
+            # new (no prior created_at on disk).
+            if not _existing_meta.get("created_at"):
+                _new_meta["created_at"] = time.time()
             if _agent_name is not None:
                 _new_meta["agent_name"] = _agent_name
             if session.worker_path is not None:
                 _new_meta["agent_path"] = str(session.worker_path)
+            # Explicit colony binding, so colony membership can be read from
+            # meta.json without falling back to the agent_path basename.
+            if session.colony_id:
+                _new_meta["colony_id"] = session.colony_id
             _existing_meta.update(_new_meta)
             _meta_path.write_text(json.dumps(_existing_meta), encoding="utf-8")
             # Hydrate colony-spawned lock state from meta.json so the lock
             # survives server restart / cold-resume into a live session.
             if _existing_meta.get("colony_spawned") is True:
                 session.colony_spawned = True
-                _spawned_name = _existing_meta.get("spawned_colony_name")
+                _spawned_name = _existing_meta.get("spawned_colony_id")
                 if isinstance(_spawned_name, str):
-                    session.spawned_colony_name = _spawned_name
+                    session.spawned_colony_id = _spawned_name
         except OSError:
             pass
 
@@ -1390,8 +1468,29 @@ class SessionManager:
         # Scan the existing event log to find the max iteration ever written,
         # then use max+1 as offset so resumed sessions produce monotonically
         # increasing iteration values — preventing frontend message ID collisions.
+        # Phase is resolved separately inside create_queen from meta.json["phase"].
+        # If the retention janitor is mid-rewrite of this session's
+        # events.jsonl (cold-session hygiene), wait for it to release the
+        # session lock before scanning/opening the file — racing the
+        # tmp+rename would leave our append fd on the orphaned old inode.
+        # The lock only wraps the rewrite itself (seconds even for a
+        # multi-hundred-MB file); 240 polls = 120s upper bound before we
+        # log and proceed rather than wedging session start forever.
+        _janitor_lock = queen_dir / ".janitor.lock"
+        for _i in range(240):
+            try:
+                if time.time() - _janitor_lock.stat().st_mtime > 3600:
+                    break  # stale lock from a crashed janitor — ignore
+            except OSError:
+                break  # no lock
+            if _i == 239:
+                logger.warning(
+                    "Session '%s': janitor lock still fresh after 120s; proceeding",
+                    session.id,
+                )
+            await asyncio.sleep(0.5)
+
         iteration_offset = 0
-        last_phase = ""
         events_path = queen_dir / "events.jsonl"
         try:
             if events_path.exists():
@@ -1403,24 +1502,17 @@ class SessionManager:
                             continue
                         try:
                             evt = json.loads(line)
-                            data = evt.get("data", {})
-                            it = data.get("iteration")
+                            it = evt.get("data", {}).get("iteration")
                             if isinstance(it, int) and it > max_iter:
                                 max_iter = it
-                            # Track the latest queen phase from QUEEN_PHASE_CHANGED events
-                            if evt.get("type") == "queen_phase_changed":
-                                phase = data.get("phase")
-                                if phase:
-                                    last_phase = phase
                         except (json.JSONDecodeError, TypeError):
                             continue
                 if max_iter >= 0:
                     iteration_offset = max_iter + 1
                     logger.info(
-                        "Session '%s' resuming with iteration_offset=%d (from events.jsonl max), last phase: %s",
+                        "Session '%s' resuming with iteration_offset=%d (from events.jsonl max)",
                         session.id,
                         iteration_offset,
-                        last_phase or "unknown",
                     )
         except OSError:
             pass
@@ -1446,7 +1538,7 @@ class SessionManager:
         # Phase 2 wiring: stand up a real ColonyRuntime that shares the
         # queen's llm, tools, event bus, and storage path. In a DM session
         # it has no parallel workers (the queen runs in queen_task), but
-        # the run_parallel_workers tool (Phase 4) will use this runtime
+        # the run_worker tool (Phase 4) will use this runtime
         # as the spawn surface, and worker SUBAGENT_REPORT events flow
         # back through the shared event_bus to the existing SSE.
         try:
@@ -1458,26 +1550,6 @@ class SessionManager:
                 "_start_queen: unified ColonyRuntime construction failed",
                 exc_info=True,
             )
-
-        # Auto-load worker on cold restore — the queen's conversation expects
-        # the colony to be loaded, but the new session has no worker.
-        if session.queen_resume_from and not session.colony_runtime:
-            meta_path = queen_dir / "meta.json"
-            if meta_path.exists():
-                try:
-                    _meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    _agent_path = _meta.get("agent_path")
-
-                    if _agent_path and Path(_agent_path).exists():
-                        await self.load_colony(session.id, _agent_path)
-                        if session.phase_state:
-                            # Restored colony session lands in reviewing — the
-                            # queen summarises whatever the last run produced
-                            # before the user decides what to do next.
-                            await session.phase_state.switch_to_reviewing(source="auto")
-                        logger.info("Cold restore: auto-loaded colony from %s", _agent_path)
-                except Exception:
-                    logger.warning("Cold restore: failed to auto-load colony", exc_info=True)
 
     # ------------------------------------------------------------------
     # Phase 2: unified ColonyRuntime construction
@@ -1505,23 +1577,66 @@ class SessionManager:
 
         The runtime is started but no overseer is attached — the queen
         still runs as ``session.queen_task`` from ``create_queen``. This
-        is dormant fan-out infrastructure: ``run_parallel_workers``
+        is dormant fan-out infrastructure: ``run_worker``
         (Phase 4) is what activates it.
         """
         from framework.agent_loop.types import AgentSpec
-        from framework.host.colony_runtime import ColonyRuntime
+        from framework.host.colony_runtime import ColonyConfig, ColonyRuntime
         from framework.schemas.goal import Goal
 
         queen_tools = getattr(session, "_queen_tools", None) or []
         queen_tool_executor = getattr(session, "_queen_tool_executor", None)
 
+        # Resolve the colony runtime config. Precedence per knob:
+        # per-colony metadata.json (set at create_colony time / colony
+        # settings) > global configuration.json (desktop Developer
+        # toggle, via get_adaptive_tool_budget_enabled) > framework
+        # default in ColonyConfig() (env-seeded). Resolved here — per
+        # session start, not import time — so toggling the global flag
+        # applies to new sessions without a runtime restart.
+        _colony_config: ColonyConfig | None = None
+        try:
+            _cfg_kwargs: dict[str, Any] = {}
+            from framework.config import get_adaptive_tool_budget_enabled
+
+            _cfg_kwargs["adaptive_tool_budget"] = get_adaptive_tool_budget_enabled()
+            colony_id = getattr(session, "colony_id", None)
+            if colony_id:
+                from framework.config import COLONIES_DIR
+
+                _meta_path = COLONIES_DIR / colony_id / "metadata.json"
+                if _meta_path.exists():
+                    import json as _json
+
+                    _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                    _meta_overrides: dict[str, Any] = {}
+                    _max_conc = _meta.get("max_concurrent_workers")
+                    if isinstance(_max_conc, int) and _max_conc > 0:
+                        _meta_overrides["max_concurrent_workers"] = _max_conc
+                    # Per-colony pin of adaptive worker budgets beats the
+                    # global Developer toggle. Same resolution point as
+                    # the concurrency cap so the knobs behave identically.
+                    _adaptive = _meta.get("adaptive_tool_budget")
+                    if isinstance(_adaptive, bool):
+                        _meta_overrides["adaptive_tool_budget"] = _adaptive
+                    if _meta_overrides:
+                        _cfg_kwargs.update(_meta_overrides)
+                        logger.info(
+                            "_start_queen: applying colony config overrides %s for '%s'",
+                            _meta_overrides,
+                            colony_id,
+                        )
+            _colony_config = ColonyConfig(**_cfg_kwargs)
+        except Exception:
+            logger.debug(
+                "_start_queen: failed to resolve colony config overrides (using defaults)",
+                exc_info=True,
+            )
+
         colony_spec = AgentSpec(
             id="queen_colony",
             name="Queen Colony",
-            description=(
-                "Unified colony runtime hosting the queen overseer and "
-                "any parallel workers spawned via run_parallel_workers."
-            ),
+            description=("Unified colony runtime hosting the queen overseer and any parallel workers spawned via run_worker."),
             system_prompt="",
             tools=[t.name for t in queen_tools],
             tool_access_policy="all",
@@ -1533,27 +1648,43 @@ class SessionManager:
             description="Default goal for the session-level ColonyRuntime.",
         )
 
-        colony = ColonyRuntime(
-            agent_spec=colony_spec,
-            goal=colony_goal,
-            storage_path=queen_dir,
-            llm=session.llm,
-            tools=queen_tools,
-            tool_executor=queen_tool_executor,
-            event_bus=session.event_bus,
-            colony_id=session.id,
-            # Wire the on-disk colony name and queen id so
-            # ColonyRuntime auto-derives its override paths. DM sessions
-            # have no colony_name (session.colony_name is None), which
-            # keeps them out of the per-colony JSON store.
-            colony_name=getattr(session, "colony_name", None),
-            queen_id=getattr(session, "queen_name", None) or None,
-            pipeline_stages=[],  # queen pipeline runs in queen_orchestrator, not here
-        )
+        # Parallel workers spawned via run_worker run inside this
+        # ColonyRuntime and inherit its ``_llm``. If the user has configured
+        # a dedicated worker_llm (e.g. desktop ships hive-2.1 for the queen
+        # + hive-swarm for workers), use it here — otherwise fall back to
+        # session.llm so workers share the queen's LLM (legacy behavior).
+        # The queen itself runs in queen_orchestrator with session.llm and
+        # is unaffected by this swap.
+        worker_llm = self.build_worker_llm() or session.llm
+        # Resolve the on-disk binding (when this session is attached to a
+        # forked colony). DM sessions construct the runtime with
+        # ``binding=None``; ``fork_session_into_colony`` installs the
+        # real binding once the queen names her colony.
+        _colony_id = getattr(session, "colony_id", None)
+        _binding: ColonyBinding | None = getattr(session, "binding", None)
+        if _binding is None and _colony_id:
+            _binding = ColonyBinding.for_name(_colony_id)
+            session.binding = _binding
+        _colony_runtime_kwargs: dict[str, Any] = {
+            "agent_spec": colony_spec,
+            "goal": colony_goal,
+            "storage_path": queen_dir,
+            "llm": worker_llm,
+            "tools": queen_tools,
+            "tool_executor": queen_tool_executor,
+            "event_bus": session.event_bus,
+            "stream_id": session.id,
+            "binding": _binding,
+            "queen_id": getattr(session, "queen_name", None) or None,
+            "pipeline_stages": [],  # queen pipeline runs in queen_orchestrator, not here
+        }
+        if _colony_config is not None:
+            _colony_runtime_kwargs["config"] = _colony_config
+        colony = ColonyRuntime(**_colony_runtime_kwargs)
 
         # Per-colony tool allowlist, loaded from the colony's metadata.json
         # when this session is attached to a real forked colony. For pure
-        # queen DM sessions (session.colony_name is None) we only capture
+        # queen DM sessions (session.colony_id is None) we only capture
         # the MCP-origin set — the allowlist stays ``None`` so every MCP
         # tool passes through by default.
         try:
@@ -1566,14 +1697,14 @@ class SessionManager:
                         if name:
                             mcp_tool_names_all.add(name)
             enabled_mcp_tools: list[str] | None = None
-            colony_name = getattr(session, "colony_name", None)
-            if colony_name:
+            colony_id = getattr(session, "colony_id", None)
+            if colony_id:
                 # Colony tool allowlist lives in a dedicated tools.json
                 # sidecar next to metadata.json. The helper migrates any
                 # legacy field out of metadata.json on first read.
                 from framework.host.colony_tools_config import load_colony_tools_config
 
-                enabled_mcp_tools = load_colony_tools_config(colony_name)
+                enabled_mcp_tools = load_colony_tools_config(colony_id)
             colony.set_tool_allowlist(enabled_mcp_tools, mcp_tool_names_all)
         except Exception:
             logger.debug(
@@ -1598,16 +1729,12 @@ class SessionManager:
 
     async def _notify_queen_colony_loaded(self, session: Session) -> None:
         """Inject a system message into the queen about the loaded colony."""
-        from framework.tools.queen_lifecycle_tools import build_worker_profile
-
         executor = session.queen_executor
         if executor is None:
             return
         node = executor.node_registry.get("queen")
         if node is None or not hasattr(node, "inject_event"):
             return
-
-        profile = build_worker_profile(session.colony_runtime, agent_path=session.worker_path)
 
         # Append available trigger info so the queen knows what's schedulable
         trigger_lines = ""
@@ -1620,23 +1747,21 @@ class SessionManager:
                 parts.append(f"  - {t.id} ({t.trigger_type}: {detail}){task_info}")
             trigger_lines = "\n\nAvailable triggers (inactive — use set_trigger to activate):\n" + "\n".join(parts)
 
-        await node.inject_event(f"[SYSTEM] Colony loaded.{profile}{trigger_lines}")
+        await node.inject_event(f"[SYSTEM] Colony loaded.{trigger_lines}")
 
     async def _emit_colony_loaded(self, session: Session) -> None:
         """Publish a WORKER_COLONY_LOADED event so the frontend can update."""
         from framework.host.event_bus import AgentEvent, EventType
 
-        info = session.worker_info
         await session.event_bus.publish(
             AgentEvent(
                 type=EventType.WORKER_COLONY_LOADED,
                 stream_id="queen",
                 data={
                     "colony_id": session.colony_id,
-                    "colony_name": info.name if info else session.colony_id,
                     "agent_path": str(session.worker_path) if session.worker_path else "",
-                    "goal": info.goal_name if info else "",
-                    "node_count": info.node_count if info else 0,
+                    "goal": "",
+                    "node_count": 0,
                 },
             )
         )
@@ -1671,9 +1796,6 @@ class SessionManager:
             event_type = EventType.TRIGGER_REMOVED
         else:
             event_type = EventType.TRIGGER_AVAILABLE
-        # Resolve entry node for trigger target
-        runner = getattr(session, "runner", None)
-        colony_entry = runner.graph.entry_node if runner else None
         fire_times = getattr(session, "trigger_next_fire", {})
         fire_stats = getattr(session, "trigger_fire_stats", {})
         now_mono = time.monotonic()
@@ -1705,7 +1827,6 @@ class SessionManager:
                         "trigger_type": t.trigger_type,
                         "trigger_config": config_out,
                         "name": t.description or t.id,
-                        **({"entry_node": colony_entry} if colony_entry else {}),
                     },
                 )
             )
@@ -1713,23 +1834,16 @@ class SessionManager:
     async def revive_queen(self, session: Session) -> None:
         """Revive a dead queen executor on an existing session.
 
-        Restarts the queen with the same session context (worker profile, tools, etc.).
+        Restarts the queen with the same session context (tools, etc.).
         """
-        from framework.tools.queen_lifecycle_tools import build_worker_profile
-
         logger.debug(
             "[revive_queen] Starting revival for session '%s', current queen_executor=%s",
             session.id,
             session.queen_executor,
         )
 
-        # Build worker identity if worker is loaded
-        worker_identity = (
-            build_worker_profile(session.colony_runtime, agent_path=session.worker_path)
-            if session.colony_runtime
-            else None
-        )
-        logger.debug("[revive_queen] worker_identity=%s", "present" if worker_identity else "None")
+        # Workers no longer carry a graph-based profile.
+        worker_identity = None
 
         # Start queen with existing session context
         logger.debug("[revive_queen] Calling _start_queen...")
@@ -1747,23 +1861,6 @@ class SessionManager:
 
     def get_session(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
-
-    def get_session_by_colony_id(self, colony_id: str) -> Session | None:
-        """Find a session by its loaded colony's ID."""
-        for s in self._sessions.values():
-            if s.colony_id == colony_id:
-                return s
-        return None
-
-    def get_session_for_agent(self, agent_id: str) -> Session | None:
-        """Resolve an agent_id to a session (backward compat).
-
-        Checks session.id first, then session.colony_id.
-        """
-        s = self._sessions.get(agent_id)
-        if s:
-            return s
-        return self.get_session_by_colony_id(agent_id)
 
     def is_loading(self, session_id: str) -> bool:
         return session_id in self._loading
@@ -1787,13 +1884,13 @@ class SessionManager:
         self,
         *,
         queen_id: str | None = None,
-        colony_name: str | None = None,
+        colony_id: str | None = None,
     ):
         """Yield live ``ColonyRuntime`` instances matching the filters.
 
         ``queen_id`` alone → every runtime whose ``queen_id`` matches
         (useful when the user toggles a queen-scope skill — all her
-        colonies must reload).  ``colony_name`` alone → the single
+        colonies must reload).  ``colony_id`` alone → the single
         runtime pinned to that colony.  Both → intersection. No filters
         → every live runtime (used by global ``/api/skills`` reload).
         """
@@ -1803,7 +1900,7 @@ class SessionManager:
                 continue
             if queen_id is not None and getattr(colony, "queen_id", None) != queen_id:
                 continue
-            if colony_name is not None and getattr(colony, "colony_name", None) != colony_name:
+            if colony_id is not None and getattr(colony, "colony_id", None) != colony_id:
                 continue
             yield colony
 
@@ -1852,7 +1949,7 @@ class SessionManager:
         agent_name: str | None = None
         agent_path: str | None = None
         colony_spawned: bool = False
-        spawned_colony_name: str | None = None
+        spawned_colony_id: str | None = None
         meta_path = queen_dir / "meta.json"
         if meta_path.exists():
             try:
@@ -1861,9 +1958,9 @@ class SessionManager:
                 agent_path = meta.get("agent_path")
                 created_at = meta.get("created_at") or created_at
                 colony_spawned = bool(meta.get("colony_spawned"))
-                _spawned = meta.get("spawned_colony_name")
+                _spawned = meta.get("spawned_colony_id")
                 if isinstance(_spawned, str):
-                    spawned_colony_name = _spawned
+                    spawned_colony_id = _spawned
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1876,12 +1973,109 @@ class SessionManager:
             "agent_name": agent_name,
             "agent_path": agent_path,
             "colony_spawned": colony_spawned,
-            "spawned_colony_name": spawned_colony_name,
+            "spawned_colony_id": spawned_colony_id,
+        }
+
+    @staticmethod
+    def _summarize_session_dir(
+        d: Path,
+        *,
+        skip_colony_fork: bool,
+    ) -> dict | None:
+        """Build the public session summary dict for one session directory.
+
+        Shared between ``list_cold_sessions`` (queen DM history) and
+        ``list_colony_sessions`` (per-colony overseer history). Returns
+        ``None`` when the dir should be omitted from the listing.
+
+        ``skip_colony_fork`` keeps the legacy filter on the queen-tree
+        listing so any pre-migration ``colony_fork`` snapshots stay
+        hidden from queen DM history. The colony listing passes False
+        because those sessions ARE the colony's own chats.
+        """
+        if not d.is_dir():
+            return None
+        try:
+            created_at = d.stat().st_ctime
+        except OSError:
+            created_at = 0.0
+
+        agent_name: str | None = None
+        agent_path: str | None = None
+        meta: dict = {}
+        meta_path = d / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                agent_name = meta.get("agent_name")
+                agent_path = meta.get("agent_path")
+                created_at = meta.get("created_at") or created_at
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if skip_colony_fork and meta.get("colony_fork"):
+            return None
+
+        # Preview of the last client-facing exchange. Cached in
+        # ``summary.json`` next to ``meta.json`` so the sidebar doesn't
+        # have to rescan every part on each list call. The cache is
+        # written incrementally by FileConversationStore.write_part; if
+        # missing or stale (parts dir mtime newer than the summary file)
+        # we do a one-time full rebuild and write a fresh summary.
+        #
+        # NOTE on activity timestamps: the session directory's own mtime
+        # is NOT reliable as a "last activity" marker — POSIX dir mtime
+        # only updates when direct entries change, and conversation
+        # parts live under conversations/parts/, so writing a new part
+        # does not bubble up to the session dir.
+        from framework.storage import session_summary
+
+        last_message: str | None = None
+        message_count: int = 0
+        last_active_at: float = float(created_at) if isinstance(created_at, (int, float)) else 0.0
+        convs_dir = d / "conversations"
+
+        summary: dict | None = None
+        if convs_dir.exists():
+            if session_summary.is_stale(d):
+                summary = session_summary.rebuild_summary(d)
+            else:
+                summary = session_summary.read_summary(d)
+
+        if summary is not None:
+            message_count = int(summary.get("message_count") or 0)
+            last_message = summary.get("last_message")
+            cached_active = summary.get("last_active_at")
+            if isinstance(cached_active, (int, float)) and cached_active > last_active_at:
+                last_active_at = float(cached_active)
+
+        # Derive queen_id from directory structure. Works for both layouts:
+        #   queens/<q>/sessions/<sid>                          -> parent.parent = <q>
+        #   colonies/<c>/queens/<q>/sessions/<sid>             -> parent.parent = <q>
+        queen_id = d.parent.parent.name if d.parent.name == "sessions" else None
+
+        return {
+            "session_id": d.name,
+            "cold": True,  # caller overrides for live sessions
+            "live": False,
+            "has_messages": convs_dir.exists() and message_count > 0,
+            "created_at": created_at,
+            "last_active_at": last_active_at,
+            "agent_name": agent_name,
+            "agent_path": agent_path,
+            "last_message": last_message,
+            "message_count": message_count,
+            "queen_id": queen_id,
         }
 
     @staticmethod
     def list_cold_sessions() -> list[dict]:
-        """Return metadata for every queen session directory on disk, newest first."""
+        """Return metadata for every queen DM session directory on disk, newest first.
+
+        Skips entries marked ``colony_fork: true`` — those belong to a
+        colony's overseer history (``list_colony_sessions``), not the
+        queen's DM history.
+        """
         if not QUEENS_DIR.exists():
             return []
 
@@ -1901,88 +2095,77 @@ class SessionManager:
 
         results: list[dict] = []
         for d in all_session_dirs:
-            if not d.is_dir():
-                continue
-            try:
-                created_at = d.stat().st_ctime
-            except OSError:
-                created_at = 0.0
-            agent_name: str | None = None
-            agent_path: str | None = None
-            meta_path = d / "meta.json"
-            meta: dict = {}
-            if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    agent_name = meta.get("agent_name")
-                    agent_path = meta.get("agent_path")
-                    created_at = meta.get("created_at") or created_at
-                except (json.JSONDecodeError, OSError):
-                    pass
+            entry = SessionManager._summarize_session_dir(d, skip_colony_fork=True)
+            if entry is not None:
+                results.append(entry)
 
-            # Skip colony-forked sessions -- these belong to colonies,
-            # not to the queen DM history.
-            if meta.get("colony_fork"):
-                continue
-
-            # Preview of the last client-facing exchange. Cached in
-            # ``summary.json`` next to ``meta.json`` so the sidebar doesn't
-            # have to rescan every part on each list call. The cache is
-            # written incrementally by FileConversationStore.write_part; if
-            # missing or stale (parts dir mtime newer than the summary file)
-            # we do a one-time full rebuild and write a fresh summary.
-            #
-            # NOTE on activity timestamps: the session directory's own mtime
-            # is NOT reliable as a "last activity" marker — POSIX dir mtime
-            # only updates when direct entries change, and conversation
-            # parts live under conversations/parts/, so writing a new part
-            # does not bubble up to the session dir.
-            from framework.storage import session_summary
-
-            last_message: str | None = None
-            message_count: int = 0
-            last_active_at: float = float(created_at) if isinstance(created_at, (int, float)) else 0.0
-            convs_dir = d / "conversations"
-
-            summary: dict | None = None
-            if convs_dir.exists():
-                if session_summary.is_stale(d):
-                    summary = session_summary.rebuild_summary(d)
-                else:
-                    summary = session_summary.read_summary(d)
-
-            if summary is not None:
-                message_count = int(summary.get("message_count") or 0)
-                last_message = summary.get("last_message")
-                cached_active = summary.get("last_active_at")
-                if isinstance(cached_active, (int, float)) and cached_active > last_active_at:
-                    last_active_at = float(cached_active)
-
-            # Derive queen_id from directory structure: queens/{queen_id}/sessions/{session_id}
-            queen_id = d.parent.parent.name if d.parent.name == "sessions" else None
-
-            results.append(
-                {
-                    "session_id": d.name,
-                    "cold": True,  # caller overrides for live sessions
-                    "live": False,
-                    "has_messages": convs_dir.exists() and message_count > 0,
-                    "created_at": created_at,
-                    "last_active_at": last_active_at,
-                    "agent_name": agent_name,
-                    "agent_path": agent_path,
-                    "last_message": last_message,
-                    "message_count": message_count,
-                    "queen_id": queen_id,
-                }
-            )
-
-        # Sort by last-activity timestamp, newest first. This is the order
-        # callers (including /api/sessions/history and colony-chat cold resume)
-        # rely on — don't use raw directory mtime, which doesn't update when
-        # nested conversation parts are written.
-        results.sort(key=lambda r: r.get("last_active_at") or 0.0, reverse=True)
+        # Strict newest-*created* first. ``session_id`` is the directory name
+        # ``session_YYYYMMDD_HHMMSS_<hash>``, so a descending string sort is a
+        # creation-time sort — total and deterministic (the hash uniquely
+        # breaks same-second ties). Callers (/api/sessions/history,
+        # colony-chat cold resume) rely on a stable "latest first" order;
+        # ``last_active_at`` had no tiebreak, so equal values fell back to
+        # undefined ``iterdir()`` filesystem order.
+        results.sort(key=lambda r: r.get("session_id") or "", reverse=True)
         return results
+
+    @staticmethod
+    def list_colony_sessions(colony_id: str) -> list[dict]:
+        """Return per-colony overseer session metadata, newest first.
+
+        Walks ``colonies/<colony_id>/queens/<q>/sessions/<sid>/`` —
+        the canonical home for colony queen-overseer sessions. The
+        legacy ``colony_fork`` filter is intentionally NOT applied here
+        because these are the colony's own chats. Returns an empty list
+        for unknown colonies (don't 404 from callers — empty is the
+        natural "no prior chat" state).
+        """
+        from framework.config import colony_queens_dir
+
+        queens_root = colony_queens_dir(colony_id)
+        if not queens_root.exists():
+            return []
+
+        all_session_dirs: list[Path] = []
+        try:
+            for queen_root in queens_root.iterdir():
+                if not queen_root.is_dir():
+                    continue
+                sessions_dir = queen_root / "sessions"
+                if not sessions_dir.exists():
+                    continue
+                for d in sessions_dir.iterdir():
+                    if d.is_dir():
+                        all_session_dirs.append(d)
+        except OSError:
+            return []
+
+        results: list[dict] = []
+        for d in all_session_dirs:
+            entry = SessionManager._summarize_session_dir(d, skip_colony_fork=False)
+            if entry is not None:
+                results.append(entry)
+
+        # Strict newest-created first by ``session_id`` (the dir name encodes
+        # the creation timestamp) — total and deterministic, see the note in
+        # ``list_cold_sessions``.
+        results.sort(key=lambda r: r.get("session_id") or "", reverse=True)
+        return results
+
+    @staticmethod
+    def get_colony_active_session(colony_id: str) -> dict | None:
+        """Return the most-recently-active overseer session for the
+        colony, or None when no session has produced messages yet.
+
+        "Active" is implicit (newest ``last_active_at``); we don't
+        persist an explicit pointer. Sessions with no messages are
+        skipped so a freshly-clicked-but-never-typed colony doesn't
+        accidentally claim the slot from a real prior chat.
+        """
+        for entry in SessionManager.list_colony_sessions(colony_id):
+            if entry.get("has_messages"):
+                return entry
+        return None
 
     async def shutdown_all(self) -> None:
         """Gracefully stop all sessions. Called on server shutdown."""

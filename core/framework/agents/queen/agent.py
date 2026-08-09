@@ -19,8 +19,20 @@ queen_goal = Goal(
 # Loop config -- used by queen_orchestrator to build LoopConfig
 queen_loop_config = {
     "max_iterations": 999_999,
-    "max_tool_calls_per_turn": 30,
+    # Budget 30 -> soft checkpoint reminders at 30/60/90/120; hard stop
+    # at budget * tool_call_hard_multiple (default 5) = 150.
+    "tool_call_budget": 30,
     "max_context_tokens": 180_000,
 }
 
-__all__ = ["queen_goal", "queen_loop_config", "queen_node"]
+# Colony queen runs longer-horizon orchestration than an independent queen, so
+# it gets a wider tool-call envelope: budget 50 * hard_multiple 10 = hard stop
+# at 500. Selected by queen_orchestrator when effective_phase == "colony".
+queen_colony_loop_config = {
+    "max_iterations": 999_999,
+    "tool_call_budget": 50,
+    "tool_call_hard_multiple": 10,
+    "max_context_tokens": 180_000,
+}
+
+__all__ = ["queen_goal", "queen_loop_config", "queen_colony_loop_config", "queen_node"]

@@ -5,15 +5,24 @@ import type { ChatMessage, ImageContent } from "@/components/ChatPanel";
 interface QueuedPayload {
   text: string;
   images?: ImageContent[];
+  /** Display echo (file chips / typed text shown in the bubble). Carried
+   *  through the queue so the flushed send matches the optimistic bubble —
+   *  without it the backend echoes the full extracted file content and the
+   *  content-based reconciler can't match, duplicating the bubble. */
+  displayMessage?: string;
 }
 
 interface UsePendingQueueArgs {
   /** Sends a message to the backend. Must handle its own errors. */
-  sendToBackend: (text: string, images?: ImageContent[]) => void;
+  sendToBackend: (
+    text: string,
+    images?: ImageContent[],
+    displayMessage?: string,
+  ) => void;
   /** Setter for the chat message list — used to flip/strip the `queued` flag. */
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
   /** Fires once per flush, before any message is sent. Typically sets
-   *  isTyping/queenIsTyping so the UI reflects that the queen is busy again. */
+   *  active/queenIsTyping so the UI reflects that the queen is busy again. */
   onFlushStart?: () => void;
 }
 
@@ -50,12 +59,23 @@ export function usePendingQueue({
       const pending = queueRef.current.get(messageId);
       if (!pending) return;
       queueRef.current.delete(messageId);
+      // Re-stamp createdAt to the actual send moment. A queued bubble was
+      // stamped at *typing* time; the backend injects it at the next
+      // iteration boundary (≈ now), so its real conversation position is
+      // here, not back where it was typed. Without this the transcript
+      // sorts it above the agent output produced while it sat queued, and
+      // a >15s-queued message also falls outside the echo-reconcile window
+      // and duplicates. Send time keeps the window valid and the position
+      // right; the server echo then supplies the authoritative createdAt.
       setMessages((prev) =>
-        prev.map((m) => (m.id === messageId ? { ...m, queued: false } : m)),
+        prev.map((m) =>
+          m.id === messageId ? { ...m, queued: false, createdAt: Date.now() } : m,
+        ),
       );
-      sendToBackend(pending.text, pending.images);
+      onFlushStart?.();
+      sendToBackend(pending.text, pending.images, pending.displayMessage);
     },
-    [sendToBackend, setMessages],
+    [sendToBackend, setMessages, onFlushStart],
   );
 
   const cancelQueued = useCallback(
@@ -83,11 +103,15 @@ export function usePendingQueue({
     if (first.done) return;
     const [firstId, payload] = first.value;
     queueRef.current.delete(firstId);
+    // Re-stamp to send time — same reasoning as steer(): the message
+    // enters the conversation now (at this turn boundary), not when typed.
     setMessages((prev) =>
-      prev.map((m) => (m.id === firstId ? { ...m, queued: false } : m)),
+      prev.map((m) =>
+        m.id === firstId ? { ...m, queued: false, createdAt: Date.now() } : m,
+      ),
     );
     onFlushStart?.();
-    sendToBackend(payload.text, payload.images);
+    sendToBackend(payload.text, payload.images, payload.displayMessage);
   }, [sendToBackend, setMessages, onFlushStart]);
 
   // Ref to the latest flushNext so SSE handlers captured with narrow deps

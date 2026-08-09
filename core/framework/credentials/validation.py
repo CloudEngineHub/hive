@@ -198,21 +198,27 @@ def _presync_aden_tokens(credential_specs: dict, *, force: bool = False) -> None
         logger.warning("Aden pre-sync unavailable: %s", e)
         return
 
+    synced_ids: list[str] = []
+    skipped_env_set: list[str] = []
+    missing_in_aden: list[str] = []
     for name, spec in credential_specs.items():
         if not spec.aden_supported:
             continue
         if not force and os.environ.get(spec.env_var):
+            skipped_env_set.append(name)
             continue  # Already set — don't overwrite
         cred_id = spec.credential_id or name
         # sync_all() already fetched everything available from Aden.
         # Skip credentials not in the store — they aren't connected,
         # so fetching individually would fail with "Invalid integration ID".
         if not aden_store.exists(cred_id):
+            missing_in_aden.append(cred_id)
             continue
         try:
             value = aden_store.get_key(cred_id, spec.credential_key)
             if value:
                 os.environ[spec.env_var] = value
+                synced_ids.append(cred_id)
                 logger.debug("Pre-synced %s from Aden", spec.env_var)
             else:
                 logger.warning(
@@ -228,6 +234,15 @@ def _presync_aden_tokens(credential_specs: dict, *, force: bool = False) -> None
                 cred_id,
                 e,
             )
+
+    # Diagnostic: a provider missing on a second device shows up here as
+    # "missing(not-in-Aden)" — the Aden store had no entry for it.
+    logger.info(
+        "Aden pre-sync: synced=%s skipped(env-set)=%s missing(not-in-Aden)=%s",
+        synced_ids,
+        skipped_env_set,
+        missing_in_aden,
+    )
 
 
 def compute_unavailable_mcp_tools(

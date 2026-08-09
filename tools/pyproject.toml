@@ -21,6 +21,9 @@ dependencies = [
     "httpx>=0.27.0",
     "beautifulsoup4>=4.12.0",
     "pypdf>=4.0.0",
+    "pdfplumber>=0.11.9",
+    "reportlab>=4.0.0",
+    "pypdfium2>=4.0.0",
     "pandas>=2.0.0",
     "jsonpath-ng>=1.6.0",
     "fastmcp>=2.0.0",
@@ -39,6 +42,9 @@ dependencies = [
     "requests>=2.31.0",
     "websockets>=12.0",
     "psycopg2-binary>=2.9.0",
+    "pytesseract>=0.3.10",
+    "pillow>=10.0.0",
+    "fpdf2>=2.7.0",
 ]
 
 [project.optional-dependencies]
@@ -80,6 +86,11 @@ all = [
     "databricks-mcp>=0.1.0",
 ]
 
+[project.scripts]
+# The browser CLI that replaces the browser_* MCP tools. Invoked by agents via
+# terminal_exec (always with --json); a `python -m gcu.cli` fallback is documented.
+hive-browser = "gcu.cli:main"
+
 [tool.uv.sources]
 framework = { workspace = true }
 
@@ -88,11 +99,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aden_tools"]
+# `gcu` ships the browser CLI (`hive-browser`) + the gcu MCP server; it must be
+# packaged for the console script to resolve in a built wheel (dev/editable
+# installs already expose it via the src path).
+packages = ["src/aden_tools", "src/gcu"]
 
 [tool.ruff]
 target-version = "py311"
-line-length = 120
+line-length = 150
 
 lint.select = [
   "B",   # bugbear errors

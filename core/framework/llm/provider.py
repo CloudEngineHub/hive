@@ -19,6 +19,11 @@ class LLMResponse:
     ``cost_usd`` is the per-call USD cost when the provider / pricing table
     can produce one (Anthropic, OpenAI, OpenRouter are supported). 0.0 when
     unknown or unpriced — treat as "unreported", not "free".
+
+    ``credits`` is the per-request Hive credit cost when the response came
+    through a Hive-aliased model (the proxy puts it on ``usage.credits``).
+    ``None`` means the field was absent — not zero. Direct provider models
+    never set this.
     """
 
     content: str
@@ -28,6 +33,7 @@ class LLMResponse:
     cached_tokens: int = 0
     cache_creation_tokens: int = 0
     cost_usd: float = 0.0
+    credits: float | None = None
     stop_reason: str = ""
     raw_response: Any = None
 
@@ -68,6 +74,12 @@ class ToolResult:
     is_error: bool = False
     image_content: list[dict[str, Any]] | None = None
     is_skill_content: bool = False  # AS-10: marks activated skill body, protected from pruning
+    # Absolute path to the on-disk spill file holding this result's full content
+    # (set by truncate_tool_result whenever a spillover dir is configured — for
+    # BOTH large-preview and small-inline results). Carried out-of-band, never in
+    # the LLM-visible message, so compaction can cite a recovery path when it
+    # clears the result without re-priming the "saved to path" poison pattern.
+    spillover_path: str | None = None
 
 
 class LLMProvider(ABC):
@@ -195,6 +207,7 @@ class LLMProvider(ABC):
             cached_tokens=response.cached_tokens,
             cache_creation_tokens=response.cache_creation_tokens,
             cost_usd=response.cost_usd,
+            credits=response.credits,
             model=response.model,
         )
 

@@ -2,12 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
-import pytest
-
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="terminal_tools is POSIX-only (uses resource module)")
-
 EXPECTED_TOOLS = {
     "terminal_exec",
     "terminal_job_start",
@@ -17,7 +11,7 @@ EXPECTED_TOOLS = {
     "terminal_pty_run",
     "terminal_pty_close",
     "terminal_rg",
-    "terminal_find",
+    "terminal_glob",
     "terminal_output_get",
 }
 

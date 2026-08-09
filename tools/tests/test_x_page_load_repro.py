@@ -199,9 +199,7 @@ async def reproduce_agent_session(session: BrowserSession):
     log(
         12,
         "browser_get_text('[data-testid=\"tweet\"]')",
-        f"text={tweet_text[:100]!r}..."
-        if isinstance(tweet_text, str) and len(tweet_text) > 100
-        else f"text={tweet_text!r}",
+        f"text={tweet_text[:100]!r}..." if isinstance(tweet_text, str) and len(tweet_text) > 100 else f"text={tweet_text!r}",
         time.time() - t0,
     )
     print("         ^ SUCCESS! Finally found the right selector on turn 12 of 13")
@@ -228,7 +226,7 @@ async def demonstrate_correct_approach(session: BrowserSession):
     Show the correct way to open X and extract commentators in ~5 turns.
 
     Key fixes:
-      1. Use browser_wait(selector='[data-testid="tweet"]') after open to wait for SPA
+      1. Use browser_interact(action="wait", wait_for_selector='[data-testid="tweet"]') after open to wait for SPA
       2. Use specific selectors, never get_text("body") on X.com
       3. Use browser_evaluate() to extract all profile links via JS
     """

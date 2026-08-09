@@ -4,7 +4,7 @@ Exposes ten tools (prefix ``terminal_*``) covering:
   - Foreground exec with auto-promotion to background (``terminal_exec``)
   - Background job lifecycle (``terminal_job_*``)
   - Persistent PTY-backed bash sessions (``terminal_pty_*``)
-  - Filesystem search (``terminal_rg``, ``terminal_find``)
+  - Filesystem search (``terminal_rg``, ``terminal_glob``)
   - Truncation handle retrieval (``terminal_output_get``)
 
 Bash-only on POSIX. zsh is rejected at the shell-resolver level. See

@@ -32,7 +32,7 @@ If `agent.py` exists (legacy), it's loaded as a Python module instead.
   "conversation_mode": "continuous",
   "loop_config": {
     "max_iterations": 100,
-    "max_tool_calls_per_turn": 30,
+    "tool_call_budget": 30,
     "max_context_tokens": 32000
   },
   "mcp_servers": [
@@ -155,7 +155,7 @@ Only three valid keys:
 ```json
 {
   "max_iterations": 100,
-  "max_tool_calls_per_turn": 20,
+  "tool_call_budget": 20,
   "max_context_tokens": 32000
 }
 ```

@@ -234,9 +234,7 @@ def register_tools(
         if not task_gid:
             return {"error": "task_gid is required"}
 
-        params = {
-            "opt_fields": ("name,notes,completed,due_on,assignee.name,projects.name,tags.name,created_at,modified_at")
-        }
+        params = {"opt_fields": ("name,notes,completed,due_on,assignee.name,projects.name,tags.name,created_at,modified_at")}
         data = _get(f"tasks/{task_gid}", token, params)
         if "error" in data:
             return data

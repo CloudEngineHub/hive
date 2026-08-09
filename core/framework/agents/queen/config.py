@@ -44,8 +44,7 @@ class AgentMetadata:
         "MCP configuration, and tests."
     )
     intro_message: str = (
-        "I'm Queen — I build Hive agents. Describe what kind of agent "
-        "you want to create and I'll design, implement, and validate it for you."
+        "I'm Queen — I build Hive agents. Describe what kind of agent you want to create and I'll design, implement, and validate it for you."
     )
 
 

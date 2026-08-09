@@ -3,7 +3,6 @@ import {
   extractLastPhase,
   sseEventToChatMessage,
   formatAgentDisplayName,
-  newTokenAccumulator,
   replayEventsToMessages,
 } from "./chat-helpers";
 import type { AgentEvent } from "@/api/types";
@@ -12,7 +11,10 @@ import type { AgentEvent } from "@/api/types";
 // sseEventToChatMessage
 // ---------------------------------------------------------------------------
 
+let __seqCounter = 0;
+
 function makeEvent(overrides: Partial<AgentEvent>): AgentEvent {
+  __seqCounter += 1;
   return {
     type: "execution_started",
     stream_id: "s1",
@@ -22,6 +24,7 @@ function makeEvent(overrides: Partial<AgentEvent>): AgentEvent {
     timestamp: "2026-01-01T00:00:00Z",
     correlation_id: null,
     colony_id: null,
+    seq: __seqCounter,
     ...overrides,
   };
 }
@@ -514,9 +517,22 @@ describe("replayEventsToMessages", () => {
     );
 
     expect(queenMessages).toHaveLength(1);
-    expect(queenMessages[0].id).toBe("queen-stream-session-1-0");
+    expect(queenMessages[0].id).toBe("queen-stream-session-1-0-s0");
+    // Inner-turn spans are exposed separately so the bubble can render a
+    // wider (1.5x paragraph) gap between them; `content` joins them with a
+    // blank line so copy/print/plain-text read as paragraphs.
+    expect(queenMessages[0].innerTurns).toEqual([
+      "I will create the ERD.",
+      "Saved to `database_erd.md`.",
+    ]);
+    // Each span carries its inner turn's (first-seen) time, for the per-node
+    // hover tooltip on the timeline.
+    expect(queenMessages[0].innerTurnTimes).toEqual([
+      new Date("2026-04-20T12:45:25.234Z").getTime(),
+      new Date("2026-04-20T12:46:07.911Z").getTime(),
+    ]);
     expect(queenMessages[0].content).toBe(
-      "I will create the ERD.\nSaved to `database_erd.md`.",
+      "I will create the ERD.\n\nSaved to `database_erd.md`.",
     );
     expect(queenMessages[0].createdAt).toBe(
       new Date("2026-04-20T12:45:25.234Z").getTime(),
@@ -614,15 +630,47 @@ describe("replayEventsToMessages", () => {
     ];
 
     const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
-    const schedulerToolRow = restored.find(
-      (m) => m.id === "tool-pill-queen-session-scheduler-1",
-    );
+    // One tool_status message per call, all completed: 3 messages
+    // (create_colony, list_worker_questions, get_worker_status).
+    const toolRows = restored.filter((m) => m.type === "tool_status");
+    expect(toolRows).toHaveLength(3);
 
-    expect(schedulerToolRow).toBeDefined();
-    expect(JSON.parse(schedulerToolRow!.content)).toEqual({
+    const ts = new Date("2026-01-01T00:00:00Z").getTime();
+    const parse = (m: { content: string }) =>
+      JSON.parse(m.content) as { tools: unknown[]; allDone: boolean };
+    expect(parse(toolRows[0])).toEqual({
       tools: [
-        { name: "list_worker_questions", done: true },
-        { name: "get_worker_status", done: true },
+        {
+          name: "create_colony",
+          done: true,
+          callKey: "tool-create",
+          startedAt: ts,
+          endedAt: ts,
+        },
+      ],
+      allDone: true,
+    });
+    expect(parse(toolRows[1])).toEqual({
+      tools: [
+        {
+          name: "list_worker_questions",
+          done: true,
+          callKey: "tool-questions",
+          startedAt: ts,
+          endedAt: ts,
+        },
+      ],
+      allDone: true,
+    });
+    expect(parse(toolRows[2])).toEqual({
+      tools: [
+        {
+          name: "get_worker_status",
+          done: true,
+          callKey: "tool-status",
+          startedAt: ts,
+          endedAt: ts,
+        },
       ],
       allDone: true,
     });
@@ -654,23 +702,76 @@ describe("replayEventsToMessages", () => {
     ];
 
     const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
-    const firstRunRow = restored.find(
-      (m) => m.id === "tool-pill-queen-exec-a-0",
-    );
-    const secondRunRow = restored.find(
-      (m) => m.id === "tool-pill-queen-exec-b-0",
-    );
-
-    expect(firstRunRow).toBeDefined();
-    expect(secondRunRow).toBeDefined();
-    expect(JSON.parse(firstRunRow!.content)).toEqual({
-      tools: [{ name: "first_run_tool", done: true }],
+    // Each tool_call_started gets its own tool_status message; the
+    // completion for exec-a resolves via the (stream, execution_id,
+    // tool_use_id) lookup even though both calls share the same
+    // tool_use_id, and only the first message flips to done.
+    const toolRows = restored.filter((m) => m.type === "tool_status");
+    expect(toolRows).toHaveLength(2);
+    const ts2 = new Date("2026-01-01T00:00:00Z").getTime();
+    const parse = (m: { content: string }) =>
+      JSON.parse(m.content) as { tools: unknown[]; allDone: boolean };
+    expect(parse(toolRows[0])).toEqual({
+      tools: [
+        {
+          name: "first_run_tool",
+          done: true,
+          callKey: "shared-id",
+          startedAt: ts2,
+          endedAt: ts2,
+        },
+      ],
       allDone: true,
     });
-    expect(JSON.parse(secondRunRow!.content)).toEqual({
-      tools: [{ name: "second_run_tool", done: false }],
-      allDone: false,
+    // The exec-b call never completed in this event stream, so
+    // finalizeOpenToolRows marks it interrupted at end-of-replay (a
+    // tool that started but didn't finish should not render as
+    // forever-running once the session ended).
+    expect(parse(toolRows[1])).toEqual({
+      tools: [
+        {
+          name: "second_run_tool",
+          done: true,
+          callKey: "shared-id",
+          startedAt: ts2,
+          isInterrupted: true,
+        },
+      ],
+      allDone: true,
     });
+  });
+
+  it("produces a path-independent msg.id for tool calls", () => {
+    // Regression: when the user switches away from a session and back,
+    // the same logical tool_call event arrives via two paths — the disk
+    // events.jsonl reload and the SSE ring-buffer resubscribe. `seq`
+    // is not stable across paths (separate runtime counters), but
+    // `tool_use_id` is stamped by the LLM provider and persisted with
+    // the event, so it's the same in both places. The msgId derives
+    // from `tool_use_id` so the by-id merge in queen-dm dedupes the
+    // two deliveries instead of rendering the same pill twice.
+    const tool = {
+      type: "tool_call_started" as const,
+      stream_id: "queen",
+      node_id: "queen",
+      execution_id: "exec-1",
+      data: { tool_name: "web_scrape", tool_use_id: "tool-xyz" },
+    };
+    const fromDisk = replayEventsToMessages(
+      [makeEvent({ ...tool, seq: 7 })],
+      "queen-dm",
+      "Alexandra",
+    );
+    const fromSse = replayEventsToMessages(
+      [makeEvent({ ...tool, seq: 9001 })],
+      "queen-dm",
+      "Alexandra",
+    );
+    const diskRow = fromDisk.find((m) => m.type === "tool_status");
+    const sseRow = fromSse.find((m) => m.type === "tool_status");
+    expect(diskRow).toBeDefined();
+    expect(sseRow).toBeDefined();
+    expect(diskRow!.id).toBe(sseRow!.id);
   });
 });
 
@@ -708,128 +809,8 @@ describe("formatAgentDisplayName", () => {
 // extractLastPhase
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// TokenAccumulator (folded into replayEventsToMessages)
-// ---------------------------------------------------------------------------
-
-describe("replayEventsToMessages tokenAccumulator", () => {
-  it("sums llm_turn_complete payloads in a single pass", () => {
-    const events = [
-      makeEvent({
-        type: "llm_turn_complete",
-        stream_id: "queen",
-        node_id: "queen",
-        execution_id: "exec-1",
-        data: {
-          input_tokens: 100,
-          output_tokens: 50,
-          cached_tokens: 10,
-          cache_creation_tokens: 5,
-          cost_usd: 0.0015,
-        },
-      }),
-      makeEvent({
-        type: "llm_turn_complete",
-        stream_id: "queen",
-        node_id: "queen",
-        execution_id: "exec-2",
-        data: {
-          input_tokens: 200,
-          output_tokens: 75,
-          cached_tokens: 20,
-          cache_creation_tokens: 0,
-          cost_usd: 0.003,
-        },
-      }),
-    ];
-
-    const tokens = newTokenAccumulator();
-    replayEventsToMessages(
-      events,
-      "queen-dm",
-      "Alexandra",
-      undefined,
-      undefined,
-      tokens,
-    );
-
-    expect(tokens.input).toBe(300);
-    expect(tokens.output).toBe(125);
-    expect(tokens.cached).toBe(30);
-    expect(tokens.cacheCreated).toBe(5);
-    expect(tokens.costUsd).toBeCloseTo(0.0045, 5);
-  });
-
-  it("does not mutate the accumulator when no llm_turn_complete events", () => {
-    const events = [
-      makeEvent({
-        type: "execution_started",
-        stream_id: "queen",
-        node_id: "queen",
-        execution_id: "exec-1",
-      }),
-    ];
-    const tokens = newTokenAccumulator();
-    replayEventsToMessages(
-      events,
-      "queen-dm",
-      "Alexandra",
-      undefined,
-      undefined,
-      tokens,
-    );
-    expect(tokens.input).toBe(0);
-    expect(tokens.costUsd).toBe(0);
-  });
-
-  it("treats missing token fields as zero", () => {
-    const events = [
-      makeEvent({
-        type: "llm_turn_complete",
-        stream_id: "queen",
-        node_id: "queen",
-        execution_id: "exec-1",
-        data: { input_tokens: 50 }, // only one field set
-      }),
-    ];
-    const tokens = newTokenAccumulator();
-    replayEventsToMessages(
-      events,
-      "queen-dm",
-      "Alexandra",
-      undefined,
-      undefined,
-      tokens,
-    );
-    expect(tokens.input).toBe(50);
-    expect(tokens.output).toBe(0);
-    expect(tokens.cached).toBe(0);
-    expect(tokens.cacheCreated).toBe(0);
-    expect(tokens.costUsd).toBe(0);
-  });
-
-  it("is a no-op when accumulator is omitted", () => {
-    const events = [
-      makeEvent({
-        type: "llm_turn_complete",
-        stream_id: "queen",
-        node_id: "queen",
-        execution_id: "exec-1",
-        data: { input_tokens: 100 },
-      }),
-    ];
-    // Should not throw, and should return messages normally.
-    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
-    expect(Array.isArray(restored)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// extractLastPhase
-// ---------------------------------------------------------------------------
-
 describe("extractLastPhase", () => {
-  it("keeps incubating as a valid queen phase", () => {
+  it("returns the most recent valid phase from queen_phase_changed events", () => {
     expect(
       extractLastPhase([
         makeEvent({
@@ -838,10 +819,10 @@ describe("extractLastPhase", () => {
         }),
         makeEvent({
           type: "queen_phase_changed",
-          data: { phase: "incubating" },
+          data: { phase: "colony" },
         }),
       ]),
-    ).toBe("incubating");
+    ).toBe("colony");
   });
 
   it("reads phase metadata from node loop iterations", () => {
@@ -849,9 +830,121 @@ describe("extractLastPhase", () => {
       extractLastPhase([
         makeEvent({
           type: "node_loop_iteration",
-          data: { phase: "working" },
+          data: { phase: "colony" },
         }),
       ]),
-    ).toBe("working");
+    ).toBe("colony");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// client_input_committed — a steer injected mid-iteration must SPLIT the
+// queen's per-iteration bubble so the post-steer reply renders as its own
+// bubble BELOW the steer, instead of folding into the pre-steer narration
+// (which is pinned at the iteration's start, above the steer). Also re-stamps
+// the user bubble to its true injection time. Guards the fix for both DM and
+// colony (both restore through replayEventsToMessages).
+// ---------------------------------------------------------------------------
+describe("client_input_committed splits the steered iteration bubble", () => {
+  const at = (s: number) =>
+    new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+
+  // One queen loop iteration (78) spanning a steer: it starts long before the
+  // steer ("tacos…" at t=10), the user steers (received t=31, drained/committed
+  // t=35), and the queen's reaction streams after ("Ramen it is" at t=39). All
+  // three deltas share iteration=78 — the merge-by-iteration is exactly what
+  // collapses them into one bubble without the fix.
+  const buildEvents = (committed: AgentEvent | null): AgentEvent[] => {
+    const early = makeEvent({
+      type: "client_output_delta",
+      stream_id: "queen",
+      node_id: "queen",
+      execution_id: "exec1",
+      timestamp: at(10),
+      data: { snapshot: "Pulling the best taco spots…", iteration: 78, inner_turn: 0 },
+    });
+    const received = makeEvent({
+      type: "client_input_received",
+      stream_id: "queen",
+      execution_id: "exec1",
+      correlation_id: "corr-ramen",
+      timestamp: at(31),
+      data: { content: "no i meant ramen" },
+    });
+    const reaction = makeEvent({
+      type: "client_output_delta",
+      stream_id: "queen",
+      node_id: "queen",
+      execution_id: "exec1",
+      timestamp: at(39),
+      data: { snapshot: "Ramen it is. Let me pivot.", iteration: 78, inner_turn: 16 },
+    });
+    // Disk/emission order: early delta → received → committed → reaction.
+    return committed ? [early, received, committed, reaction] : [early, received, reaction];
+  };
+
+  const queenBubbles = (msgs: ChatMessageLike[]) =>
+    msgs.filter((m) => m.role === "queen" && !m.type);
+  type ChatMessageLike = { role?: string; type?: string; content?: string; createdAt?: number };
+  const idxOf = (msgs: ChatMessageLike[], pred: (m: ChatMessageLike) => boolean) =>
+    msgs.findIndex(pred);
+
+  it("splits into two bubbles so the reply sorts below the steer", () => {
+    const committed = makeEvent({
+      type: "client_input_committed",
+      stream_id: "queen",
+      execution_id: "exec1",
+      correlation_id: "corr-ramen",
+      timestamp: at(35),
+      data: { seq: 58 },
+    });
+    const msgs = replayEventsToMessages(buildEvents(committed), "thread", undefined, "Eleanor") as ChatMessageLike[];
+
+    // Two distinct queen bubbles — pre-steer and post-steer.
+    const bubbles = queenBubbles(msgs);
+    expect(bubbles).toHaveLength(2);
+
+    const taco = idxOf(msgs, (m) => (m.content ?? "").includes("taco"));
+    const ramen = idxOf(msgs, (m) => (m.content ?? "").includes("Ramen it is"));
+    const user = idxOf(msgs, (m) => m.type === "user");
+    // Order: taco narration → steer → ramen reply.
+    expect(taco).toBeLessThan(user);
+    expect(user).toBeLessThan(ramen);
+    // Bubbles are not cross-contaminated.
+    expect(msgs[taco].content).not.toContain("Ramen it is");
+    expect(msgs[ramen].content).not.toContain("taco");
+    // User bubble adopted the committed (true injection) time.
+    expect(msgs[user].createdAt).toBe(Date.parse(at(35)));
+  });
+
+  it("without the committed event the whole iteration merges above the steer (the bug)", () => {
+    const msgs = replayEventsToMessages(buildEvents(null), "thread", undefined, "Eleanor") as ChatMessageLike[];
+    // One merged bubble carrying BOTH texts, pinned at the iteration start…
+    const bubbles = queenBubbles(msgs);
+    expect(bubbles).toHaveLength(1);
+    expect(bubbles[0].content).toContain("taco");
+    expect(bubbles[0].content).toContain("Ramen it is");
+    // …so the reply wrongly sits ABOVE the steer.
+    const ramen = idxOf(msgs, (m) => (m.content ?? "").includes("Ramen it is"));
+    const user = idxOf(msgs, (m) => m.type === "user");
+    expect(ramen).toBeLessThan(user);
+  });
+
+  it("segments independently of event order (delta seen before its drain)", () => {
+    const committed = makeEvent({
+      type: "client_input_committed",
+      stream_id: "queen",
+      execution_id: "exec1",
+      correlation_id: "corr-ramen",
+      timestamp: at(35),
+      data: { seq: 58 },
+    });
+    // Pathological order: the post-steer reaction delta is delivered BEFORE
+    // the committed event. The pre-pass over committed times must still place
+    // it in the post-steer segment.
+    const ev = buildEvents(committed);
+    const reordered = [ev[0], ev[1], ev[3], ev[2]]; // early, received, reaction, committed
+    const msgs = replayEventsToMessages(reordered, "thread", undefined, "Eleanor") as ChatMessageLike[];
+    expect(queenBubbles(msgs)).toHaveLength(2);
   });
 });

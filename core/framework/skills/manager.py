@@ -51,9 +51,6 @@ class SkillsManagerConfig:
             ``~/.hive/agents/queens/{queen_id}/skills_overrides.json``.
             When set, the store is loaded and its entries override
             discovery results (disable skills, record provenance).
-        colony_name: Optional colony identifier; mirrors ``queen_id`` for
-            the ``colony_ui`` scope.
-        colony_overrides_path: Per-colony override file path.
         extra_scope_dirs: Extra scope dirs scanned between user and
             project scopes. Typically populated by the caller with the
             queen/colony UI skill directories.
@@ -67,11 +64,17 @@ class SkillsManagerConfig:
     # Override support
     queen_id: str | None = None
     queen_overrides_path: Path | None = None
-    colony_name: str | None = None
-    colony_overrides_path: Path | None = None
     # Typed at the call site as ``list[ExtraScope]`` — not imported here
     # to keep this module free of discovery-layer dependencies.
     extra_scope_dirs: list = field(default_factory=list)
+
+    # Preset-scope skills to treat as enabled-by-default for this scope,
+    # even though presets ship globally OFF. Mirrors how role-default tools
+    # are resolved in-memory (``load_queen_tools_config``): the per-queen
+    # runtime supplies the role's defaults; an explicit per-queen/colony
+    # override still wins. A plain set of skill names keeps the skills layer
+    # free of queen-role knowledge.
+    default_preset_skills: frozenset[str] = field(default_factory=frozenset)
 
 
 class SkillsManager:
@@ -92,10 +95,8 @@ class SkillsManager:
         self._protocols_prompt: str = ""
         self._allowlisted_dirs: list[str] = []
         self._default_mgr: object = None  # DefaultSkillManager, set after load()
-        # Override stores (loaded lazily in _do_load). Queen-scope and
-        # colony-scope are read together; colony entries win on collision.
+        # Override store (loaded lazily in _do_load).
         self._queen_overrides: object = None  # SkillOverrideStore | None
-        self._colony_overrides: object = None  # SkillOverrideStore | None
         # Hot-reload state
         self._watched_dirs: list[str] = []
         self._watched_files: list[str] = []
@@ -169,48 +170,28 @@ class SkillsManager:
         if self._config.project_root is not None and not self._config.skip_community_discovery:
             from framework.skills.trust import TrustGate
 
-            discovered = TrustGate(interactive=self._config.interactive).filter_and_gate(
-                discovered, project_dir=self._config.project_root
-            )
+            discovered = TrustGate(interactive=self._config.interactive).filter_and_gate(discovered, project_dir=self._config.project_root)
 
-        # 1b. Load per-scope override stores. Missing files → empty stores.
+        # 1b. Load the queen-scope override store. Missing file → empty store.
         queen_store = None
         if self._config.queen_overrides_path is not None:
             queen_store = SkillOverrideStore.load(
                 self._config.queen_overrides_path,
                 scope_label=f"queen:{self._config.queen_id or ''}",
             )
-        colony_store = None
-        if self._config.colony_overrides_path is not None:
-            colony_store = SkillOverrideStore.load(
-                self._config.colony_overrides_path,
-                scope_label=f"colony:{self._config.colony_name or ''}",
-            )
         self._queen_overrides = queen_store
-        self._colony_overrides = colony_store
-        self._watched_files = [
-            str(p) for p in (self._config.queen_overrides_path, self._config.colony_overrides_path) if p is not None
-        ]
+        self._watched_files = [str(p) for p in (self._config.queen_overrides_path,) if p is not None]
 
-        # 1c. Apply override filtering. Colony entries take precedence over
-        # queen entries on name collision; the store's ``is_disabled`` keeps
-        # the resolution rule in one place.
+        # 1c. Apply override filtering.
         self._all_skills = list(discovered)
-        discovered = self._apply_overrides(discovered, skills_config, queen_store, colony_store)
+        discovered = self._apply_overrides(
+            discovered, skills_config, queen_store, self._config.default_preset_skills
+        )
 
         catalog = SkillCatalog(discovered)
         self._catalog = catalog
         self._allowlisted_dirs = catalog.allowlisted_dirs
         catalog_prompt = catalog.to_prompt()
-
-        # Pre-activated community skills
-        if skills_config.skills:
-            pre_activated = catalog.build_pre_activated_prompt(skills_config.skills)
-            if pre_activated:
-                if catalog_prompt:
-                    catalog_prompt = f"{catalog_prompt}\n\n{pre_activated}"
-                else:
-                    catalog_prompt = pre_activated
 
         # 2. Default skills -- discovered via _default_skills/ and included
         # in the catalog for progressive disclosure (no longer force-injected
@@ -240,9 +221,9 @@ class SkillsManager:
         discovered: list,
         skills_config: SkillsConfig,
         queen_store: object,
-        colony_store: object,
+        default_preset_skills: frozenset[str] = frozenset(),
     ) -> list:
-        """Filter ``discovered`` per the queen + colony override stores.
+        """Filter ``discovered`` per the queen override store.
 
         Resolution rule:
           1. Tombstoned names (``deleted_ui_skills``) drop out.
@@ -250,30 +231,25 @@ class SkillsManager:
           3. An explicit ``enabled=True`` override keeps it (wins over
              ``all_defaults_disabled`` for framework defaults AND over the
              preset-scope default-off rule).
-          4. Otherwise: preset-scope skills are off by default; everything
-             else inherits :meth:`SkillsConfig.is_default_enabled`.
+          4. Preset-scope skills are off by default, EXCEPT those in
+             ``default_preset_skills`` (this scope's role defaults) — the
+             in-memory parallel to role-default tools.
+          5. Otherwise everything inherits
+             :meth:`SkillsConfig.is_default_enabled`.
         """
-        from framework.skills.overrides import SkillOverrideStore
-
-        stores: list[SkillOverrideStore] = [s for s in (queen_store, colony_store) if s is not None]
-
-        tombstones: set[str] = set()
-        for store in stores:
-            tombstones |= set(store.deleted_ui_skills)
+        tombstones: set[str] = set(queen_store.deleted_ui_skills) if queen_store is not None else set()
 
         out = []
         for skill in discovered:
             if skill.name in tombstones:
                 continue
-            # Check colony first so colony overrides win over queen's.
             explicit: bool | None = None
             master_disabled = False
-            for store in reversed(stores):  # colony, then queen
-                entry = store.get(skill.name)
+            if queen_store is not None:
+                entry = queen_store.get(skill.name)
                 if entry is not None and entry.enabled is not None:
                     explicit = entry.enabled
-                    break
-                if store.all_defaults_disabled:
+                elif queen_store.all_defaults_disabled:
                     master_disabled = True
             if explicit is False:
                 continue
@@ -281,10 +257,14 @@ class SkillsManager:
                 out.append(skill)
                 continue
             # Preset-scope capability packs are bundled but ship OFF; the
-            # user must explicitly enable them per queen or colony. This
+            # user must explicitly enable them per queen. This
             # runs even when no store is present so bare agents don't
-            # silently load x-automation etc.
+            # silently load x-com-automation etc. Exception: presets named as
+            # this scope's role defaults are on by default (still
+            # overridable above), mirroring role-default tools.
             if skill.source_scope == "preset":
+                if skill.name in default_preset_skills:
+                    out.append(skill)
                 continue
             # No explicit entry — master switch takes effect against framework defaults.
             default_enabled = skills_config.is_default_enabled(skill.name)
@@ -302,11 +282,6 @@ class SkillsManager:
     def queen_overrides(self) -> object:
         """The queen-scope :class:`SkillOverrideStore` or ``None``."""
         return self._queen_overrides
-
-    @property
-    def colony_overrides(self) -> object:
-        """The colony-scope :class:`SkillOverrideStore` or ``None``."""
-        return self._colony_overrides
 
     @property
     def mutation_lock(self) -> asyncio.Lock:
@@ -459,20 +434,6 @@ class SkillsManager:
     def allowlisted_dirs(self) -> list[str]:
         """Skill base directories for Tier 3 resource access (AS-6)."""
         return self._allowlisted_dirs
-
-    @property
-    def batch_init_nudge(self) -> str | None:
-        """Batch init nudge text for DS-12 auto-detection, or None if disabled."""
-        if self._default_mgr is None:
-            return None
-        return self._default_mgr.batch_init_nudge  # type: ignore[union-attr]
-
-    @property
-    def context_warn_ratio(self) -> float | None:
-        """Token usage ratio for DS-13 context preservation warning, or None if disabled."""
-        if self._default_mgr is None:
-            return None
-        return self._default_mgr.context_warn_ratio  # type: ignore[union-attr]
 
     @property
     def is_loaded(self) -> bool:

@@ -111,9 +111,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_traffic_sources"]
         result = tool.fn(domain="amazon.com", country="world")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/traffic-sources", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/traffic-sources", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -158,9 +156,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_company_info"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/company-info/company-info", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/company-info/company-info", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -194,9 +190,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_keyword_competitors"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/keywords-competitors/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/keywords-competitors/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -245,9 +239,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_referrals"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/referrals/aggregated", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/referrals/aggregated", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -262,9 +254,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_ppc_spend"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/ppc-spend", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/ppc-spend", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -294,9 +284,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_similar_sites"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/similar-sites/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/similar-sites/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -311,9 +299,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_ad_networks"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/ad-networks/aggregated", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/ad-networks/aggregated", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -328,9 +314,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_demographics_traffic"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/traffic-by-demographics/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/traffic-by-demographics/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -345,9 +329,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_audience_interests"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/audience-interests/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/audience-interests/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -400,9 +382,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_popular_pages"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-content/pages/popular-pages/aggregated", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-content/pages/popular-pages/aggregated", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -417,9 +397,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_subdomains"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-content/subdomains/aggregated", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-content/subdomains/aggregated", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -434,9 +412,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_keyword_opportunities"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/keywords-opportunities/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/keywords-opportunities/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -485,9 +461,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_paid_keywords"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/keywords/paid/aggregated", {"domain": "amazon.com", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/keywords/paid/aggregated", {"domain": "amazon.com", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -502,9 +476,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_serp_players"]
         result = tool.fn(domain="amazon.com")
 
-        self._assert_v5_request(
-            mock_get, "website-analysis/websites/keywords/serp-players/aggregated", {"domain": "amazon.com"}
-        )
+        self._assert_v5_request(mock_get, "website-analysis/websites/keywords/serp-players/aggregated", {"domain": "amazon.com"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -553,9 +525,7 @@ class TestSimilarWebToolV5:
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_segment_analysis"]
         result = tool.fn(segment_id="seg1")
 
-        self._assert_v5_request(
-            mock_get, "segment-analysis/segments/traffic-and-engagement", {"segment": "seg1", "country": "world"}
-        )
+        self._assert_v5_request(mock_get, "segment-analysis/segments/traffic-and-engagement", {"segment": "seg1", "country": "world"})
         assert result == response_data
 
     @patch("aden_tools.tools.similarweb_tool.similarweb_tool.httpx.get")
@@ -568,9 +538,7 @@ class TestSimilarWebToolV5:
         mock_response = MagicMock()
         mock_response.status_code = 403
         mock_response.text = "Forbidden"
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "403 Forbidden", request=MagicMock(), response=mock_response
-        )
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError("403 Forbidden", request=MagicMock(), response=mock_response)
         mock_get.return_value = mock_response
 
         tool = mcp_with_tools._tool_manager._tools["similarweb_v5_website_rank"]

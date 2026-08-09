@@ -1,7 +1,7 @@
 """Per-colony MCP tool allowlist routes.
 
-- GET   /api/colony/{colony_name}/tools  -- enumerate colony tool surface
-- PATCH /api/colony/{colony_name}/tools  -- set or clear the allowlist
+- GET   /api/colony/{colony_id}/tools  -- enumerate colony tool surface
+- PATCH /api/colony/{colony_id}/tools  -- set or clear the allowlist
 
 A colony's tool set is inherited from the queen that forked it, so the
 tool surface mirrors the queen's MCP servers. Lifecycle/synthetic tools
@@ -16,7 +16,7 @@ Semantics:
 - ``enabled_mcp_tools: [...]`` →  only listed names pass.
 
 The allowlist is persisted in a dedicated ``tools.json`` sidecar at
-``~/.hive/colonies/{colony_name}/tools.json``. Changes take effect on
+``~/.hive/colonies/{colony_id}/tools.json``. Changes take effect on
 the *next* worker spawn. In-flight workers keep the tool list they
 booted with because workers have no dynamic tools provider today —
 mutating their tool set mid-turn would diverge from the list the LLM
@@ -64,24 +64,20 @@ def _synthetic_entries() -> list[dict[str, Any]]:
         ]
 
 
-def _colony_runtimes_for_name(manager: Any, colony_name: str) -> list[Any]:
-    """Return every live ColonyRuntime whose session is attached to ``colony_name``."""
+def _colony_runtimes_for_name(manager: Any, colony_id: str) -> list[Any]:
+    """Return every live ColonyRuntime whose session is attached to ``colony_id``."""
     sessions = getattr(manager, "_sessions", None) or {}
     runtimes: list[Any] = []
     for session in sessions.values():
-        if getattr(session, "colony_name", None) != colony_name:
+        if getattr(session, "colony_id", None) != colony_id:
             continue
-        # Both ``session.colony`` (queen-side unified runtime) and
-        # ``session.colony_runtime`` (legacy worker runtime) may carry
-        # tools that need the allowlist applied. We update both.
-        for attr in ("colony", "colony_runtime"):
-            rt = getattr(session, attr, None)
-            if rt is not None and rt not in runtimes:
-                runtimes.append(rt)
+        rt = getattr(session, "colony", None)
+        if rt is not None and rt not in runtimes:
+            runtimes.append(rt)
     return runtimes
 
 
-async def _render_catalog(manager: Any, colony_name: str) -> dict[str, list[dict[str, Any]]]:
+async def _render_catalog(manager: Any, colony_id: str) -> dict[str, list[dict[str, Any]]]:
     """Build a per-server tool catalog for this colony.
 
     All colonies inherit the queen's MCP surface, so we reuse the
@@ -89,7 +85,7 @@ async def _render_catalog(manager: Any, colony_name: str) -> dict[str, list[dict
     """
     # If a live runtime exists and carries its own registry, prefer it —
     # it's authoritative (reflects any post-queen-boot MCP additions).
-    for rt in _colony_runtimes_for_name(manager, colony_name):
+    for rt in _colony_runtimes_for_name(manager, colony_id):
         tools = getattr(rt, "_tools", None)
         if not tools:
             continue
@@ -120,28 +116,32 @@ async def _render_catalog(manager: Any, colony_name: str) -> dict[str, list[dict
                 )
         return catalog
 
-    # Otherwise fall back to the queen-level snapshot. Build it on demand
-    # (off the event loop) when empty so the Tool Library works before
-    # any queen has been started in this process.
-    cached = getattr(manager, "_mcp_tool_catalog", None)
-    if isinstance(cached, dict) and cached:
-        return cached
-    try:
-        import asyncio
-
-        from framework.server.queen_orchestrator import build_queen_tool_registry_bare
-
-        registry, built = await asyncio.to_thread(build_queen_tool_registry_bare)
-        if manager is not None:
-            manager._mcp_tool_catalog = built  # type: ignore[attr-defined]
-            manager._bootstrap_tool_registry = registry  # type: ignore[attr-defined]
-        return built
-    except Exception:
-        logger.warning("Colony tools: catalog bootstrap failed", exc_info=True)
+    # Otherwise read live from the bootstrap registry so credential
+    # changes propagate without an explicit invalidation step. Build
+    # the registry on demand (off the event loop) on first access.
+    registry = getattr(manager, "_bootstrap_tool_registry", None) if manager is not None else None
+    if registry is not None:
+        return {
+            server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", "")) for server, entries in registry.get_full_mcp_catalog().items()
+        }
+    # Legacy dict snapshot (still used by some tests).
+    legacy = getattr(manager, "_mcp_tool_catalog", None) if manager is not None else None
+    if isinstance(legacy, dict) and legacy:
+        return {server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", "")) for server, entries in legacy.items()}
+    if manager is None:
         return {}
 
+    from framework.server.queen_orchestrator import ensure_bootstrap_tool_registry
 
-def _lifecycle_entries_from_runtime(manager: Any, colony_name: str) -> list[dict[str, Any]]:
+    registry = await ensure_bootstrap_tool_registry(manager)
+    if registry is None:
+        return {}
+    return {
+        server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", "")) for server, entries in registry.get_full_mcp_catalog().items()
+    }
+
+
+def _lifecycle_entries_from_runtime(manager: Any, colony_id: str) -> list[dict[str, Any]]:
     """Non-MCP tools currently registered on the colony runtime (if any).
 
     When no live runtime is available we fall back to the bootstrap
@@ -160,7 +160,7 @@ def _lifecycle_entries_from_runtime(manager: Any, colony_name: str) -> list[dict
         seen.add(name)
         out.append({"name": name, "description": description, "editable": False})
 
-    runtimes = _colony_runtimes_for_name(manager, colony_name)
+    runtimes = _colony_runtimes_for_name(manager, colony_id)
     if runtimes:
         for rt in runtimes:
             mcp_names = set(getattr(rt, "_mcp_tool_names_all", set()) or set())
@@ -211,17 +211,17 @@ def _render_servers(
 
 
 async def handle_get_tools(request: web.Request) -> web.Response:
-    """GET /api/colony/{colony_name}/tools."""
-    colony_name = request.match_info["colony_name"]
-    if not colony_metadata_path(colony_name).exists():
-        return web.json_response({"error": f"Colony '{colony_name}' not found"}, status=404)
+    """GET /api/colony/{colony_id}/tools."""
+    colony_id = request.match_info["colony_id"]
+    if not colony_metadata_path(colony_id).exists():
+        return web.json_response({"error": f"Colony '{colony_id}' not found"}, status=404)
 
     manager = request.app.get("manager")
     # Allowlist now lives in a dedicated tools.json sidecar; helper
     # migrates any legacy metadata.json field on first read.
-    enabled = load_colony_tools_config(colony_name)
+    enabled = load_colony_tools_config(colony_id)
 
-    catalog = await _render_catalog(manager, colony_name)
+    catalog = await _render_catalog(manager, colony_id)
     stale = not catalog
 
     # Snapshot live OAuth providers so disconnected credentialed tools
@@ -232,10 +232,10 @@ async def handle_get_tools(request: web.Request) -> web.Response:
 
     return web.json_response(
         {
-            "colony_name": colony_name,
+            "colony_id": colony_id,
             "enabled_mcp_tools": enabled,
             "stale": stale,
-            "lifecycle": _lifecycle_entries_from_runtime(manager, colony_name),
+            "lifecycle": _lifecycle_entries_from_runtime(manager, colony_id),
             "synthetic": _synthetic_entries(),
             "mcp_servers": _render_servers(catalog, enabled, connected_providers),
             "connected_providers": sorted(connected_providers),
@@ -244,10 +244,10 @@ async def handle_get_tools(request: web.Request) -> web.Response:
 
 
 async def handle_patch_tools(request: web.Request) -> web.Response:
-    """PATCH /api/colony/{colony_name}/tools."""
-    colony_name = request.match_info["colony_name"]
-    if not colony_metadata_path(colony_name).exists():
-        return web.json_response({"error": f"Colony '{colony_name}' not found"}, status=404)
+    """PATCH /api/colony/{colony_id}/tools."""
+    colony_id = request.match_info["colony_id"]
+    if not colony_metadata_path(colony_id).exists():
+        return web.json_response({"error": f"Colony '{colony_id}' not found"}, status=404)
 
     try:
         body = await request.json()
@@ -271,7 +271,7 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
 
     # Validate names against the known MCP catalog — lifts the same
     # typo-catching guarantee we already offer on queen tools.
-    catalog = await _render_catalog(manager, colony_name)
+    catalog = await _render_catalog(manager, colony_id)
     known: set[str] = {e.get("name") for entries in catalog.values() for e in entries if e.get("name")}
     if enabled is not None and known:
         unknown = sorted(set(enabled) - known)
@@ -284,14 +284,14 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
     # Persist — tools.json sidecar, not metadata.json. Missing directory
     # is already guarded by the 404 check above.
     try:
-        update_colony_tools_config(colony_name, enabled)
+        update_colony_tools_config(colony_id, enabled)
     except FileNotFoundError:
-        return web.json_response({"error": f"Colony '{colony_name}' not found"}, status=404)
+        return web.json_response({"error": f"Colony '{colony_id}' not found"}, status=404)
 
     # Update any live runtimes so the NEXT worker spawn reflects the change.
     # We do NOT rebuild in-flight workers' tool lists (see module docstring).
     refreshed = 0
-    for rt in _colony_runtimes_for_name(manager, colony_name):
+    for rt in _colony_runtimes_for_name(manager, colony_id):
         setter = getattr(rt, "set_tool_allowlist", None)
         if callable(setter):
             try:
@@ -300,19 +300,33 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
             except Exception:
                 logger.debug(
                     "Colony tools: set_tool_allowlist failed on runtime for %s",
-                    colony_name,
+                    colony_id,
                     exc_info=True,
                 )
 
     logger.info(
         "Colony tools: colony=%s allowlist=%s refreshed_runtimes=%d",
-        colony_name,
+        colony_id,
         "null" if enabled is None else f"{len(enabled)} tool(s)",
         refreshed,
     )
+    # Broadcast a TOOLS_CONFIG_CHANGED event so other Tool Library
+    # tabs viewing this colony silently refetch.
+    try:
+        from framework.host.event_bus import AgentEvent, EventType, publish_global
+
+        await publish_global(
+            AgentEvent(
+                type=EventType.TOOLS_CONFIG_CHANGED,
+                stream_id="global",
+                data={"scope": "colony", "scope_id": colony_id, "action": "update"},
+            )
+        )
+    except Exception:
+        logger.debug("Failed to publish TOOLS_CONFIG_CHANGED for colony", exc_info=True)
     return web.json_response(
         {
-            "colony_name": colony_name,
+            "colony_id": colony_id,
             "enabled_mcp_tools": enabled,
             "refreshed_runtimes": refreshed,
             "note": "Changes apply to the next worker spawn. Running workers keep their booted tool list.",
@@ -325,10 +339,10 @@ async def handle_list_colonies(request: web.Request) -> web.Response:
 
     Powers the Tool Library page's colony picker.
     """
-    from framework.host.colony_metadata import list_colony_names, load_colony_metadata
+    from framework.host.colony_metadata import list_colony_ids, load_colony_metadata
 
     colonies: list[dict[str, Any]] = []
-    for name in list_colony_names():
+    for name in list_colony_ids():
         meta = load_colony_metadata(name)
         # Provenance stays in metadata.json; allowlist lives in tools.json.
         allowlist = load_colony_tools_config(name)
@@ -347,5 +361,5 @@ async def handle_list_colonies(request: web.Request) -> web.Response:
 def register_routes(app: web.Application) -> None:
     """Register per-colony tool routes."""
     app.router.add_get("/api/colonies/tools-index", handle_list_colonies)
-    app.router.add_get("/api/colony/{colony_name}/tools", handle_get_tools)
-    app.router.add_patch("/api/colony/{colony_name}/tools", handle_patch_tools)
+    app.router.add_get("/api/colony/{colony_id}/tools", handle_get_tools)
+    app.router.add_patch("/api/colony/{colony_id}/tools", handle_patch_tools)

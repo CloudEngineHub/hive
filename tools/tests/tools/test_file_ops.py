@@ -377,16 +377,7 @@ class TestPatchToolPatchMode:
         """One failing op aborts the whole batch with no writes."""
         target = tmp_path / "real.py"
         target.write_text("original\n", encoding="utf-8")
-        body = (
-            "*** Begin Patch\n"
-            "*** Update File: real.py\n"
-            "-original\n"
-            "+changed\n"
-            "*** Update File: missing.py\n"
-            "-foo\n"
-            "+bar\n"
-            "*** End Patch\n"
-        )
+        body = "*** Begin Patch\n*** Update File: real.py\n-original\n+changed\n*** Update File: missing.py\n-foo\n+bar\n*** End Patch\n"
         edit_fn = _get_tool_fn(file_ops_mcp, "edit_file")
         result = edit_fn(mode="patch", patch_text=body)
         assert "Error" in result

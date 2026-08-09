@@ -730,3 +730,200 @@ class TestGmailCreateDraft:
         with patch(HTTPX_MODULE, side_effect=[orig_resp, draft_resp]):
             result = create_draft_fn(html="<p>x</p>", reply_to_message_id="origmsg")
         assert "error" in result
+
+    # -- signature ------------------------------------------------------------
+
+    def test_new_draft_appends_signature(self, create_draft_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(200, {"id": "d", "message": {"id": "m"}})
+        sig = "<div>— Timothy</div>"
+        with patch(HTTPX_MODULE, return_value=mock_resp) as mock_req:
+            create_draft_fn(html="<p>Hi</p>", to="a@b.com", subject="Hey", signature=sig)
+
+        import base64
+        import email
+
+        body = mock_req.call_args[1]["json"]
+        raw = base64.urlsafe_b64decode(body["message"]["raw"])
+        mime = email.message_from_bytes(raw)
+        decoded = mime.get_payload(decode=True).decode("utf-8")
+        # Body comes first, signature follows.
+        body_idx = decoded.index("<p>Hi</p>")
+        sig_idx = decoded.index("— Timothy")
+        assert body_idx < sig_idx
+
+    def test_new_draft_no_signature_when_empty(self, create_draft_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(200, {"id": "d", "message": {"id": "m"}})
+        with patch(HTTPX_MODULE, return_value=mock_resp) as mock_req:
+            create_draft_fn(html="<p>Hi</p>", to="a@b.com", subject="Hey")
+
+        import base64
+        import email
+
+        body = mock_req.call_args[1]["json"]
+        raw = base64.urlsafe_b64decode(body["message"]["raw"])
+        mime = email.message_from_bytes(raw)
+        decoded = mime.get_payload(decode=True).decode("utf-8")
+        # No separator/signature added when signature is empty.
+        assert decoded == "<p>Hi</p>"
+
+    def test_reply_draft_signature_between_body_and_quote(self, create_draft_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        orig_resp = _orig_message_response()
+        draft_resp = _mock_response(200, {"id": "d", "message": {"id": "m"}})
+        sig = "<div>— Tim, via Aden</div>"
+
+        with patch(HTTPX_MODULE, side_effect=[orig_resp, draft_resp]) as mock_req:
+            create_draft_fn(
+                html="<p>Reply body</p>",
+                reply_to_message_id="origmsg",
+                signature=sig,
+            )
+
+        import base64
+        import email
+
+        body = mock_req.call_args_list[1][1]["json"]
+        raw = base64.urlsafe_b64decode(body["message"]["raw"])
+        mime = email.message_from_bytes(raw)
+        # Reply MIME is multipart/alternative — find the html part.
+        decoded = ""
+        for part in mime.walk():
+            if part.get_content_type() == "text/html":
+                decoded = part.get_payload(decode=True).decode("utf-8")
+                break
+
+        # Signature must sit between the reply body and the gmail_quote block.
+        body_idx = decoded.index("<p>Reply body</p>")
+        sig_idx = decoded.index("— Tim, via Aden")
+        quote_idx = decoded.index("gmail_quote")
+        assert body_idx < sig_idx < quote_idx
+
+
+# ---------------------------------------------------------------------------
+# gmail_get_signature
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def get_signature_fn(gmail_tools):
+    return gmail_tools["gmail_get_signature"]
+
+
+class TestGmailGetSignature:
+    """Tests for gmail_get_signature tool."""
+
+    def test_no_credentials(self, get_signature_fn, monkeypatch):
+        monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
+        result = get_signature_fn()
+        assert "error" in result
+        assert "Gmail credentials not configured" in result["error"]
+
+    def test_primary_alias(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(
+            200,
+            {
+                "sendAs": [
+                    {
+                        "sendAsEmail": "alias@example.com",
+                        "displayName": "Alias",
+                        "signature": "<div>alias sig</div>",
+                        "isPrimary": False,
+                    },
+                    {
+                        "sendAsEmail": "me@example.com",
+                        "displayName": "Me",
+                        "signature": "<div>primary sig</div>",
+                        "isPrimary": True,
+                    },
+                ]
+            },
+        )
+        with patch(HTTPX_MODULE, return_value=mock_resp) as mock_req:
+            result = get_signature_fn()
+
+        assert result["signature"] == "<div>primary sig</div>"
+        assert result["send_as_email"] == "me@example.com"
+        assert result["display_name"] == "Me"
+        assert result["is_primary"] is True
+        # Endpoint is the collection URL.
+        url = mock_req.call_args[0][1]
+        assert url.endswith("/settings/sendAs")
+
+    def test_specific_send_as_email(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(
+            200,
+            {
+                "sendAsEmail": "alias@example.com",
+                "displayName": "Alias",
+                "signature": "<div>alias sig</div>",
+                "isPrimary": False,
+            },
+        )
+        with patch(HTTPX_MODULE, return_value=mock_resp) as mock_req:
+            result = get_signature_fn(send_as_email="alias@example.com")
+
+        assert result["signature"] == "<div>alias sig</div>"
+        assert result["send_as_email"] == "alias@example.com"
+        assert result["is_primary"] is False
+        url = mock_req.call_args[0][1]
+        assert url.endswith("/settings/sendAs/alias@example.com")
+
+    def test_missing_scope_returns_helpful_error(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(403, text="insufficient scope")
+        with patch(HTTPX_MODULE, return_value=mock_resp):
+            result = get_signature_fn()
+
+        assert "error" in result
+        assert "gmail.settings.basic" in result["error"]
+        assert "help" in result
+
+    def test_path_traversal_rejected(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        result = get_signature_fn(send_as_email="../evil")
+        assert "error" in result
+
+    def test_empty_signature_normalised(self, get_signature_fn, monkeypatch):
+        """A null/missing signature field returns an empty string, not None."""
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(
+            200,
+            {
+                "sendAs": [
+                    {
+                        "sendAsEmail": "me@example.com",
+                        "displayName": "Me",
+                        "isPrimary": True,
+                    }
+                ]
+            },
+        )
+        with patch(HTTPX_MODULE, return_value=mock_resp):
+            result = get_signature_fn()
+        assert result["signature"] == ""
+
+    def test_no_aliases_returns_error(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(200, {"sendAs": []})
+        with patch(HTTPX_MODULE, return_value=mock_resp):
+            result = get_signature_fn()
+        assert "error" in result
+
+    def test_token_expired(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        mock_resp = _mock_response(401)
+        with patch(HTTPX_MODULE, return_value=mock_resp):
+            result = get_signature_fn()
+        assert "error" in result
+        assert "token" in result["error"].lower()
+
+    def test_network_error(self, get_signature_fn, monkeypatch):
+        monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "tok")
+        with patch(HTTPX_MODULE, side_effect=httpx.HTTPError("boom")):
+            result = get_signature_fn()
+        assert "error" in result
+        assert "Request failed" in result["error"]

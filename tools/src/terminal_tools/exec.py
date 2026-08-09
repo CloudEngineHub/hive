@@ -25,17 +25,19 @@ Implementation notes:
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING
 
+from terminal_tools.common.command_guard import check_command
 from terminal_tools.common.limits import (
     ZshRefused,
-    _resolve_shell,
     coerce_limits,
     make_preexec_fn,
+    resolve_shell_spec,
     sanitized_env,
 )
 from terminal_tools.common.ring_buffer import RingBuffer
@@ -68,6 +70,8 @@ def register_exec_tools(mcp: FastMCP) -> None:
         stdin: str | None = None,
         limits: dict[str, int] | None = None,
         max_output_kb: int = 256,
+        session_cwd: str | None = None,
+        crm_principal: str | None = None,
     ) -> dict:
         """Run a shell command and capture its output.
 
@@ -83,7 +87,9 @@ def register_exec_tools(mcp: FastMCP) -> None:
         Args:
             command: The command. With shell=False we naively split on
                 whitespace; for pipes / quoting / globs use shell=True.
-            cwd: Working directory.
+            cwd: Working directory. Defaults to the session workdir when
+                omitted; pass an absolute path to override (loose default,
+                not a sandbox — you can point anywhere).
             env: Environment override (merged into a sanitized base — zsh
                 dotfile vars are stripped).
             timeout_sec: Hard kill deadline. Past this, the process is
@@ -100,6 +106,14 @@ def register_exec_tools(mcp: FastMCP) -> None:
 
         Returns the standard envelope: see `terminal-tools-foundations` skill.
         """
+        # Hard guard: browser/runtime kill+launch commands never spawn.
+        # (destructive_warning stays advisory; this one blocks.)
+        blocked = check_command(command)
+        if blocked is not None:
+            envelope = _err_envelope(command, blocked)
+            envelope["blocked"] = True
+            return envelope
+
         # Auto-detect shell-syntax commands. If the agent passes
         # ``shell=False`` (the default) but the command contains a pipe,
         # redirect, ``&&``, etc., naive argv splitting silently mangles
@@ -129,6 +143,12 @@ def register_exec_tools(mcp: FastMCP) -> None:
                     ):
                         auto_shell = True
 
+            # Framework-injected, never agent-supplied (a CONTEXT_PARAM, so it
+            # is stripped from the LLM-facing schema). `hive-crm` reads it as its
+            # acting identity; without it the CRM backend falls back to the human
+            # and every agent gets the user's own permissions.
+            if crm_principal:
+                env = {**(env or {}), "HIVE_CRM_PRINCIPAL": crm_principal}
             full_env = sanitized_env(env) if env is not None else None
             preexec = make_preexec_fn(coerce_limits(limits))
         except ZshRefused as e:
@@ -139,28 +159,50 @@ def register_exec_tools(mcp: FastMCP) -> None:
         # Resolve shell here so the same logic the JobManager uses applies
         # in both the inline + promoted paths.
         try:
-            resolved_shell = _resolve_shell(effective_shell)
+            spec = resolve_shell_spec(effective_shell)
+            # Windows has no useful direct-exec path: POSIX coreutils (cat,
+            # grep, sed, find) aren't native binaries and shlex tokenization
+            # is POSIX-shaped, so a bare `cat foo` would FileNotFound. Route
+            # every command through the resolved platform shell (Git Bash →
+            # PowerShell → cmd). POSIX keeps the fast direct-exec path.
+            if spec.executable is None and os.name == "nt":
+                spec = resolve_shell_spec(True)
         except ZshRefused as e:
             return _err_envelope(command, str(e))
 
-        if resolved_shell is not None:
-            spawn_argv: list[str] = [resolved_shell, "-c", command]
+        shell_kind = spec.kind
+        if spec.executable is not None:
+            spawn_argv: list[str] = spec.build_argv(command)
         else:
             # shell=False AND no metacharacters → safe to direct-exec.
             spawn_argv = tokens
 
+        # Loose, optimistic default: when the agent omits cwd, fall back to the
+        # framework-injected session workdir. Not a sandbox — an explicit cwd
+        # always wins and the agent may point anywhere. The promoted background
+        # job inherits this because it adopts the already-spawned proc.
+        effective_cwd = cwd if cwd is not None else session_cwd
         start = time.monotonic()
         try:
             proc = subprocess.Popen(
                 spawn_argv,
-                cwd=cwd,
+                cwd=effective_cwd,
                 env=full_env,
-                stdin=subprocess.PIPE if stdin is not None else None,
+                # No stdin payload → DEVNULL, never inherit. This tool runs
+                # inside a stdio MCP server whose own stdin IS the JSON-RPC
+                # pipe; inheriting it makes the shell share the server's
+                # protocol stream, which deadlocks on Windows (every command
+                # hangs with zero output). DEVNULL also means a command that
+                # reads stdin (cmd `date`, `read`, ssh) gets EOF and fails
+                # fast instead of blocking forever.
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 preexec_fn=preexec,
                 close_fds=True,
                 bufsize=0,
+                # Headless: don't pop or attach a console for the child shell.
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except FileNotFoundError as e:
             return _err_envelope(command, f"command not found: {e}")
@@ -224,7 +266,7 @@ def register_exec_tools(mcp: FastMCP) -> None:
                 try:
                     record = get_manager().adopt_running(
                         proc,
-                        spawn_argv if resolved_shell is None else command,
+                        spawn_argv if spec.executable is None else command,
                         merged=False,
                         existing_stdout_buf=stdout_buf,
                         existing_stderr_buf=stderr_buf,
@@ -243,6 +285,7 @@ def register_exec_tools(mcp: FastMCP) -> None:
                         auto_backgrounded=True,
                         job_id=record.job_id,
                         auto_shell=auto_shell,
+                        shell_kind=shell_kind,
                     )
                 except JobLimitExceeded:
                     # Cap reached; treat as a hard timeout rather than spin.
@@ -278,6 +321,7 @@ def register_exec_tools(mcp: FastMCP) -> None:
             signaled=(exit_code is not None and exit_code < 0),
             max_output_kb=max_output_kb,
             auto_shell=auto_shell,
+            shell_kind=shell_kind,
         )
 
 
@@ -299,6 +343,7 @@ def _err_envelope(command: str, message: str) -> dict:
         "auto_backgrounded": False,
         "job_id": None,
         "auto_shell": False,
+        "shell_kind": None,
         "error": message,
     }
 

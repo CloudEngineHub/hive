@@ -95,4 +95,27 @@ SLACK_CREDENTIALS = {
         credential_id="slack",
         credential_key="access_token",
     ),
+    # App-level token (xapp-…) for Socket Mode — used by Sentinel's inbound
+    # listener to receive reply messages, NOT by any MCP tool. Distinct from
+    # the bot token above.
+    "slack_app": CredentialSpec(
+        env_var="SLACK_APP_TOKEN",
+        tools=[],
+        required=False,
+        startup_required=False,
+        help_url="https://api.slack.com/apis/connections/socket",
+        description="Slack App-Level Token for Socket Mode (starts with xapp-)",
+        direct_api_key_supported=True,
+        api_key_instructions="""To get a Slack App-Level Token (Socket Mode):
+1. Open your app at https://api.slack.com/apps
+2. Go to "Socket Mode" in the sidebar and enable it
+3. Under "Basic Information" → "App-Level Tokens", click "Generate Token and Scopes"
+4. Add the scope: connections:write
+5. Copy the generated token (starts with xapp-)
+6. Under "Event Subscriptions", subscribe your bot to the "message.channels"
+   (and/or "message.im") events so replies are delivered""",
+        # Credential store mapping
+        credential_id="slack_app",
+        credential_key="access_token",
+    ),
 }

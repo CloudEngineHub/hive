@@ -58,9 +58,7 @@ class TestRedshiftExecuteSQL:
                 return_value=_mock_resp(data),
             ),
         ):
-            result = tool_fns["redshift_execute_sql"](
-                sql="SELECT * FROM users", database="dev", cluster_identifier="my-cluster"
-            )
+            result = tool_fns["redshift_execute_sql"](sql="SELECT * FROM users", database="dev", cluster_identifier="my-cluster")
 
         assert result["statement_id"] == "stmt-abc123"
         assert result["status"] == "submitted"

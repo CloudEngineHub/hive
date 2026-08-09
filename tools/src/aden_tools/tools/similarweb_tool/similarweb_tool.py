@@ -31,10 +31,7 @@ def _get_api_key(credentials: CredentialStoreAdapter | None = None) -> str | dic
 
     return {
         "error": "SimilarWeb credentials not configured",
-        "help": (
-            "Set SIMILARWEB_API_KEY environment variable or configure "
-            "via credential store. Get a key at https://developer.similarweb.com/"
-        ),
+        "help": ("Set SIMILARWEB_API_KEY environment variable or configure via credential store. Get a key at https://developer.similarweb.com/"),
     }
 
 
@@ -291,9 +288,7 @@ def register_tools(mcp: FastMCP, credentials: CredentialStoreAdapter | None = No
         if isinstance(api_key_res, dict):
             return api_key_res
 
-        return _make_request(
-            "website-analysis/websites/traffic-by-demographics/aggregated", api_key_res, {"domain": domain}
-        )
+        return _make_request("website-analysis/websites/traffic-by-demographics/aggregated", api_key_res, {"domain": domain})
 
     @mcp.tool()
     def similarweb_v5_deduplicated_audience(
@@ -433,9 +428,7 @@ def register_tools(mcp: FastMCP, credentials: CredentialStoreAdapter | None = No
         if isinstance(api_key_res, dict):
             return api_key_res
 
-        return _make_request(
-            "website-analysis/websites/keywords-competitors/aggregated", api_key_res, {"domain": domain}
-        )
+        return _make_request("website-analysis/websites/keywords-competitors/aggregated", api_key_res, {"domain": domain})
 
     @mcp.tool()
     def similarweb_v5_keyword_opportunities(
@@ -446,9 +439,7 @@ def register_tools(mcp: FastMCP, credentials: CredentialStoreAdapter | None = No
         if isinstance(api_key_res, dict):
             return api_key_res
 
-        return _make_request(
-            "website-analysis/websites/keywords-opportunities/aggregated", api_key_res, {"domain": domain}
-        )
+        return _make_request("website-analysis/websites/keywords-opportunities/aggregated", api_key_res, {"domain": domain})
 
     @mcp.tool()
     def similarweb_v5_serp_features(
@@ -512,9 +503,7 @@ def register_tools(mcp: FastMCP, credentials: CredentialStoreAdapter | None = No
         if isinstance(api_key_res, dict):
             return api_key_res
 
-        return _make_request(
-            "website-analysis/websites/keywords/serp-players/aggregated", api_key_res, {"domain": domain}
-        )
+        return _make_request("website-analysis/websites/keywords/serp-players/aggregated", api_key_res, {"domain": domain})
 
     @mcp.tool()
     def similarweb_v5_social_referrals(

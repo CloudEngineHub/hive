@@ -68,9 +68,7 @@ class TestLiveHealthCheckers:
             result.message,
         )
 
-        assert result.valid is True, (
-            f"Health check for '{credential_name}' returned valid=False: {result.message} (details: {result.details})"
-        )
+        assert result.valid is True, f"Health check for '{credential_name}' returned valid=False: {result.message} (details: {result.details})"
         assert result.message
 
     @pytest.mark.parametrize("credential_name", CHECKER_NAMES, ids=CHECKER_NAMES)
@@ -120,10 +118,7 @@ class TestLiveDispatcher:
             result.message,
         )
 
-        assert result.valid is True, (
-            f"Dispatcher check for '{credential_name}' returned valid=False: "
-            f"{result.message} (details: {result.details})"
-        )
+        assert result.valid is True, f"Dispatcher check for '{credential_name}' returned valid=False: {result.message} (details: {result.details})"
 
 
 # ---------------------------------------------------------------------------

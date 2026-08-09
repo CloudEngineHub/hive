@@ -20,9 +20,22 @@ tools are added (e.g. browser_* auto-joins the ``browser`` category).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from framework.agents.queen.queen_profiles import DEFAULT_QUEENS
+
 logger = logging.getLogger(__name__)
+
+
+def _current_app_version() -> str:
+    """The app version that spawned this runtime.
+
+    Set by Electron's runtime spawn (``runtime.ts``). Falls back to
+    ``0.0.0`` in stripped-down test/OSS environments so version compares
+    don't blow up — that floor is identical to a missing sidecar field.
+    """
+    return os.environ.get("HIVE_APP_VERSION") or "0.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -36,22 +49,24 @@ logger = logging.getLogger(__name__)
 # the named entries only).
 
 _TOOL_CATEGORIES: dict[str, list[str]] = {
-    # Unified file ops — read, write, edit, search across the files-tools
-    # MCP server (read_file, write_file, edit_file, search_files). pdf_read
-    # lives in hive_tools so it's listed explicitly; without it queens
-    # cannot read PDF documents by default.
+    # Document tools. The read/write/edit/search file tools were removed in
+    # favor of the terminal tools (see terminal_basic) — file I/O now goes
+    # through terminal_exec / terminal_rg / terminal_glob, which default their
+    # cwd to the session workdir. pdf_read lets queens read PDF documents;
+    # attach_file rehydrates a PDF or image from disk back into the LLM's
+    # next-turn context (to re-look at attachments that aged out of image_content).
     "file_ops": [
-        "@server:files-tools",
         "pdf_read",
+        "attach_file",
     ],
     # Terminal basic — the 3-tool subset queens get out of the box.
     #   terminal_exec — foreground command execution (Bash equivalent)
     #   terminal_rg   — ripgrep content search (Grep equivalent)
-    #   terminal_find — glob/find file listing (Glob equivalent)
+    #   terminal_glob — name/glob file listing (Glob equivalent)
     "terminal_basic": [
         "terminal_exec",
         "terminal_rg",
-        "terminal_find",
+        "terminal_glob",
     ],
     # Terminal advanced — the power-user tools beyond the basics. Not in
     # any role default; opt in explicitly per-queen via the Tool Library.
@@ -82,49 +97,42 @@ _TOOL_CATEGORIES: dict[str, list[str]] = {
         "excel_sheet_list",
         "excel_sql",
     ],
-    # Browser lifecycle + read-only inspection (navigation, snapshots, query).
-    # Split out from interaction so personas that only need to *observe* pages
-    # (e.g. research, status checks) don't pull in click/type/drag/etc.
-    "browser_basic": [
-        "browser_setup",
-        "browser_status",
-        "browser_stop",
-        "browser_tabs",
-        "browser_open",
-        "browser_close",
-        "browser_activate_tab",
-        "browser_navigate",
-        "browser_go_back",
-        "browser_go_forward",
-        "browser_reload",
-        "browser_screenshot",
-        "browser_snapshot",
-        "browser_html",
-        "browser_console",
-        "browser_evaluate",
-        "browser_get_text",
-        "browser_get_attribute",
-        "browser_get_rect",
-        "browser_shadow_query",
+    # The browser is driven from the terminal via the `hive-browser` CLI, not MCP
+    # tools. The four legacy browser_* categories all collapse to the single
+    # in-process discovery tool `browser_setup`: its presence pre-activates the
+    # browser-automation skill (which teaches the CLI), and `browser_core` is in
+    # the always-enabled tiers, so every queen/worker gets browser capability up
+    # front. The four keys are kept (rather than merged) so existing per-queen
+    # category configs that name any of them keep resolving.
+    "browser_basic": ["browser_setup"],
+    "browser_interaction": ["browser_setup"],
+    "browser_core": ["browser_setup"],
+    "browser_extended": ["browser_setup"],
+    # terminal_core / terminal_extended: terminal_exec measured at 200/1k
+    # carries (the single most-invoked tool); rg (3.3/1k) and glob (1.3/1k)
+    # are cold — terminal_exec can express both when loaded ad hoc.
+    "terminal_core": [
+        "terminal_exec",
     ],
-    # Browser interaction — anything that mutates page state (clicks, typing,
-    # drag, scrolling, dialogs, file uploads). Pair with browser_basic for
-    # full automation; omit for read-only personas.
-    "browser_interaction": [
-        "browser_click",
-        "browser_click_coordinate",
-        "browser_type",
-        "browser_type_focused",
-        "browser_press",
-        "browser_press_at",
-        "browser_hover",
-        "browser_hover_coordinate",
-        "browser_select",
-        "browser_scroll",
-        "browser_drag",
-        "browser_wait",
-        "browser_resize",
-        "browser_upload",
+    "terminal_extended": [
+        "terminal_rg",
+        "terminal_glob",
+    ],
+    # files_core: attach_file (7.8/1k — rehydrates attachments into context).
+    # pdf_read (0.7/1k) stays deferred via the research/file_ops categories.
+    "files_core": [
+        "attach_file",
+    ],
+    # context_core: the cheap ambient helpers minus search_messages, whose
+    # 4.3 KB schema was carried on every call and invoked 0.7×/1k.
+    "context_core": [
+        "get_current_time",
+        "get_account_info",
+    ],
+    # web_core: web_scrape measured hot (34/1k) — eager for workers even
+    # though the broader research bundle stays deferred.
+    "web_core": [
+        "web_scrape",
     ],
     # Research — paper search, Wikipedia, ad-hoc web scrape. Pair with
     # browser_basic for richer site-by-site research; this category is the
@@ -156,6 +164,13 @@ _TOOL_CATEGORIES: dict[str, list[str]] = {
     "charts": [
         "@server:chart-tools",
     ],
+    # Media generation — text-to-image and reference-image editing via the
+    # Hive image proxy (gpt-image-2). Each call is billed to the user's
+    # credits per image, so this is opt-in for visual roles (content,
+    # brand/design, growth) rather than always-enabled.
+    "media": [
+        "image_generate",
+    ],
     # ----- OAuth-bound categories ------------------------------------
     # These tools require an OAuth provider connection (Google, GitHub,
     # HubSpot, Notion, Slack). They are listed in the Library catalog
@@ -176,6 +191,22 @@ _TOOL_CATEGORIES: dict[str, list[str]] = {
         "gmail_list_labels",
         "gmail_batch_get_messages",
         "gmail_batch_modify_messages",
+    ],
+    # Team email senders — the cloud-configured sender pool + rotation. These
+    # tools are credential-less at the MCP layer (secrets come from the sender
+    # registry), so unlike "email_oauth" they are NOT gated on a connected
+    # provider: a queen with this category always has the send surface, which
+    # self-describes an empty pool until the team configures senders.
+    "email_senders": [
+        "list_senders",
+        "setup_email_sender",
+        "send_from_sender",
+        "pick_sender",
+        "send_campaign",
+        "sender_history",
+        "suppress_recipient",
+        "list_suppressed",
+        "adjust_sender",
     ],
     "calendar_oauth": [
         "calendar_list_calendars",
@@ -294,116 +325,95 @@ _TOOL_CATEGORIES: dict[str, list[str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Category additions — generally-available tools added to a category AFTER
+# a prior release shipped.
+# ---------------------------------------------------------------------------
+#
+# A saved ``tools.json`` sidecar is a frozen flat list of tool names — it
+# never picks up a tool added to a category later. Two consumers heal that:
+#
+#   * ``grant_role_default_additions`` (preferred) — used by the GA tool
+#     migration on runtime startup and by ``load_queen_tools_config`` when
+#     the queen has a role default. Grants every addition whose GA-promotion
+#     version is newer than the sidecar's ``saved_on_version``, when its
+#     category appears in the queen's role default.
+#
+#   * ``infer_category_additions`` (legacy fallback) — used for queens
+#     without a role default. Grants additions only when the saved
+#     allowlist fully covered the category's pre-addition baseline. Skipped
+#     for small categories to avoid coincidental baseline matches.
+#
+# In both cases, an addition whose version is <= ``saved_on_version`` is
+# left alone — the sidecar was saved on a release that already knew about
+# the tool, so its absence is a deliberate untick.
+#
+# When adding a tool to a category, add it to BOTH ``_TOOL_CATEGORIES`` and
+# here, keyed by the release version that promotes the tool to GA (the
+# version that ships this dict entry).
+#
+# Versions are compared by ``_parse_version`` as tuples of ints split on
+# ``.`` — ``"0.2.19"`` → ``(0, 2, 19)``. Anything malformed/missing
+# collapses to ``(0, 0, 0)`` so legacy sidecars without ``saved_on_version``
+# receive every addition on first migration.
+#
+# GRADUATION: once a release cycle has passed and sidecars have had a chance
+# to re-save, drop the entry from this table. The tool stays a normal
+# ``_TOOL_CATEGORIES`` member; leaving it here forever slowly erodes the
+# ``baseline`` set the legacy fallback compares against.
+#
+# Shape: category -> { tool_name -> GA-promotion version (e.g. "0.2.19") }.
+_CATEGORY_ADDITIONS: dict[str, dict[str, str]] = {
+    # The browser_* MCP tools were replaced by the terminal-driven hive-browser CLI
+    # in 0.3.0; the sole in-process tool is now browser_setup (in browser_core,
+    # always-enabled). Heal saved sidecars that predate the switch — whose lists
+    # name now-removed browser_* tools — so they regain the browser capability.
+    "browser_core": {"browser_setup": "0.3.0"},
+    "file_ops": {"attach_file": "0.2.19"},
+    # image_generate shipped in 0.2.27 but "media" was only in three visual
+    # roles' defaults, so the other ten queens could see the image-generation
+    # skill while the tool it documents was filtered out of their allowlist.
+    # 0.3.0 grants "media" to every role, so re-tag the addition to 0.3.0 —
+    # sidecars saved on 0.2.27–0.2.x never had media in their role default and
+    # must heal. Cost: for the three roles that already had media, a
+    # deliberate untick saved on 0.2.27+ is re-granted once.
+    "media": {"image_generate": "0.3.0"},
+    # Email senders suite ships in 0.2.30; heal existing explicit-allowlist
+    # sidecars of queens whose role default now includes "email_senders".
+    "email_senders": {
+        "list_senders": "0.2.30",
+        "send_from_sender": "0.2.30",
+        "pick_sender": "0.2.30",
+        "send_campaign": "0.2.30",
+        # Agent-driven sender setup ships in 0.3.0.
+        "setup_email_sender": "0.3.0",
+        # The team-wide send log (audit + dedupe) ships in 0.3.0.
+        "sender_history": "0.3.0",
+        # Do-not-contact list. Ships in 0.3.0.
+        "suppress_recipient": "0.3.0",
+        "list_suppressed": "0.3.0",
+        # Agent-tunable sender volume/rotation. Ships in 0.3.0.
+        "adjust_sender": "0.3.0",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Per-queen mapping.
 # ---------------------------------------------------------------------------
 #
-# Built from the queen personas in ``queen_profiles.DEFAULT_QUEENS``. The
-# goal is "just enough" — a queen should see tools she'd plausibly call
-# for her stated role, nothing more. Users curate further via the Tool
-# Library if they want.
+# DERIVED from ``queen_profiles.DEFAULT_QUEENS`` — each queen entry is the
+# single place its defaults live (persona + ``default_tool_categories`` +
+# ``default_preset_skills``). To change what tools a queen gets by default,
+# edit its ``default_tool_categories`` there; this dict just projects it.
 #
 # A queen whose ID is NOT in this map falls through to "allow every MCP
 # tool" (the original behavior), which keeps the system compatible with
 # user-added custom queen IDs that we don't know about.
 
 QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
-    # Head of Technology — builds and operates systems. Security tools
-    # (port_scan, subdomain_enumerate, etc.) are intentionally NOT in the
-    # default — users opt in via the Tool Library when an engagement
-    # actually needs reconnaissance. OAuth-bound categories (email,
-    # github, slack, …) are likewise opt-in: defining them implicitly
-    # would either spam the prompt with disconnected tools the worker
-    # can't actually call, or — once authorized — expose data sources
-    # the user never asked the queen to touch. Users add OAuth
-    # categories per-queen via the Tool Library.
-    "queen_technology": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-        "charts",
-    ],
-    # Head of Growth — data, experiments, competitor research; no security.
-    "queen_growth": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-        "charts",
-    ],
-    # Head of Product Strategy — user research + roadmaps; no security.
-    "queen_product_strategy": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-        "charts",
-    ],
-    # Head of Finance — financial models (CSV/Excel heavy), market research.
-    "queen_finance_fundraising": [
-        "file_ops",
-        "terminal_basic",
-        "spreadsheet_advanced",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-        "charts",
-    ],
-    # Head of Legal — reads contracts/PDFs, researches; no data/security.
-    "queen_legal": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-    ],
-    # Head of Brand & Design — visual refs, style guides; no data/security.
-    "queen_brand_design": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-    ],
-    # Head of Marketing — positioning, content, competitor research, campaign
-    # performance. Charts included for funnel/audience reporting; no security.
-    "queen_marketing": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-        "charts",
-    ],
-    # Head of Talent — candidate pipelines, resumes; data + browser heavy.
-    "queen_talent": [
-        "file_ops",
-        "terminal_basic",
-        "browser_basic",
-        "browser_interaction",
-        "research",
-        "context_awareness",
-    ],
-    # Head of Operations — processes, automation, observability.
-    "queen_operations": [
-        "file_ops",
-        "terminal_basic",
-        "spreadsheet_advanced",
-        "browser_basic",
-        "browser_interaction",
-        "context_awareness",
-        "charts",
-    ],
+    queen_id: list(profile["default_tool_categories"])
+    for queen_id, profile in DEFAULT_QUEENS.items()
+    if profile.get("default_tool_categories")
 }
 
 
@@ -453,6 +463,268 @@ def resolve_category_tools(
             seen.add(entry)
             names.append(entry)
     return names
+
+
+# ---------------------------------------------------------------------------
+# Always-enabled categories — the global, role-independent set whose tools
+# are loaded into the queen's prompt up front (full schemas).
+# ---------------------------------------------------------------------------
+#
+# This is THE single source of truth for the "always-enabled" tier. Add a
+# category name here and its tools are loaded up front for EVERY queen,
+# regardless of persona. Everything else the queen is allowed to use defaults
+# to *searchable* — only its name + one-line description ship in the prompt
+# manifest, and the full schema is fetched on demand via the ``search_tools``
+# tool (see ``QueenPhaseState``).
+#
+# Always-enabled tools bypass the per-queen allowlist (see
+# ``QueenPhaseState._passes_allowlist``): the frontend disallows un-ticking
+# them, and the backend enforces that by always granting them — a stale or
+# malformed sidecar can never disable them. This is checked BEFORE the
+# allowlist, so "always" means always.
+#
+# Lifecycle / synthetic tools (run_worker, suggest_colony, task_*, …) are
+# already always-on because they are not MCP-origin tools and bypass the
+# allowlist for free — they deliberately do NOT need listing here.
+ALWAYS_ENABLED_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "file_ops",
+        "terminal_basic",
+        "context_awareness",
+        # Browser: the measured automation core only. The earlier
+        # "all-or-nothing bundle" assumption did not survive contact with the
+        # data — prod carry-vs-invoke sampling (2026-07) showed the
+        # browser_extended tail (upload / dialog_respond / html / console /
+        # get_text / shadow_query / select / resize) at 0–2 invocations per
+        # 1k carries while being re-sent on every call. The core keeps every
+        # tool a browser session needs to start and act; the tail is one
+        # search_tools call away.
+        "browser_core",
+    }
+)
+
+
+def configured_always_enabled_categories() -> frozenset[str]:
+    """Always-enabled tool categories, overridable via ``configuration.json``.
+
+    Reads ``queen_tools.always_enabled_categories`` from the active
+    HIVE_HOME ``configuration.json``. When set (a list of category names),
+    it REPLACES the hardcoded :data:`ALWAYS_ENABLED_CATEGORIES` default —
+    e.g. a chat-only persona can set ``["context_awareness"]`` to drop the
+    file / terminal / browser bundles that otherwise bypass the per-queen
+    allowlist and hand the model real machine control. When the field is
+    absent, the hardcoded default applies (unchanged behavior).
+    """
+    try:
+        from framework.config import get_hive_config
+
+        override = (
+            get_hive_config().get("queen_tools", {}).get("always_enabled_categories")
+        )
+        if isinstance(override, list) and all(isinstance(x, str) for x in override):
+            return frozenset(override)
+    except Exception:  # noqa: BLE001 — config is best-effort; fall back to default
+        pass
+    return ALWAYS_ENABLED_CATEGORIES
+
+
+def always_enabled_tool_names(
+    mcp_catalog: dict[str, list[dict[str, Any]]] | None = None,
+) -> set[str]:
+    """Expand the always-enabled categories to concrete tool names.
+
+    Uses :func:`configured_always_enabled_categories` (config override or
+    the hardcoded :data:`ALWAYS_ENABLED_CATEGORIES` default). Resolves
+    ``@server:NAME`` shorthands against ``mcp_catalog`` (e.g.
+    ``@server:files-tools`` inside ``file_ops``). Returns a set for cheap
+    membership tests. The searchable set is never enumerated here — it is the
+    complement (everything allowed that is not in this set), so adding a tool
+    to a category is the only edit needed to make it always-enabled.
+    """
+    names: set[str] = set()
+    for category in configured_always_enabled_categories():
+        names.update(resolve_category_tools(category, mcp_catalog))
+    return names
+
+
+# ---------------------------------------------------------------------------
+# Worker keep-set — the eager tier for colony workers' tool tiering.
+# ---------------------------------------------------------------------------
+#
+# Mirrors the queen trio above but drives ``ToolTierState`` at worker spawn
+# (see ColonyRuntime._build_worker). The default is the MEASURED keep-set
+# from the 2026-07 tool-cost analysis: everything at ≥5 invocations/1k
+# carries plus the lifecycle tools those need to function. Everything else —
+# integration bundles (senders / hubspot / github / crm), the browser and
+# terminal extended tails, search_messages, pdf_read, chart_render — ships as
+# a searchable manifest entry instead of a full schema (the measured-cold set
+# was 56% of tool-schema spend). Non-MCP framework tools (task_* / tracker_* /
+# report_to_parent / ask_user) bypass the split entirely — see
+# ``ToolTierState.is_eager``. Set ``worker_tools.always_enabled_categories``
+# in configuration.json to override; an empty list turns the split OFF
+# (every tool eager).
+WORKER_ALWAYS_ENABLED_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "browser_core",
+        "terminal_core",
+        "files_core",
+        "context_core",
+        "web_core",
+    }
+)
+
+
+def configured_worker_always_enabled_categories() -> frozenset[str]:
+    """Worker keep-set categories, overridable via ``configuration.json``.
+
+    Reads ``worker_tools.always_enabled_categories``. When set (a list of
+    category names), it REPLACES :data:`WORKER_ALWAYS_ENABLED_CATEGORIES`.
+    When absent, the hardcoded default applies.
+    """
+    try:
+        from framework.config import get_hive_config
+
+        override = (
+            get_hive_config().get("worker_tools", {}).get("always_enabled_categories")
+        )
+        if isinstance(override, list) and all(isinstance(x, str) for x in override):
+            return frozenset(override)
+    except Exception:  # noqa: BLE001 — config is best-effort; fall back to default
+        pass
+    return WORKER_ALWAYS_ENABLED_CATEGORIES
+
+
+def worker_always_enabled_tool_names(
+    mcp_catalog: dict[str, list[dict[str, Any]]] | None = None,
+) -> set[str]:
+    """Expand the worker keep-set categories to concrete tool names.
+
+    Empty result ⇒ worker tiering stays dark (split disabled at spawn).
+    """
+    names: set[str] = set()
+    for category in configured_worker_always_enabled_categories():
+        names.update(resolve_category_tools(category, mcp_catalog))
+    return names
+
+
+def _parse_version(value: str | None) -> tuple[int, ...]:
+    """Parse a dotted version string into a comparable tuple of ints.
+
+    ``"0.2.19"`` → ``(0, 2, 19)``. Missing/malformed input → ``(0, 0, 0)``
+    floor so legacy sidecars without ``saved_on_version`` are treated as
+    older than every tracked addition and receive every GA grant on the
+    first migration pass.
+    """
+    floor = (0, 0, 0)
+    if not value:
+        return floor
+    parts: list[int] = []
+    for chunk in value.split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            return floor
+    return tuple(parts) if parts else floor
+
+
+def _category_fully_resolvable(
+    category: str,
+    mcp_catalog: dict[str, list[dict[str, Any]]] | None,
+) -> bool:
+    """True iff every ``@server:`` shorthand in the category resolves to >=1 tool.
+
+    A category with an unresolved shorthand (no catalog, or a stale/partial
+    catalog missing that server) would expand to a too-small member set —
+    inference must skip it rather than risk a false-positive grant.
+    """
+    for entry in _TOOL_CATEGORIES.get(category, []):
+        if not entry.startswith("@server:"):
+            continue
+        server_name = entry[len("@server:") :]
+        if not (mcp_catalog or {}).get(server_name):
+            return False
+    return True
+
+
+def infer_category_additions(
+    enabled: list[str],
+    saved_on_version: str | None,
+    mcp_catalog: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[str]:
+    """Grant recently-added category tools to a saved flat allowlist.
+
+    A saved ``tools.json`` sidecar is a frozen list and never picks up a
+    tool added to a category later. For each category in
+    ``_CATEGORY_ADDITIONS``: if ``enabled`` already covers the whole
+    category as it existed *before* any tracked addition, grant every
+    addition whose GA-promotion version is newer than the sidecar's
+    ``saved_on_version``. An addition with version <= ``saved_on_version``
+    is left alone — the sidecar was saved on a release that already knew
+    about the tool, so its absence is a deliberate untick.
+
+    ``enabled`` is the queen's saved ``enabled_mcp_tools`` list. An empty
+    list (``[]`` = disable-all) is returned unchanged; otherwise a new
+    sorted list is returned.
+    """
+    if not enabled:
+        return enabled
+
+    saved = set(enabled)
+    sidecar_version = _parse_version(saved_on_version)
+
+    for category, additions in _CATEGORY_ADDITIONS.items():
+        if not _category_fully_resolvable(category, mcp_catalog):
+            continue
+        members = set(resolve_category_tools(category, mcp_catalog))
+        # The category as it predates every tracked addition.
+        baseline = members - set(additions)
+        if not baseline or not baseline.issubset(saved):
+            continue
+        saved |= {tool for tool, ver in additions.items() if sidecar_version < _parse_version(ver)}
+
+    return sorted(saved)
+
+
+def grant_role_default_additions(
+    queen_id: str,
+    enabled: list[str],
+    saved_on_version: str | None,
+) -> list[str]:
+    """Append GA additions whose category sits in the queen's role default.
+
+    Used by the runtime-startup GA tool migration AND by ``load_queen_tools_config``
+    for queens with a known role. For each tool in ``_CATEGORY_ADDITIONS``
+    whose category appears in ``QUEEN_DEFAULT_CATEGORIES[queen_id]``, grant
+    it when its GA-promotion version is newer than the sidecar's
+    ``saved_on_version``. An addition with version <= ``saved_on_version``
+    is respected as a deliberate untick (the user saved on a release that
+    already knew about the tool).
+    Returns a new sorted list when grants were made, otherwise the original.
+
+    Differs from ``infer_category_additions``: the signal is role-default
+    membership (deterministic, works for small categories) rather than
+    baseline coverage (heuristic, false-positive-prone). Queens without a
+    role default — custom IDs — are skipped to avoid over-granting; callers
+    fall through to ``infer_category_additions`` for that path.
+    """
+    if not enabled:
+        return enabled
+    categories = QUEEN_DEFAULT_CATEGORIES.get(queen_id)
+    if not categories:
+        return enabled
+
+    saved = set(enabled)
+    sidecar_version = _parse_version(saved_on_version)
+    additions: set[str] = set()
+    for category in categories:
+        for tool, ver in _CATEGORY_ADDITIONS.get(category, {}).items():
+            if tool in saved:
+                continue
+            if sidecar_version < _parse_version(ver):
+                additions.add(tool)
+    if not additions:
+        return enabled
+    return sorted(saved | additions)
 
 
 def _credentialed_tool_names() -> set[str]:

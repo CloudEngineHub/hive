@@ -38,9 +38,7 @@ class TestRegistryCompleteness:
                 continue
             if spec.health_check_endpoint and name not in HEALTH_CHECKERS:
                 missing.append(f"{name}: has endpoint '{spec.health_check_endpoint}' but no dedicated health checker")
-        assert not missing, f"{len(missing)} credential(s) have health_check_endpoint but no checker:\n" + "\n".join(
-            f"  - {m}" for m in missing
-        )
+        assert not missing, f"{len(missing)} credential(s) have health_check_endpoint but no checker:\n" + "\n".join(f"  - {m}" for m in missing)
 
     def test_checkers_have_corresponding_specs(self):
         """Every key in HEALTH_CHECKERS matches a CREDENTIAL_SPECS entry."""

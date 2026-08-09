@@ -57,10 +57,7 @@ def register_tools(
         if not base_url or not username or not password:
             return {
                 "error": "SAP credentials not configured",
-                "help": (
-                    "Set SAP_BASE_URL, SAP_USERNAME, and SAP_PASSWORD "
-                    "environment variables or configure via credential store"
-                ),
+                "help": ("Set SAP_BASE_URL, SAP_USERNAME, and SAP_PASSWORD environment variables or configure via credential store"),
             }
         base_url = base_url.rstrip("/")
         encoded = base64.b64encode(f"{username}:{password}".encode()).decode()

@@ -125,9 +125,7 @@ def batch_approval(
             if req.action != ApprovalAction.SKIP:
                 storage.update_test(test)
 
-            results.append(
-                ApprovalResult.success_result(req.test_id, req.action, f"Test {req.action.value}d successfully")
-            )
+            results.append(ApprovalResult.success_result(req.test_id, req.action, f"Test {req.action.value}d successfully"))
 
         except Exception as e:
             results.append(ApprovalResult.error_result(req.test_id, req.action, str(e)))

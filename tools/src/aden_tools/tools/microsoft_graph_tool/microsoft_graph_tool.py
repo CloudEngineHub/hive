@@ -229,9 +229,7 @@ def register_tools(
             "toRecipients": to_recipients,
         }
         if cc:
-            message["ccRecipients"] = [
-                {"emailAddress": {"address": addr.strip()}} for addr in cc.split(",") if addr.strip()
-            ]
+            message["ccRecipients"] = [{"emailAddress": {"address": addr.strip()}} for addr in cc.split(",") if addr.strip()]
 
         payload = {"message": message, "saveToSentItems": save_to_sent}
         result = _post("me/sendMail", token, payload)

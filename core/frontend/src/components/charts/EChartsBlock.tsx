@@ -77,6 +77,14 @@ export default function EChartsBlock({
   // live chart and downloaded file always match.
   const theme = useDocumentTheme();
 
+  // Stringify the spec so the init/dispose effect only fires when the
+  // CONTENT changes — not when the parent passes a new object
+  // reference on every render. Without this, every parent tick
+  // (e.g. setNowTick while the queen is busy) tears down and
+  // re-initializes the chart, producing the visible flashing.
+  const specJson =
+    typeof spec === "string" ? spec : JSON.stringify(spec ?? null);
+
   useEffect(() => {
     if (!containerRef.current) return;
     let disposed = false;
@@ -95,17 +103,20 @@ export default function EChartsBlock({
           echarts.registerTheme(themeName, buildOpenHiveTheme(theme));
           _themeRegistered[theme] = true;
         }
-        // Coerce string specs to objects (defensive — the agent should
-        // pass dicts but LLMs sometimes serialize before sending).
+        // Parse from the stable JSON signature so identical-content
+        // re-renders don't re-do this work (and so the deps array
+        // tracks content, not object identity).
         let parsedSpec: Record<string, unknown>;
-        if (typeof spec === "string") {
-          try {
-            parsedSpec = JSON.parse(spec);
-          } catch {
-            throw new Error("spec is a string and not valid JSON");
+        try {
+          const parsed = JSON.parse(specJson);
+          if (parsed === null || typeof parsed !== "object") {
+            throw new Error("spec is not an object");
           }
-        } else {
-          parsedSpec = spec as Record<string, unknown>;
+          parsedSpec = parsed as Record<string, unknown>;
+        } catch (e) {
+          throw new Error(
+            `spec is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
 
         // Disjoint-region layout policy. ECharts has no auto-layout
@@ -199,7 +210,7 @@ export default function EChartsBlock({
         chartRef.current = null;
       }
     };
-  }, [spec, theme]);
+  }, [specJson, theme]);
 
   if (error) {
     return (

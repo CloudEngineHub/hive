@@ -447,9 +447,7 @@ class TestSpecCompleteness:
         """All specs with direct_api_key_supported=True have non-empty api_key_instructions."""
         for name, spec in CREDENTIAL_SPECS.items():
             if spec.direct_api_key_supported:
-                assert spec.api_key_instructions.strip(), (
-                    f"Credential '{name}' has direct_api_key_supported=True but empty api_key_instructions"
-                )
+                assert spec.api_key_instructions.strip(), f"Credential '{name}' has direct_api_key_supported=True but empty api_key_instructions"
 
     def test_all_specs_have_credential_id(self):
         """All credential specs have a non-empty credential_id."""
@@ -480,9 +478,7 @@ class TestSpecCompleteness:
                 "redshift_access_key",
                 "redshift_secret_key",
             ):
-                assert spec.credential_group == "", (
-                    f"Credential '{name}' has unexpected credential_group='{spec.credential_group}'"
-                )
+                assert spec.credential_group == "", f"Credential '{name}' has unexpected credential_group='{spec.credential_group}'"
 
 
 class TestCredentialStoreAdapterAdenSync:

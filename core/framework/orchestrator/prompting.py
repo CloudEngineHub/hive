@@ -38,6 +38,7 @@ class NodePromptSpec:
     skills_catalog_prompt: str = ""
     protocols_prompt: str = ""
     memory_prompt: str = ""
+    binding_prompt: str = ""
     node_type: str = "event_loop"
     output_keys: tuple[str, ...] = ()
 
@@ -57,10 +58,43 @@ class TransitionSpec:
 
 
 def stamp_prompt_datetime(prompt: str) -> str:
-    """Append current datetime with local timezone to a prompt."""
+    """Append the current DATE (day resolution) to a prompt.
+
+    Deliberately not minute-resolution: this lands in the system prompt,
+    which sits before the entire message history in the request. A
+    minute-level stamp made byte-identical prompts hash differently every
+    minute — defeating provider prompt-cache reuse across sessions and
+    minting near-duplicate datalog blobs (measured in prod, 2026-07: five
+    ~70 KB worker system blobs differing only by this stamp). Fine-grained
+    temporal anchoring rides the conversation instead, as ``[YYYY-MM-DD
+    HH:MM TZ]`` prefixes on injected messages (see agent_loop /
+    cursor_persistence) — byte-stable once appended, so cache-safe.
+    """
     local = datetime.now().astimezone()
-    stamp = f"Current date and time: {local.strftime('%Y-%m-%d %H:%M %Z (UTC%z)')}"
+    stamp = f"Current date: {local.strftime('%Y-%m-%d %Z (UTC%z)')}"
     return f"{prompt}\n\n{stamp}" if prompt else stamp
+
+
+def build_binding_prompt(binding: Any) -> str:
+    """Render a ColonyBinding into a static system-prompt block.
+
+    Lives in the cache-stable prefix: the binding is constant for the
+    life of a graph run, so emitting it once and letting the prompt
+    cache hold it across iterations costs nothing. Returns "" when no
+    binding is bound so the section disappears rather than rendering
+    an empty heading.
+    """
+    if binding is None:
+        return ""
+    tracker_db = getattr(binding, "tracker_db", None)
+    if not tracker_db:
+        return ""
+    return (
+        f"Tracker DB: {tracker_db}\n"
+        "(Your tracker_* tools target this automatically. "
+        "Use it directly only when you script a batch operation on the "
+        "DB, e.g. bulk-loading rows from other files.)"
+    )
 
 
 def build_accounts_prompt(
@@ -97,10 +131,7 @@ def build_accounts_prompt(
 
     # Appended (only when any rendered provider has >1 account) so the model
     # knows to disambiguate instead of silently picking one.
-    multi_account_note = (
-        "\nWhen a provider below has multiple accounts, ask the user which "
-        "one to use and list the options — do not guess."
-    )
+    multi_account_note = "\nWhen a provider below has multiple accounts, ask the user which one to use and list the options — do not guess."
 
     # Simple path: no tool map — just group accounts by provider.
     if tool_provider_map is None:
@@ -154,6 +185,33 @@ def build_accounts_prompt(
     return "\n".join(sections)
 
 
+def build_credentials_summary(accounts: list[dict[str, Any]]) -> str:
+    """Build a COMPACT connected-credentials summary for the system prompt.
+
+    Replaces the full per-account ``build_accounts_prompt`` block in the
+    queen's always-on prompt: by default the queen sees only provider names +
+    counts (enough to know what exists), not every alias. Full detail is
+    re-injected per-session only for credentials the queen explicitly attaches
+    via the ``credentials`` tool. Returns "" when nothing is connected so the
+    section disappears.
+    """
+    if not accounts:
+        return "# Credentials\n" "No credentials are connected yet. Use the `credentials` tool " "(action=collect) to add one, or action=browse to see what's available."
+
+    counts: dict[str, int] = {}
+    for acct in accounts:
+        provider = str(acct.get("provider") or acct.get("credential_id") or "unknown")
+        counts[provider] = counts.get(provider, 0) + 1
+
+    summary = ", ".join(f"{provider} ({n})" if n > 1 else provider for provider, n in sorted(counts.items()))
+    return (
+        "# Credentials\n"
+        f"Connected: {summary}.\n"
+        "Use the `credentials` tool (action=browse) for details or to collect "
+        "new ones, and action=attach to pin the ones you'll reuse this session."
+    )
+
+
 def build_prompt_spec_from_node_context(
     ctx: Any,
     *,
@@ -180,6 +238,14 @@ def build_prompt_spec_from_node_context(
     tool_names = [getattr(t, "name", "") for t in (getattr(ctx, "available_tools", None) or [])]
     skills_catalog_prompt = augment_catalog_for_tools(ctx.skills_catalog_prompt or "", tool_names)
 
+    binding_prompt = ""
+    binding_provider = getattr(ctx, "colony_binding_provider", None)
+    if binding_provider is not None:
+        try:
+            binding_prompt = build_binding_prompt(binding_provider())
+        except Exception:
+            binding_prompt = ""
+
     return NodePromptSpec(
         identity_prompt=ctx.identity_prompt or "",
         focus_prompt=focus_prompt if focus_prompt is not None else (ctx.node_spec.system_prompt or ""),
@@ -188,17 +254,36 @@ def build_prompt_spec_from_node_context(
         skills_catalog_prompt=skills_catalog_prompt,
         protocols_prompt=ctx.protocols_prompt or "",
         memory_prompt=resolved_memory_prompt,
+        binding_prompt=binding_prompt,
         node_type=ctx.node_spec.node_type,
         output_keys=tuple(ctx.node_spec.output_keys or ()),
     )
 
 
-def build_system_prompt(spec: NodePromptSpec) -> str:
-    """Compose one canonical system prompt for a node."""
+def build_system_prompt_static(spec: NodePromptSpec) -> str:
+    """Cache-stable prefix of the node system prompt.
+
+    Holds the truly static layers — identity, connected accounts, skills
+    catalog, protocols, recalled memory. These don't change during a
+    single phase, so the provider's prompt cache keeps them warm across
+    every iteration.
+
+    The narrative + EXECUTION_SCOPE_PREAMBLE + focus block all live in
+    the dynamic suffix, even though EXECUTION_SCOPE_PREAMBLE and focus
+    are *technically* stable within a phase — keeping them adjacent to
+    the narrative preserves the original layout (narrative → preamble →
+    focus → timestamp) that downstream prompts and tests expect. The
+    cache cost is small (focus + preamble are typically <2KB) and worth
+    paying to avoid silently shuffling sections around the model's
+    attention.
+    """
     parts: list[str] = []
 
     if spec.identity_prompt:
         parts.append(spec.identity_prompt)
+
+    if spec.binding_prompt:
+        parts.append(f"\n{spec.binding_prompt}")
 
     if spec.accounts_prompt:
         parts.append(f"\n{spec.accounts_prompt}")
@@ -211,21 +296,57 @@ def build_system_prompt(spec: NodePromptSpec) -> str:
 
     if spec.memory_prompt:
         parts.append(
-            "\nRelevant recalled memories may appear below. Treat them as "
-            "point-in-time guidance and verify stale details against current context."
+            "\nRelevant recalled memories may appear below. Treat them as point-in-time guidance and verify stale details against current context."
         )
         parts.append(f"\n{spec.memory_prompt}")
 
-    if spec.narrative:
-        parts.append(f"\n--- Context (what has happened so far) ---\n{spec.narrative}")
+    return "\n".join(parts) if parts else ""
 
-    if not False and spec.node_type == "event_loop" and spec.output_keys:
-        parts.append(f"\n{EXECUTION_SCOPE_PREAMBLE}")
+
+def build_system_prompt_dynamic_suffix(spec: NodePromptSpec) -> str:
+    """Per-turn dynamic tail for the node system prompt.
+
+    Holds the narrative (execution path + buffer state), the conditional
+    ``EXECUTION_SCOPE_PREAMBLE`` block, the focus prompt, and the
+    wall-clock timestamp — in that order, matching the legacy
+    single-string builder so the model sees identical content layout.
+
+    Returns ``""`` only when every dynamic section is empty (rare —
+    even a no-op iteration carries a fresh timestamp).
+    """
+    parts: list[str] = []
+
+    if spec.narrative:
+        parts.append(f"--- Context (what has happened so far) ---\n{spec.narrative}")
+
+    if spec.node_type == "event_loop" and spec.output_keys:
+        parts.append(f"{EXECUTION_SCOPE_PREAMBLE}")
 
     if spec.focus_prompt:
-        parts.append(f"\n--- Current Focus ---\n{spec.focus_prompt}")
+        parts.append(f"--- Current Focus ---\n{spec.focus_prompt}")
 
-    return stamp_prompt_datetime("\n".join(parts) if parts else "")
+    body = "\n\n".join(parts)
+    return stamp_prompt_datetime(body)
+
+
+def build_system_prompt(spec: NodePromptSpec) -> str:
+    """Concatenate static prefix + dynamic suffix.
+
+    Back-compat shim for callers that haven't been migrated to the
+    static/dynamic split. New callers should call
+    ``build_system_prompt_static`` and
+    ``build_system_prompt_dynamic_suffix`` separately and pass the
+    suffix to ``NodeConversation.update_system_prompt(static,
+    dynamic_suffix=suffix)`` so the LiteLLM wrapper can emit two
+    cache-aware blocks.
+    """
+    static = build_system_prompt_static(spec)
+    suffix = build_system_prompt_dynamic_suffix(spec)
+    if not suffix:
+        return static
+    if not static:
+        return suffix
+    return f"{static}\n\n{suffix}"
 
 
 def build_system_prompt_for_node_context(
@@ -235,7 +356,7 @@ def build_system_prompt_for_node_context(
     narrative: str | None = None,
     memory_prompt: str | None = None,
 ) -> str:
-    """Build a canonical system prompt from a NodeContext-like object."""
+    """Build the combined system prompt (back-compat single-string)."""
     spec = build_prompt_spec_from_node_context(
         ctx,
         focus_prompt=focus_prompt,
@@ -243,6 +364,28 @@ def build_system_prompt_for_node_context(
         memory_prompt=memory_prompt,
     )
     return build_system_prompt(spec)
+
+
+def build_system_prompt_parts_for_node_context(
+    ctx: Any,
+    *,
+    focus_prompt: str | None = None,
+    narrative: str | None = None,
+    memory_prompt: str | None = None,
+) -> tuple[str, str]:
+    """Return ``(static_prefix, dynamic_suffix)`` for a NodeContext.
+
+    Pass to ``NodeConversation.update_system_prompt(static,
+    dynamic_suffix=suffix)`` so the LLM wrapper sends two cache-aware
+    blocks.
+    """
+    spec = build_prompt_spec_from_node_context(
+        ctx,
+        focus_prompt=focus_prompt,
+        narrative=narrative,
+        memory_prompt=memory_prompt,
+    )
+    return build_system_prompt_static(spec), build_system_prompt_dynamic_suffix(spec)
 
 
 def build_narrative(
@@ -292,9 +435,7 @@ def build_transition_message(spec: TransitionSpec) -> str:
         sections.append("\nOutputs available:\n" + "\n".join(lines))
 
     if spec.data_files:
-        sections.append(
-            "\nData files (use read_file to access):\n" + "\n".join(f"  {entry}" for entry in spec.data_files)
-        )
+        sections.append('\nData files (use terminal_exec("cat ...") to access):\n' + "\n".join(f"  {entry}" for entry in spec.data_files))
 
     if spec.cumulative_tool_names:
         sections.append("\nAvailable tools: " + ", ".join(sorted(spec.cumulative_tool_names)))
@@ -308,10 +449,7 @@ def build_transition_message(spec: TransitionSpec) -> str:
             f"belongs to later phases."
         )
 
-    sections.append(
-        "\nBefore proceeding, briefly reflect: what went well in the "
-        "previous phase? Are there any gaps or surprises worth noting?"
-    )
+    sections.append("\nBefore proceeding, briefly reflect: what went well in the previous phase? Are there any gaps or surprises worth noting?")
     sections.append("\n--- END TRANSITION ---")
     return "\n".join(sections)
 
@@ -321,10 +459,15 @@ __all__ = [
     "NodePromptSpec",
     "TransitionSpec",
     "build_accounts_prompt",
+    "build_binding_prompt",
+    "build_credentials_summary",
     "build_narrative",
     "build_prompt_spec_from_node_context",
     "build_system_prompt",
+    "build_system_prompt_dynamic_suffix",
     "build_system_prompt_for_node_context",
+    "build_system_prompt_parts_for_node_context",
+    "build_system_prompt_static",
     "build_transition_message",
     "stamp_prompt_datetime",
 ]

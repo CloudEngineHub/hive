@@ -79,6 +79,11 @@ def main() -> None:
 
     register_mcp_commands(subparsers)
 
+    # Data-retention janitor (dry-run by default)
+    from framework.maintenance.cli import register_janitor_commands
+
+    register_janitor_commands(subparsers)
+
     args = parser.parse_args()
 
     if hasattr(args, "func"):

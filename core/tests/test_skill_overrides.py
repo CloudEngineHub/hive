@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from framework.skills.authoring import build_draft, write_skill
 from framework.skills.config import SkillsConfig
 from framework.skills.discovery import ExtraScope
 from framework.skills.manager import SkillsManager, SkillsManagerConfig
@@ -17,6 +16,7 @@ from framework.skills.overrides import (
     Provenance,
     SkillOverrideStore,
 )
+from framework.skills.skill_writer import build_draft, write_skill
 
 
 def _write_skill_file(base: Path, name: str, description: str = "desc") -> Path:
@@ -128,12 +128,12 @@ class TestSkillsManagerOverrides:
         # extra scope tagged as framework so the manager sees it.
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
         fake_fw = tmp_path / "fake_framework"
-        _write_skill_file(fake_fw, "hive.note-taking", "Fake default")
+        _write_skill_file(fake_fw, "hive.fake-protocol", "Fake default")
 
         overrides_path = tmp_path / "queen_overrides.json"
         store = SkillOverrideStore.load(overrides_path, scope_label="queen:q")
         store.upsert(
-            "hive.note-taking",
+            "hive.fake-protocol",
             OverrideEntry(enabled=False, provenance=Provenance.FRAMEWORK),
         )
         store.save()
@@ -151,40 +151,33 @@ class TestSkillsManagerOverrides:
         mgr.load()
 
         names_enabled = {s.name for s in mgr._catalog._skills.values()}  # type: ignore[attr-defined]
-        assert "hive.note-taking" not in names_enabled
+        assert "hive.fake-protocol" not in names_enabled
         # Enumeration (for UI rendering) still returns the hidden entry.
-        assert any(s.name == "hive.note-taking" for s in mgr.enumerate_skills_with_source())
+        assert any(s.name == "hive.fake-protocol" for s in mgr.enumerate_skills_with_source())
 
-    def test_colony_disable_overrides_queen_enable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_queen_disable_applies_to_colony_ui_skills(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Colonies have no override store of their own — the queen's
+        store is the single authority, and its entries apply to skills
+        discovered from a colony's dir (``colony_ui`` extra scope) too.
+        """
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
-        # One skill in a "queen_ui" extra scope.
-        queen_skills = tmp_path / "queen_home" / "skills"
-        _write_skill_file(queen_skills, "shared-skill")
+        colony_skills = tmp_path / "colony_home" / "skills"
+        _write_skill_file(colony_skills, "shared-skill")
 
         queen_overrides = tmp_path / "queen_overrides.json"
         qstore = SkillOverrideStore.load(queen_overrides, scope_label="queen:q")
         qstore.upsert(
             "shared-skill",
-            OverrideEntry(enabled=True, provenance=Provenance.USER_UI_CREATED),
-        )
-        qstore.save()
-
-        colony_overrides = tmp_path / "colony_overrides.json"
-        cstore = SkillOverrideStore.load(colony_overrides, scope_label="colony:c")
-        cstore.upsert(
-            "shared-skill",
             OverrideEntry(enabled=False, provenance=Provenance.USER_UI_CREATED),
         )
-        cstore.save()
+        qstore.save()
 
         mgr = SkillsManager(
             SkillsManagerConfig(
                 queen_id="q",
                 queen_overrides_path=queen_overrides,
-                colony_name="c",
-                colony_overrides_path=colony_overrides,
-                extra_scope_dirs=[ExtraScope(directory=queen_skills, label="queen_ui", priority=2)],
+                extra_scope_dirs=[ExtraScope(directory=colony_skills, label="colony_ui", priority=3)],
                 project_root=None,
                 skip_community_discovery=True,
                 skills_config=SkillsConfig(),
@@ -246,6 +239,60 @@ class TestSkillsManagerOverrides:
         mgr.load()
         enabled = {s.name for s in mgr._catalog._skills.values()}  # type: ignore[attr-defined]
         assert "hive.x-automation" in enabled
+
+    def test_role_default_preset_enabled_in_memory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A preset named in ``default_preset_skills`` is on by default — no
+        override file needed — while other presets stay off. This is the
+        in-memory parallel to role-default tools."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        fake_presets = tmp_path / "fake_presets"
+        _write_skill_file(fake_presets, "hive.linkedin-message-campaign", "campaign")
+        _write_skill_file(fake_presets, "hive.x-automation", "x pack")
+
+        mgr = SkillsManager(
+            SkillsManagerConfig(
+                queen_id="queen_outbound",
+                default_preset_skills=frozenset({"hive.linkedin-message-campaign"}),
+                extra_scope_dirs=[ExtraScope(directory=fake_presets, label="preset", priority=1)],
+                project_root=None,
+                skip_community_discovery=True,
+                interactive=False,
+            )
+        )
+        mgr.load()
+        enabled = {s.name for s in mgr._catalog._skills.values()}  # type: ignore[attr-defined]
+        assert "hive.linkedin-message-campaign" in enabled  # role default → on
+        assert "hive.x-automation" not in enabled  # other preset → still off
+
+    def test_role_default_preset_disabled_by_explicit_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicit enabled=False override beats the role default, so the
+        user can always turn a defaulted preset back off."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        fake_presets = tmp_path / "fake_presets"
+        _write_skill_file(fake_presets, "hive.linkedin-message-campaign", "campaign")
+
+        overrides_path = tmp_path / "queen_overrides.json"
+        store = SkillOverrideStore.load(overrides_path, scope_label="queen:queen_outbound")
+        store.upsert(
+            "hive.linkedin-message-campaign",
+            OverrideEntry(enabled=False, provenance=Provenance.PRESET),
+        )
+        store.save()
+
+        mgr = SkillsManager(
+            SkillsManagerConfig(
+                queen_id="queen_outbound",
+                queen_overrides_path=overrides_path,
+                default_preset_skills=frozenset({"hive.linkedin-message-campaign"}),
+                extra_scope_dirs=[ExtraScope(directory=fake_presets, label="preset", priority=1)],
+                project_root=None,
+                skip_community_discovery=True,
+                interactive=False,
+            )
+        )
+        mgr.load()
+        enabled = {s.name for s in mgr._catalog._skills.values()}  # type: ignore[attr-defined]
+        assert "hive.linkedin-message-campaign" not in enabled
 
     def test_reload_picks_up_store_change(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")

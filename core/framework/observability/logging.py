@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
@@ -206,14 +207,40 @@ def configure_logging(
     else:
         formatter = HumanReadableFormatter()
 
-    # Configure handler
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
+    # Always silence LiteLLM's "Provider List: ..." banner, regardless of
+    # format. It's printed via raw print() (not the logger), so the
+    # LiteLLM logger level can't suppress it — only litellm.suppress_debug_info
+    # does.
+    try:
+        import litellm
+
+        if hasattr(litellm, "suppress_debug_info"):
+            litellm.suppress_debug_info = True  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        pass
+
+    # Split handlers by severity:
+    #   DEBUG / INFO  → stdout
+    #   WARNING+      → stderr
+    # Python's StreamHandler() defaults to stderr, which means even
+    # routine INFO logs appear on the stderr pipe and get tagged
+    # `[runtime stderr]` by the desktop's runtime.ts wireStream — making
+    # ordinary chatter look like errors. Splitting by severity makes the
+    # pipe label match the user's intuition: stdout is normal output,
+    # stderr is "look at this."
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    stdout_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(formatter)
+    stderr_handler.setLevel(logging.WARNING)
 
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.addHandler(handler)
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(stderr_handler)
     root_logger.setLevel(level.upper())
 
     # Suppress noisy LiteLLM INFO logs (model/provider line + Provider List URL

@@ -150,9 +150,7 @@ class TestSynthesizeDraftFromRuntime:
         assert fmap == {"intake": ["intake"], "process": ["process"], "deliver": ["deliver"]}
 
         # Legend should contain all types
-        assert draft["flowchart_legend"] == {
-            k: {"shape": v["shape"], "color": v["color"]} for k, v in FLOWCHART_TYPES.items()
-        }
+        assert draft["flowchart_legend"] == {k: {"shape": v["shape"], "color": v["color"]} for k, v in FLOWCHART_TYPES.items()}
 
     def test_graph_with_sub_agents(self):
         nodes = [

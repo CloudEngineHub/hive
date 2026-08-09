@@ -445,12 +445,7 @@ async def test_unified_short_reflection_can_write_both_scopes_in_one_loop(tmp_pa
                     "input": {
                         "scope": "global",
                         "filename": "user-profile.md",
-                        "content": (
-                            "---\nname: User Profile\n"
-                            "type: profile\n"
-                            "description: Shared user profile\n"
-                            "---\nShared profile body."
-                        ),
+                        "content": ("---\nname: User Profile\ntype: profile\ndescription: Shared user profile\n---\nShared profile body."),
                     },
                 },
                 {
@@ -512,12 +507,8 @@ async def test_long_reflection(tmp_path: Path):
 
     mem_dir = tmp_path / "global_memory"
     mem_dir.mkdir()
-    (mem_dir / "dup-a.md").write_text(
-        "---\nname: dup-a\ntype: profile\ndescription: profile A\n---\nProfile A details."
-    )
-    (mem_dir / "dup-b.md").write_text(
-        "---\nname: dup-b\ntype: profile\ndescription: profile A dup\n---\nSame profile A."
-    )
+    (mem_dir / "dup-a.md").write_text("---\nname: dup-a\ntype: profile\ndescription: profile A\n---\nProfile A details.")
+    (mem_dir / "dup-b.md").write_text("---\nname: dup-b\ntype: profile\ndescription: profile A dup\n---\nSame profile A.")
 
     llm = AsyncMock()
     llm.acomplete.side_effect = [
@@ -533,11 +524,7 @@ async def test_long_reflection(tmp_path: Path):
                     "name": "write_memory_file",
                     "input": {
                         "filename": "dup-a.md",
-                        "content": (
-                            "---\nname: dup-a\ntype: profile\n"
-                            "description: profile A (merged)\n"
-                            "---\nProfile A details. Also same profile A."
-                        ),
+                        "content": ("---\nname: dup-a\ntype: profile\ndescription: profile A (merged)\n---\nProfile A details. Also same profile A."),
                     },
                 },
                 {
@@ -632,12 +619,7 @@ async def test_shutdown_reflection_writes_global_and_queen_scope(tmp_path: Path)
                     "input": {
                         "scope": "global",
                         "filename": "user-profile.md",
-                        "content": (
-                            "---\nname: User Profile\n"
-                            "type: profile\n"
-                            "description: Shared user profile\n"
-                            "---\nShared profile body."
-                        ),
+                        "content": ("---\nname: User Profile\ntype: profile\ndescription: Shared user profile\n---\nShared profile body."),
                     },
                 },
                 {
@@ -736,37 +718,43 @@ def test_build_system_prompt_injects_dynamic_memory():
     assert "remember this" in prompt
 
 
-def test_queen_phase_state_appends_global_memory_block():
+def test_queen_phase_state_renders_global_memory_block():
+    """Recall rides the conversation as a <system-reminder>, NOT the system
+    prompt — a per-turn recall block in the system prompt would invalidate
+    the cached history prefix on every refresh. render_recall_block() is
+    what the orchestrator injects; the system prompt stays recall-free."""
     phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
+        phase="colony",
+        prompt_colony="base prompt",
         _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
     )
 
+    block = phase.render_recall_block()
+    assert "Global Memories" in block
+    assert "global stuff" in block
     prompt = phase.get_current_prompt()
     assert "base prompt" in prompt
-    assert "Global Memories" in prompt
-    assert "global stuff" in prompt
+    assert "Global Memories" not in prompt
 
 
-def test_queen_phase_state_appends_queen_memory_block():
+def test_queen_phase_state_renders_queen_memory_block():
     phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
+        phase="colony",
+        prompt_colony="base prompt",
         _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
         _cached_queen_recall_block="--- Queen Memories: queen_technology ---\nqueen stuff",
     )
 
-    prompt = phase.get_current_prompt()
-    assert "base prompt" in prompt
-    assert "Global Memories" in prompt
-    assert "Queen Memories: queen_technology" in prompt
-    assert "queen stuff" in prompt
+    block = phase.render_recall_block()
+    assert "Global Memories" in block
+    assert "Queen Memories: queen_technology" in block
+    assert "queen stuff" in block
 
 
-def test_queen_phase_state_prompt_without_memory():
-    phase = QueenPhaseState(phase="working", prompt_working="base prompt")
+def test_queen_phase_state_recall_block_empty_without_memory():
+    phase = QueenPhaseState(phase="colony", prompt_colony="base prompt")
 
+    assert phase.render_recall_block() == ""
     prompt = phase.get_current_prompt()
     assert "base prompt" in prompt
     assert "Global Memories" not in prompt

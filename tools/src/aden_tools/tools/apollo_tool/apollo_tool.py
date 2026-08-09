@@ -253,9 +253,7 @@ class _ApolloClient:
                         "organization": {
                             "id": p.get("organization", {}).get("id") if p.get("organization") else None,
                             "name": p.get("organization", {}).get("name") if p.get("organization") else None,
-                            "domain": p.get("organization", {}).get("primary_domain")
-                            if p.get("organization")
-                            else None,
+                            "domain": p.get("organization", {}).get("primary_domain") if p.get("organization") else None,
                         },
                     }
                     for p in people
@@ -497,12 +495,7 @@ def register_tools(
         has_name_and_domain = bool((first_name and last_name and domain) or (name and domain))
 
         if not has_email_or_linkedin and not has_name_and_domain:
-            return {
-                "error": (
-                    "Invalid search criteria. Provide either (email), (linkedin_url), "
-                    "or (name/first_name+last_name AND domain)."
-                )
-            }
+            return {"error": ("Invalid search criteria. Provide either (email), (linkedin_url), or (name/first_name+last_name AND domain).")}
         try:
             return client.enrich_person(
                 email=email,

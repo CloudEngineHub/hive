@@ -356,6 +356,35 @@ class CredentialExpiredError(CredentialError):
         super().__init__(message)
 
 
+class AccountSelectionRequiredError(CredentialError):
+    """Raised when a queen tool needs an explicit account choice.
+
+    Fires only when ``CredentialStoreAdapter.get`` is invoked under
+    queen strict-account-mode (no worker-profile binding, multiple
+    authorized accounts for the provider). The agent loop converts
+    this into a structured ``account_selection_required`` tool result
+    so the queen LLM can ask the user which account to use and re-call
+    the tool with ``account=<alias>`` set.
+
+    ``available_accounts`` is a list of dicts with ``alias`` and
+    ``identity`` keys — the same shape produced by
+    ``CredentialStore.list_accounts``.
+    """
+
+    def __init__(
+        self,
+        credential_id: str,
+        message: str,
+        *,
+        provider: str | None = None,
+        available_accounts: list[dict] | None = None,
+    ):
+        self.credential_id = credential_id
+        self.provider = provider
+        self.available_accounts = available_accounts or []
+        super().__init__(message)
+
+
 class CredentialValidationError(CredentialError):
     """Raised when credential validation fails."""
 

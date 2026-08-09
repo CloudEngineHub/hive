@@ -106,10 +106,7 @@ async def _wait_for_queen_identity(
                 if qid != "default":
                     return qid
         await asyncio.sleep(poll_interval)
-    pytest.fail(
-        f"Queen identity not selected within {timeout}s "
-        f"(last queen_id={last_qid!r}). The queen identity hook may not be firing."
-    )
+    pytest.fail(f"Queen identity not selected within {timeout}s (last queen_id={last_qid!r}). The queen identity hook may not be firing.")
 
 
 # ---------------------------------------------------------------------------
@@ -162,26 +159,26 @@ async def test_live_queen_fork_to_colony(isolated_hive_home):
         assert queen_name != "default", f"Identity hook didn't pick a real queen, got {queen_name!r}"
 
         # ── 3. Fork to a colony ────────────────────────────────────
-        colony_name = "live_test_honeycomb"
+        colony_id = "live_test_honeycomb"
         resp = await client.post(
             f"/api/sessions/{session_id}/colony-spawn",
-            json={"colony_name": colony_name, "task": "trade carefully"},
+            json={"colony_id": colony_id, "task": "trade carefully"},
         )
         assert resp.status == 200, await resp.text()
         spawn_data = await resp.json()
         colony_session_id = spawn_data["queen_session_id"]
-        assert spawn_data["colony_name"] == colony_name
+        assert spawn_data["colony_id"] == colony_id
         assert spawn_data["is_new"] is True
         assert colony_session_id != session_id
 
         # ── 4. Validate on-disk artifacts ──────────────────────────
-        colony_dir = isolated_hive_home / "colonies" / colony_name
+        colony_dir = isolated_hive_home / "colonies" / colony_id
         assert colony_dir.is_dir()
         assert (colony_dir / "worker.json").is_file()
         assert (colony_dir / "metadata.json").is_file()
 
         metadata = json.loads((colony_dir / "metadata.json").read_text())
-        assert metadata["colony_name"] == colony_name
+        assert metadata["colony_id"] == colony_id
         # The crucial assertion: the metadata's queen_name must be the
         # auto-selected queen, not "default". This is what failed
         # repeatedly yesterday before the queen-dir relocate fix.
@@ -222,7 +219,7 @@ async def test_live_queen_fork_to_colony(isolated_hive_home):
         assert not forked_in_history, f"Forked colony session leaked into queen DM history: {forked_in_history}"
 
         # ── 7. Worker storage received the conversations ──────────
-        worker_storage_convs = isolated_hive_home / "agents" / colony_name / "worker" / "conversations"
+        worker_storage_convs = isolated_hive_home / "agents" / colony_id / "worker" / "conversations"
         assert worker_storage_convs.is_dir()
         # The queen has had at least one turn (the initial_prompt acknowledgment),
         # so there should be conversation parts.

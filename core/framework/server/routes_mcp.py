@@ -25,6 +25,7 @@ from aiohttp import web
 
 from framework.loader.mcp_errors import MCPError
 from framework.loader.mcp_registry import MCPRegistry
+from framework.server.app import get_request_executor
 
 logger = logging.getLogger(__name__)
 
@@ -269,10 +270,12 @@ async def handle_health(request: web.Request) -> web.Response:
     reg = _registry()
     try:
         # MCPRegistry.health_check blocks on subprocess IO — run it off
-        # the event loop so the HTTP worker stays responsive.
+        # the event loop so the HTTP worker stays responsive. Use the
+        # request executor so a stuck queen tool call can't stall it.
         import asyncio
 
-        result = await asyncio.to_thread(reg.health_check, name)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(get_request_executor(), reg.health_check, name)
     except MCPError as exc:
         return _mcp_error_response(exc, default_status=404)
     except Exception as exc:

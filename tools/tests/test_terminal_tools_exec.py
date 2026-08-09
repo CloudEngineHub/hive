@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import sys
 import time
 
 import pytest
-
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="terminal_tools is POSIX-only (uses resource module)")
 
 
 @pytest.fixture
@@ -29,6 +26,24 @@ def test_envelope_shape_simple_echo(exec_tool):
     assert result["job_id"] is None
     assert result["warning"] is None
     assert result["pid"] is not None
+    # "direct" on POSIX (shell=False, no metacharacters); on Windows there is
+    # no useful direct path so it routes through the resolved platform shell.
+    import os
+
+    assert result["shell_kind"] == ("direct" if os.name != "nt" else result["shell_kind"])
+    assert result["shell_kind"] in ("direct", "bash", "powershell", "cmd")
+
+
+def test_shell_kind_reported(exec_tool):
+    """shell=True (or an auto-shelled pipeline) reports the interpreter that
+    ran the command so the agent can adapt syntax per platform."""
+    result = exec_tool(command="echo hi", shell=True)
+    assert result["exit_code"] == 0
+    assert result["shell_kind"] in ("bash", "powershell", "cmd")
+
+    piped = exec_tool(command="echo a | tr a b")
+    assert piped["auto_shell"] is True
+    assert piped["shell_kind"] in ("bash", "powershell", "cmd")
 
 
 def test_grep_no_matches_is_ok_not_error(exec_tool, tmp_path):
@@ -68,16 +83,44 @@ def test_destructive_warning_drop_table(exec_tool):
     assert "drop" in result["warning"].lower() or "truncate" in result["warning"].lower()
 
 
+# ── session_cwd injection (loose-optimistic default cwd) ──────────────────────
+
+
+def test_session_cwd_used_when_cwd_omitted(exec_tool, tmp_path):
+    """Omitting cwd runs the command in the framework-injected session workdir."""
+    import os
+
+    result = exec_tool(command="pwd", session_cwd=str(tmp_path))
+    assert result["exit_code"] == 0
+    assert os.path.realpath(result["stdout"].strip()) == os.path.realpath(str(tmp_path))
+
+
+def test_explicit_cwd_overrides_session_cwd(exec_tool, tmp_path):
+    """An explicit cwd always wins over session_cwd — it's a default, not a jail."""
+    import os
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    result = exec_tool(command="pwd", cwd=str(sub), session_cwd=str(tmp_path))
+    assert result["exit_code"] == 0
+    assert os.path.realpath(result["stdout"].strip()) == os.path.realpath(str(sub))
+
+
+def test_no_cwd_no_session_cwd_uses_server_cwd(exec_tool):
+    """With neither cwd nor session_cwd, behavior is unchanged (server cwd)."""
+    import os
+
+    result = exec_tool(command="pwd")
+    assert result["exit_code"] == 0
+    assert os.path.realpath(result["stdout"].strip()) == os.path.realpath(os.getcwd())
+
+
 def test_command_not_found(exec_tool):
     result = exec_tool(command="this_command_does_not_exist_xyzzy")
     assert result["exit_code"] is None or result["exit_code"] != 0
     # Either pre-spawn FileNotFoundError or shell exit 127 — both are fine
     # as long as semantic_status reflects an error or the error field is set.
-    assert (
-        result["semantic_status"] == "error"
-        or result.get("error")
-        or "not found" in (result["semantic_message"] or "").lower()
-    )
+    assert result["semantic_status"] == "error" or result.get("error") or "not found" in (result["semantic_message"] or "").lower()
 
 
 def test_zsh_refused(exec_tool):
@@ -136,7 +179,8 @@ def test_output_handle_round_trip(exec_tool, mcp):
 
 
 def test_timed_out_marker(exec_tool):
-    result = exec_tool(command="sleep 5", timeout_sec=1, auto_background_after_sec=0)
+    # Float timeout works at runtime — .fn bypasses MCP int-schema validation.
+    result = exec_tool(command="sleep 5", timeout_sec=0.1, auto_background_after_sec=0)
     assert result["timed_out"] is True
 
 
@@ -208,21 +252,24 @@ def test_auto_promotion(exec_tool, mcp):
     from terminal_tools.jobs.tools import register_job_tools
 
     register_job_tools(mcp)
-    # Use a 1s budget so the test runs quickly.
+    # Sub-second budget + short sleep keeps the test under 1s. The int
+    # annotation on auto_background_after_sec is for the MCP schema; the
+    # underlying subprocess.wait accepts floats, and calling .fn directly
+    # bypasses schema validation.
     start = time.monotonic()
     result = exec_tool(
-        command="sleep 5",
-        auto_background_after_sec=1,
-        timeout_sec=10,
+        command="sleep 0.5",
+        auto_background_after_sec=0.1,
+        timeout_sec=2,
     )
     elapsed = time.monotonic() - start
     assert result["auto_backgrounded"] is True, result
     assert result["job_id"] is not None
     assert result["exit_code"] is None
-    assert elapsed < 3, "auto-promotion should return quickly past the budget"
+    assert elapsed < 0.4, "auto-promotion should return quickly past the budget"
 
     # Take over via terminal_job_logs
     job_logs = mcp._tool_manager._tools["terminal_job_logs"].fn
-    log_result = job_logs(job_id=result["job_id"], wait_until_exit=True, wait_timeout_sec=10)
+    log_result = job_logs(job_id=result["job_id"], wait_until_exit=True, wait_timeout_sec=2)
     assert log_result["status"] == "exited"
     assert log_result["exit_code"] == 0

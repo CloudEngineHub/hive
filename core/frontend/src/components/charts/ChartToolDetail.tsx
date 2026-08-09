@@ -13,16 +13,15 @@
  *     IS the embedding — there's nothing else to remember.
  *   - The chart survives session reload because the spec lives in
  *     events.jsonl alongside the tool_call_completed event.
- *   - The downloadable PNG lives at ``result.file_url`` (a ``file://``
- *     URI on the runtime host). The web frontend can't open file://
- *     directly; we surface ``file_path`` as text and give a Copy
- *     button so the user can paste it into a file manager. (The
- *     desktop renderer has an Electron IPC bridge — not available
- *     in OSS.)
+ *   - The download is always available because the server tool wrote
+ *     the file before returning. We don't generate the link client-
+ *     side; we use ``result.file_url`` directly.
  */
 
 import { lazy, Suspense, useState } from "react";
-import { Copy, Loader2, Check } from "lucide-react";
+import { Download, Loader2, Check } from "lucide-react";
+import { apiUrl } from "@/api/client";
+import { downloadUrl } from "@/lib/desktop-shims";
 
 // Lazy chunks so non-chart messages don't drag in echarts/mermaid.
 const EChartsBlock = lazy(() => import("./EChartsBlock"));
@@ -35,6 +34,8 @@ export interface ChartToolEntry {
   result?: unknown;
   isError?: boolean;
   callKey?: string;
+  startedAt?: number;
+  endedAt?: number;
 }
 
 interface ChartResult {
@@ -45,9 +46,9 @@ interface ChartResult {
   title?: string;
   error?: string;
   // Width/height come back from the server tool but are NOT displayed
-  // in the footer. Kept here so the live in-chat render can match the
-  // spec's native aspect ratio instead of forcing a 16:9 box that
-  // clips wide dashboards.
+  // in the footer (per design feedback 2026-05-01). Kept here so the
+  // live in-chat render can match the spec's native aspect ratio
+  // instead of forcing a 16:9 box that clips wide dashboards.
   width?: number;
   height?: number;
 }
@@ -57,8 +58,19 @@ function asResult(v: unknown): ChartResult {
   return {};
 }
 
+/**
+ * Download the rendered chart. The runtime serves the chart image at its
+ * on-disk path via the `/api` surface; a temporary `<a download>` saves it
+ * under the suggested filename.
+ */
+function downloadChart(srcPath: string, suggestedName: string): { ok: boolean; cancelled?: boolean } {
+  return downloadUrl(apiUrl(srcPath), suggestedName);
+}
+
 export default function ChartToolDetail({ entry }: { entry: ChartToolEntry }) {
-  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [downloadState, setDownloadState] = useState<"idle" | "saving" | "saved">(
+    "idle",
+  );
 
   // Still running: show a tiny inline spinner. Charts render fast (a
   // few hundred ms), so a full skeleton would flash and feel janky.
@@ -78,7 +90,8 @@ export default function ChartToolDetail({ entry }: { entry: ChartToolEntry }) {
   if (result.error) {
     // Errors are intentionally NOT shown to the user — the agent sees
     // them in the tool result envelope and is expected to retry with a
-    // fixed spec.
+    // fixed spec. Showing the raw "Cannot create property 'series' on
+    // string '...'" wall-of-text scared users (feedback 2026-05-01).
     return null;
   }
 
@@ -88,19 +101,31 @@ export default function ChartToolDetail({ entry }: { entry: ChartToolEntry }) {
     return null;
   }
 
-  const handleCopyPath = async () => {
+  const handleDownload = async () => {
     if (!result.file_path) return;
+    const suggestedName = `${result.title || "chart"}.png`;
+    setDownloadState("saving");
     try {
-      await navigator.clipboard.writeText(result.file_path);
-      setCopyState("copied");
-      window.setTimeout(() => setCopyState("idle"), 2000);
+      const r = await downloadChart(result.file_path, suggestedName);
+      if (r.ok && !r.cancelled) {
+        setDownloadState("saved");
+        // Clear the "saved" indicator after a beat so the button can be
+        // reused for further saves.
+        window.setTimeout(() => setDownloadState("idle"), 2000);
+      } else {
+        setDownloadState("idle");
+      }
     } catch {
-      // Clipboard API unavailable (insecure context); silently no-op.
+      setDownloadState("idle");
     }
   };
 
   // Honor the spec's native aspect ratio when both dimensions are
-  // known (the server tool always returns them).
+  // known (the server tool always returns them). Wide multi-card
+  // dashboards designed at 1400×700 (2:1) used to get crammed into
+  // a 16:9 box at 768px wide → content overflowed and clipped
+  // (feedback 2026-05-01). Falls back to undefined so EChartsBlock's
+  // 16:9 default applies for chart kinds without dimension hints.
   const aspectRatio =
     result.width && result.height ? result.width / result.height : undefined;
 
@@ -125,10 +150,11 @@ export default function ChartToolDetail({ entry }: { entry: ChartToolEntry }) {
         )}
       </Suspense>
 
-      {/* Footer: title + path-copy. The PNG lives on the runtime host;
-          web browsers can't open file:// URIs from a hosted page, so
-          we surface the path as a copyable string instead of a fake
-          Download button. */}
+      {/* Footer: just title + download. The PNG dimensions / dpi /
+          file size were displayed earlier but the user pointed out
+          (2026-05-01) that nobody cares about those numbers in the
+          chat — they're noise. Title gives the chart context; the
+          Download button is the only action. */}
       <div className="flex items-center justify-between mt-2 px-1 text-[10.5px] text-muted-foreground/80">
         <span className="truncate min-w-0 flex-1">
           {result.title || kind}
@@ -136,20 +162,23 @@ export default function ChartToolDetail({ entry }: { entry: ChartToolEntry }) {
         {result.file_path && (
           <button
             type="button"
-            onClick={handleCopyPath}
-            className="inline-flex items-center gap-1 hover:text-foreground transition shrink-0 cursor-pointer"
+            onClick={handleDownload}
+            disabled={downloadState === "saving"}
+            className="inline-flex items-center gap-1 hover:text-foreground transition shrink-0 disabled:opacity-60 cursor-pointer"
             title={
-              copyState === "copied"
-                ? "Copied to clipboard"
-                : `Copy path: ${result.file_path}`
+              downloadState === "saved"
+                ? `Saved to your chosen location`
+                : `Save a copy of ${result.file_path}`
             }
           >
-            {copyState === "copied" ? (
+            {downloadState === "saving" ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : downloadState === "saved" ? (
               <Check className="w-3 h-3 text-primary" />
             ) : (
-              <Copy className="w-3 h-3" />
+              <Download className="w-3 h-3" />
             )}
-            {copyState === "copied" ? "Copied" : "Copy path"}
+            {downloadState === "saved" ? "Saved" : "Download PNG"}
           </button>
         )}
       </div>

@@ -56,9 +56,7 @@ class TestPythonpathSeparatorWindows:
             [
                 sys.executable,
                 "-c",
-                "import sys; "
-                "sys.path = [p for p in sys.path if 'mod_a' not in p and 'mod_b' not in p]; "
-                "import mod_a; import mod_b; print('ok')",
+                "import sys; sys.path = [p for p in sys.path if 'mod_a' not in p and 'mod_b' not in p]; import mod_a; import mod_b; print('ok')",
             ],
             env=env,
             capture_output=True,
@@ -89,9 +87,7 @@ class TestPythonpathSeparatorWindows:
             [
                 sys.executable,
                 "-c",
-                "import sys; "
-                "pp = [p for p in sys.path if 'core' in p or 'exports' in p]; "
-                "import mod_c; import mod_d; print('ok')",
+                "import sys; pp = [p for p in sys.path if 'core' in p or 'exports' in p]; import mod_c; import mod_d; print('ok')",
             ],
             env=env,
             capture_output=True,

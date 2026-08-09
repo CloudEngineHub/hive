@@ -98,9 +98,6 @@ def is_tool_doom_loop(
     # All turns in the window must match the first exactly
     if all(fp == first for fp in recent_tool_fingerprints[1:]):
         tool_names = [name for name, _ in first]
-        desc = (
-            f"Doom loop detected: {len(recent_tool_fingerprints)} "
-            f"identical consecutive tool calls ({', '.join(tool_names)})"
-        )
+        desc = f"Doom loop detected: {len(recent_tool_fingerprints)} identical consecutive tool calls ({', '.join(tool_names)})"
         return True, desc
     return False, ""

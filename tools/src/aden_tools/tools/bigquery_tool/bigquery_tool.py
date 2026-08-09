@@ -87,9 +87,7 @@ def _create_bigquery_client(project_id: str | None = None) -> Any:
     try:
         from google.cloud import bigquery
     except ImportError:
-        raise ImportError(
-            "google-cloud-bigquery is required for BigQuery tools. Install it with: pip install google-cloud-bigquery"
-        ) from None
+        raise ImportError("google-cloud-bigquery is required for BigQuery tools. Install it with: pip install google-cloud-bigquery") from None
 
     # Create client - will use ADC if GOOGLE_APPLICATION_CREDENTIALS not set
     if project_id:
@@ -198,8 +196,7 @@ def register_tools(
         if not _is_read_only_query(sql):
             return {
                 "error": "Write operations are not allowed",
-                "help": "Only SELECT queries are permitted. "
-                "INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, and MERGE are blocked.",
+                "help": "Only SELECT queries are permitted. INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, and MERGE are blocked.",
             }
 
         # Validate max_rows
@@ -249,10 +246,7 @@ def register_tools(
             error_msg = str(e)
 
             # Provide helpful messages for common errors
-            if (
-                "Could not automatically determine credentials" in error_msg
-                or "default credentials were not found" in error_msg.lower()
-            ):  # noqa: E501
+            if "Could not automatically determine credentials" in error_msg or "default credentials were not found" in error_msg.lower():  # noqa: E501
                 return {
                     "error": "BigQuery authentication failed",
                     "help": "Set GOOGLE_APPLICATION_CREDENTIALS to your service account JSON path, "
@@ -365,10 +359,7 @@ def register_tools(
         except Exception as e:
             error_msg = str(e)
 
-            if (
-                "Could not automatically determine credentials" in error_msg
-                or "default credentials were not found" in error_msg.lower()
-            ):  # noqa: E501
+            if "Could not automatically determine credentials" in error_msg or "default credentials were not found" in error_msg.lower():  # noqa: E501
                 return {
                     "error": "BigQuery authentication failed",
                     "help": "Set GOOGLE_APPLICATION_CREDENTIALS to your service account JSON path, "

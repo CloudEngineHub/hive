@@ -1,8 +1,8 @@
 """Tests for the per-queen MCP tool allowlist filter + routes.
 
 Covers:
-1. QueenPhaseState filter semantics (default-allow, allowlist, empty, phase-
-   isolation, memo identity for LLM prompt-cache stability).
+1. QueenPhaseState filter semantics (default-allow, allowlist, empty, all-
+   phase MCP filtering, memo identity for LLM prompt-cache stability).
 2. routes_queen_tools round trip (GET, PATCH, validation, live-session
    hot-reload).
 
@@ -66,20 +66,18 @@ class TestPhaseStateFilter:
         names = [t.name for t in ps.get_current_tools()]
         assert names == ["lc_c"]
 
-    def test_filter_isolated_to_independent_phase(self):
+    def test_allowlist_applies_to_mcp_tools_in_every_phase(self):
         ps = QueenPhaseState(phase="independent")
         ps.independent_tools = [_tool("mcp_a"), _tool("lc_c")]
-        ps.working_tools = [_tool("mcp_a"), _tool("lc_c")]
+        ps.colony_tools = [_tool("mcp_a"), _tool("lc_colony")]
         ps.mcp_tool_names_all = {"mcp_a"}
         ps.enabled_mcp_tools = []
         ps.rebuild_independent_filter()
 
-        # Independent → filtered
         assert [t.name for t in ps.get_current_tools()] == ["lc_c"]
 
-        # Other phases → unaffected
-        ps.phase = "working"
-        assert [t.name for t in ps.get_current_tools()] == ["mcp_a", "lc_c"]
+        ps.phase = "colony"
+        assert [t.name for t in ps.get_current_tools()] == ["lc_colony"]
 
     def test_memo_returns_stable_identity_for_prompt_cache(self):
         """Same Python list object across turns → LLM prompt cache stays warm."""
@@ -101,6 +99,144 @@ class TestPhaseStateFilter:
         assert third is not first
         assert [t.name for t in third] == ["mcp_a", "lc_c"]
 
+    def test_suggest_colony_gated_to_independent_phase(self):
+        """``suggest_colony`` (synthetic, framework-handled) must surface
+        only in the independent phase. The queen orchestrator wires it
+        into ``independent_tools``; on switch to colony the
+        ``dynamic_tools_provider`` (== get_current_tools) must drop it
+        so the LLM no longer sees the tool.
+        """
+        from framework.agent_loop.internals.synthetic_tools import (
+            build_suggest_colony_tool,
+        )
+
+        ps = QueenPhaseState(phase="independent")
+        ps.independent_tools = [_tool("read_file"), build_suggest_colony_tool()]
+        ps.colony_tools = [_tool("read_file"), _tool("run_worker")]
+        ps.mcp_tool_names_all = set()
+        ps.enabled_mcp_tools = None
+        ps.rebuild_independent_filter()
+
+        # Independent phase: tool must be present.
+        names = [t.name for t in ps.get_current_tools()]
+        assert "suggest_colony" in names, names
+
+        # Colony phase: tool must be absent. This is what stops the LLM
+        # from emitting a fork suggestion while already inside a colony.
+        ps.phase = "colony"
+        names = [t.name for t in ps.get_current_tools()]
+        assert "suggest_colony" not in names, names
+        assert "run_worker" in names, names
+
+        # And switching back restores it.
+        ps.phase = "independent"
+        names = [t.name for t in ps.get_current_tools()]
+        assert "suggest_colony" in names, names
+
+
+class TestAlwaysEnabledSearchableSplit:
+    """The always-enabled / searchable tier split + on-demand loading.
+
+    Intent: a queen boots with a small global eager toolset; every other MCP
+    tool it is allowed to use is searchable (manifest-only) until loaded via
+    search_tools, and loads survive a session restart. Always-enabled tools
+    are granted unconditionally — the allowlist cannot disable them.
+    """
+
+    def _ps(self, **kw):
+        ps = QueenPhaseState(phase="independent")
+        ps.independent_tools = [_tool("read_file"), _tool("gmail_send"), _tool("notion_search"), _tool("lc_task")]
+        ps.mcp_tool_names_all = {"read_file", "gmail_send", "notion_search"}
+        ps.always_enabled_names = {"read_file"}
+        for k, v in kw.items():
+            setattr(ps, k, v)
+        ps.rebuild_independent_filter()
+        return ps
+
+    def test_only_always_enabled_and_lifecycle_are_eager(self):
+        ps = self._ps(enabled_mcp_tools=None)  # allow-all
+        # Eager = always-enabled MCP (read_file) + non-MCP lifecycle (lc_task).
+        assert [t.name for t in ps.get_current_tools()] == ["read_file", "lc_task"]
+        # The other allowed MCP tools are searchable, not callable.
+        assert sorted(t.name for t in ps.get_searchable_tools()) == ["gmail_send", "notion_search"]
+
+    def test_always_enabled_bypasses_allowlist(self):
+        # Allowlist names neither read_file nor the others; read_file is still
+        # granted (and eager) because it is always-enabled.
+        ps = self._ps(enabled_mcp_tools=["gmail_send"])
+        assert "read_file" in [t.name for t in ps.get_current_tools()]
+        # gmail_send is allowed but not always-enabled → searchable.
+        assert [t.name for t in ps.get_searchable_tools()] == ["gmail_send"]
+        # notion_search is not allowed → absent from both tiers.
+        all_names = {t.name for t in ps.get_current_tools()} | {t.name for t in ps.get_searchable_tools()}
+        assert "notion_search" not in all_names
+
+    def test_empty_always_enabled_disables_split(self):
+        """Fail-open: no always-enabled set → every allowed tool is eager."""
+        ps = self._ps(always_enabled_names=set(), enabled_mcp_tools=None)
+        assert [t.name for t in ps.get_current_tools()] == [
+            "read_file",
+            "gmail_send",
+            "notion_search",
+            "lc_task",
+        ]
+        assert ps.get_searchable_tools() == []
+
+    def test_searchable_set_excludes_eager(self):
+        ps = self._ps(enabled_mcp_tools=None)
+        searchable = {t.name for t in ps.get_searchable_tools()}
+        assert searchable == {"gmail_send", "notion_search"}
+        assert "read_file" not in searchable  # always-enabled → eager, not searchable
+
+    def test_promote_loads_tool_into_eager(self):
+        ps = self._ps(enabled_mcp_tools=None)
+        loaded = ps.promote_searched_tools(["gmail_send"])
+        assert loaded == ["gmail_send"]
+        assert "gmail_send" in [t.name for t in ps.get_current_tools()]
+        assert "gmail_send" not in [t.name for t in ps.get_searchable_tools()]
+        # Re-loading is idempotent.
+        assert ps.promote_searched_tools(["gmail_send"]) == []
+
+    def test_loaded_tools_persist_and_restore(self, tmp_path):
+        meta = tmp_path / "meta.json"
+        ps = self._ps(enabled_mcp_tools=None, meta_path=meta)
+        ps.promote_searched_tools(["gmail_send"])
+        assert json.loads(meta.read_text())["loaded_tools"] == ["gmail_send"]
+
+        # Simulate restart: a fresh phase state restores from meta.json.
+        persisted = json.loads(meta.read_text()).get("loaded_tools", [])
+        ps2 = self._ps(enabled_mcp_tools=None)
+        ps2.restore_loaded_tools(persisted, registered_names={"read_file", "gmail_send", "notion_search", "lc_task"})
+        ps2.rebuild_independent_filter()
+        assert "gmail_send" in [t.name for t in ps2.get_current_tools()]
+
+    def test_restore_drops_unregistered_or_disallowed(self):
+        ps = self._ps(enabled_mcp_tools=["gmail_send"])
+        # notion_search: not allowed → dropped. ghost_tool: unregistered → dropped.
+        ps.restore_loaded_tools(
+            ["gmail_send", "notion_search", "ghost_tool"],
+            registered_names={"read_file", "gmail_send", "notion_search", "lc_task"},
+        )
+        assert ps.loaded_tool_names == ["gmail_send"]
+
+
+def test_match_searchable_tools_select_and_keywords():
+    from framework.tools.queen_lifecycle_tools import _match_searchable_tools
+
+    pool = [
+        Tool(name="gmail_send", description="Send an email via Gmail", parameters={}),
+        Tool(name="gmail_list_messages", description="List Gmail messages", parameters={}),
+        Tool(name="notion_search", description="Search Notion pages", parameters={}),
+    ]
+    # Exact-name selection, order preserved, unknown names dropped.
+    assert _match_searchable_tools("select:notion_search,nope", pool) == ["notion_search"]
+    # Keyword scoring: "gmail" hits both gmail tools, not notion.
+    out = _match_searchable_tools("gmail", pool)
+    assert set(out) == {"gmail_send", "gmail_list_messages"}
+    assert "notion_search" not in out
+    # No hit → empty.
+    assert _match_searchable_tools("kubernetes", pool) == []
+
 
 # ---------------------------------------------------------------------------
 # Route round-trip tests
@@ -111,7 +247,6 @@ class TestPhaseStateFilter:
 class _FakeSession:
     queen_name: str
     phase_state: QueenPhaseState
-    colony_runtime: Any = None
     id: str = "sess-1"
     _queen_tool_registry: Any = None
 
@@ -129,12 +264,15 @@ def queen_dir(tmp_path, monkeypatch):
     queens_dir.mkdir()
     monkeypatch.setattr("framework.agents.queen.queen_profiles.QUEENS_DIR", queens_dir)
     monkeypatch.setattr("framework.agents.queen.queen_tools_config.QUEENS_DIR", queens_dir)
+    # Pin a high version so sidecars written under this fixture postdate
+    # every entry in _CATEGORY_ADDITIONS — keeps PATCH/legacy tests from
+    # picking up GA grants they don't care about. Production always has
+    # HIVE_APP_VERSION set by the Electron spawn.
+    monkeypatch.setenv("HIVE_APP_VERSION", "99.0.0")
 
     queen_id = "queen_technology"
     (queens_dir / queen_id).mkdir()
-    (queens_dir / queen_id / "profile.yaml").write_text(
-        yaml.safe_dump({"name": "Alexandra", "title": "Head of Technology"})
-    )
+    (queens_dir / queen_id / "profile.yaml").write_text(yaml.safe_dump({"name": "Alexandra", "title": "Head of Technology"}))
     return queens_dir, queen_id
 
 
@@ -203,14 +341,14 @@ async def test_get_tools_applies_role_default(queen_dir, monkeypatch):
     _, queen_id = queen_dir  # queen_technology — has a role default
 
     manager = _FakeManager()
-    # Seed two MCP servers: files-tools is referenced by the technology
-    # role via the @server:files-tools shorthand in `file_ops`, so its
-    # tools should bubble into the default. unrelated-server is NOT
-    # referenced by any role category — its tools must NOT leak in.
+    # file_ops (in the technology role) grants pdf_read + attach_file by name,
+    # so staging them in the catalog surfaces them in the default.
+    # unrelated-server is NOT referenced by any role category — its tools
+    # must NOT leak in.
     manager._mcp_tool_catalog = {
-        "files-tools": [
-            {"name": "read_file", "description": "", "input_schema": {}},
-            {"name": "edit_file", "description": "", "input_schema": {}},
+        "hive_tools": [
+            {"name": "pdf_read", "description": "", "input_schema": {}},
+            {"name": "attach_file", "description": "", "input_schema": {}},
         ],
         "unrelated-server": [
             {"name": "fluffy_unknown_tool", "description": "", "input_schema": {}},
@@ -225,9 +363,9 @@ async def test_get_tools_applies_role_default(queen_dir, monkeypatch):
 
     assert body["is_role_default"] is True
     enabled = set(body["enabled_mcp_tools"] or [])
-    # @server:files-tools shorthand pulls in every tool under that server.
-    assert "read_file" in enabled
-    assert "edit_file" in enabled
+    # file_ops grants pdf_read + attach_file by name.
+    assert "pdf_read" in enabled
+    assert "attach_file" in enabled
     # Tools registered under a server the role doesn't reference are NOT
     # part of the default.
     assert "fluffy_unknown_tool" not in enabled
@@ -241,9 +379,9 @@ async def test_get_tools_exposes_categories(queen_dir, monkeypatch):
 
     manager = _FakeManager()
     manager._mcp_tool_catalog = {
-        "files-tools": [
-            {"name": "read_file", "description": "", "input_schema": {}},
-            {"name": "edit_file", "description": "", "input_schema": {}},
+        "hive_tools": [
+            {"name": "pdf_read", "description": "", "input_schema": {}},
+            {"name": "attach_file", "description": "", "input_schema": {}},
         ],
     }
 
@@ -263,9 +401,56 @@ async def test_get_tools_exposes_categories(queen_dir, monkeypatch):
     assert cats["spreadsheet_advanced"]["in_role_default"] is False
     # Security was removed from queen_technology defaults.
     assert cats["security"]["in_role_default"] is False
-    # @server:files-tools shorthand expanded against the catalog.
-    assert "read_file" in cats["file_ops"]["tools"]
-    assert "edit_file" in cats["file_ops"]["tools"]
+    # file_ops grants pdf_read + attach_file by name.
+    assert "pdf_read" in cats["file_ops"]["tools"]
+    assert "attach_file" in cats["file_ops"]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_get_tools_live_session_preserves_server_scoped_defaults(queen_dir, monkeypatch):
+    """A live session must use registry server groups, not the flat fallback.
+
+    If the catalog collapses to ``{"MCP Tools": [...]}``, the
+    ``@server:chart-tools`` role-default shorthand cannot expand and the
+    ``charts`` category degrades to empty.
+    """
+    monkeypatch.setattr(routes_queen_tools, "ensure_default_queens", lambda: None)
+    _, queen_id = queen_dir  # queen_technology — has charts in role default
+
+    class _FakeRegistry:
+        _mcp_server_tools = {
+            "chart-tools": {"chart_render", "diagram_render"},
+        }
+
+        def get_full_mcp_catalog(self):
+            return {}
+
+        def get_tools(self):
+            return {name: _tool(name) for name in {"chart_render", "diagram_render"}}
+
+    phase_state = QueenPhaseState(phase="independent")
+    phase_state.independent_tools = [
+        _tool("chart_render"),
+        _tool("diagram_render"),
+    ]
+    phase_state.mcp_tool_names_all = {
+        "chart_render",
+        "diagram_render",
+    }
+    session = _FakeSession(queen_name=queen_id, phase_state=phase_state)
+    session._queen_tool_registry = _FakeRegistry()
+    manager = _FakeManager(_sessions={"sess-1": session})
+
+    app = await _make_app(manager=manager)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(f"/api/queen/{queen_id}/tools")
+        assert resp.status == 200
+        body = await resp.json()
+
+    enabled = set(body["enabled_mcp_tools"] or [])
+    assert {"chart_render", "diagram_render"} <= enabled
+    cats = {c["name"]: c for c in body["categories"]}
+    assert sorted(cats["charts"]["tools"]) == ["chart_render", "diagram_render"]
 
 
 def test_resolve_queen_default_tools_expands_server_shorthand():
@@ -273,16 +458,16 @@ def test_resolve_queen_default_tools_expands_server_shorthand():
     from framework.agents.queen.queen_tools_defaults import resolve_queen_default_tools
 
     catalog = {
-        "files-tools": [
-            {"name": "read_file"},
-            {"name": "write_file"},
+        "chart-tools": [
+            {"name": "chart_render"},
+            {"name": "diagram_render"},
         ],
     }
-    # queen_brand_design uses "file_ops" category → expands via @server:files-tools.
-    result = resolve_queen_default_tools("queen_brand_design", catalog)
+    # queen_technology uses the "charts" category → expands via @server:chart-tools.
+    result = resolve_queen_default_tools("queen_technology", catalog)
     assert result is not None
-    assert "read_file" in result
-    assert "write_file" in result
+    assert "chart_render" in result
+    assert "diagram_render" in result
 
 
 def test_resolve_queen_default_tools_unknown_queen():
@@ -441,12 +626,11 @@ async def test_delete_restores_role_default(queen_dir, monkeypatch):
 
     manager = _FakeManager()
     manager._mcp_tool_catalog = {
-        "files-tools": [
-            {"name": "read_file", "description": "", "input_schema": {}},
-            # pdf_read lives in hive_tools but is named explicitly in the
-            # file_ops category, so we stage it in any server here just to
-            # surface it through the catalog.
+        "hive_tools": [
+            # pdf_read + attach_file are named explicitly in the file_ops
+            # category, so we stage them in the catalog to surface them.
             {"name": "pdf_read", "description": "", "input_schema": {}},
+            {"name": "attach_file", "description": "", "input_schema": {}},
         ],
     }
 
@@ -455,7 +639,7 @@ async def test_delete_restores_role_default(queen_dir, monkeypatch):
         # Seed a custom allowlist first so we have a sidecar to delete.
         resp = await client.patch(
             f"/api/queen/{queen_id}/tools",
-            json={"enabled_mcp_tools": ["read_file"]},
+            json={"enabled_mcp_tools": ["pdf_read"]},
         )
         assert resp.status == 200
         assert tools_path.exists()
@@ -469,10 +653,10 @@ async def test_delete_restores_role_default(queen_dir, monkeypatch):
 
         # The new effective list is the role default for queen_technology;
         # security tools were intentionally removed, so port_scan must NOT
-        # appear, while file_ops members like read_file/pdf_read do.
+        # appear, while file_ops members like pdf_read/attach_file do.
         enabled = set(body["enabled_mcp_tools"] or [])
-        assert "read_file" in enabled
         assert "pdf_read" in enabled
+        assert "attach_file" in enabled
         assert "port_scan" not in enabled
         assert "subdomain_enumerate" not in enabled
 

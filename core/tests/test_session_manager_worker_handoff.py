@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -148,77 +148,3 @@ async def test_stop_session_unsubscribes_worker_handoff() -> None:
         request_id="req-after",
     )
     assert queen_node.inject_event.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_load_worker_core_defaults_to_session_llm_model(monkeypatch, tmp_path) -> None:
-    bus = EventBus()
-    manager = SessionManager(model="manager-default")
-    session_llm = SimpleNamespace(model="queen-shared-model")
-    session = Session(id="session_worker", event_bus=bus, llm=session_llm, loaded_at=0.0)
-
-    runtime = SimpleNamespace(is_running=True)
-    runner = SimpleNamespace(
-        _llm=None,
-        _agent_runtime=runtime,
-        info=MagicMock(return_value={"id": "worker"}),
-    )
-
-    load_calls: list[dict[str, object]] = []
-
-    def fake_load(agent_path, model=None, **kwargs):
-        load_calls.append({"agent_path": agent_path, "model": model, "kwargs": kwargs})
-        return runner
-
-    monkeypatch.setattr("framework.loader.agent_loader.AgentLoader.load", fake_load)
-    monkeypatch.setattr(manager, "_cleanup_stale_active_sessions", lambda *_args: None)
-    monkeypatch.setattr(
-        "framework.tools.queen_lifecycle_tools._read_agent_triggers_json",
-        lambda *_args: [],
-    )
-
-    await manager._load_worker_core(session, tmp_path / "worker_agent")
-
-    assert load_calls[0]["model"] == "queen-shared-model"
-    assert session.runner is runner
-    assert session.runner._llm is session_llm
-
-
-@pytest.mark.asyncio
-async def test_load_worker_core_keeps_explicit_worker_model_override(monkeypatch, tmp_path) -> None:
-    bus = EventBus()
-    manager = SessionManager(model="manager-default")
-    session_llm = SimpleNamespace(model="queen-shared-model")
-    session = Session(id="session_override", event_bus=bus, llm=session_llm, loaded_at=0.0)
-
-    runtime = SimpleNamespace(is_running=True)
-    runner = SimpleNamespace(
-        _llm=None,
-        _agent_runtime=runtime,
-        info=MagicMock(return_value={"id": "worker"}),
-    )
-
-    load_calls: list[dict[str, object]] = []
-
-    def fake_load(agent_path, model=None, **kwargs):
-        load_calls.append({"agent_path": agent_path, "model": model, "kwargs": kwargs})
-        return runner
-
-    monkeypatch.setattr("framework.loader.agent_loader.AgentLoader.load", fake_load)
-    monkeypatch.setattr(manager, "_cleanup_stale_active_sessions", lambda *_args: None)
-    monkeypatch.setattr(
-        "framework.tools.queen_lifecycle_tools._read_agent_triggers_json",
-        lambda *_args: [],
-    )
-
-    await manager._load_worker_core(
-        session,
-        tmp_path / "worker_agent",
-        model="explicit-worker-model",
-    )
-
-    assert load_calls[0]["model"] == "explicit-worker-model"
-    assert session.runner is runner
-    assert session.runner._llm is None
-
-    assert session.worker_path == tmp_path / "worker_agent"

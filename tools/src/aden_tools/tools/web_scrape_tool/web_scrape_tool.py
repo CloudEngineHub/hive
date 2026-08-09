@@ -9,14 +9,19 @@ Validates URLs against internal network ranges to prevent SSRF attacks.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
+import os
 import re
 import socket
+import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
+import httpx
 from bs4 import BeautifulSoup, NavigableString
 from fastmcp import FastMCP
 from playwright.async_api import (
@@ -27,9 +32,40 @@ from playwright.async_api import (
 from playwright_stealth import Stealth
 
 # Browser-like User-Agent for actual page requests
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def _resolve_scrape_artifact_dir() -> Path:
+    """Return the directory where extracted scrape text is written.
+
+    Prefers ``<HIVE_STORAGE_PATH>/data`` (same folder the agent uses for
+    spillover, injected per-agent into MCP subprocess env by the
+    framework's tool_registry).  Falls back to the shared
+    ``<HIVE_HOME>/tool-artifacts`` directory — same folder the browser
+    inspection tools use.  HIVE_HOME respects the desktop shell's
+    override (e.g. macOS userData dir); defaults to ``~/.hive`` for the
+    OSS install.
+    """
+    storage = os.environ.get("HIVE_STORAGE_PATH")
+    if storage:
+        return Path(storage) / "data"
+    hive_home = os.environ.get("HIVE_HOME")
+    base = Path(hive_home).expanduser() if hive_home else Path.home() / ".hive"
+    return base / "tool-artifacts"
+
+
+def _write_scrape_artifact(host: str, raw_text: str) -> Path:
+    """Persist extracted scrape text as raw UTF-8 (no JSON wrapping) and
+    return the absolute path.  Filename: ``web_scrape_<unix_ms>_<host>.txt``.
+    Host is sanitized to a filesystem-safe slug (~60 chars).
+    """
+    out_dir = _resolve_scrape_artifact_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts_ms = int(time.time() * 1000)
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "_", host or "unknown")[:60]
+    path = out_dir / f"web_scrape_{ts_ms}_{safe_host}.txt"
+    path.write_text(raw_text, encoding="utf-8")
+    return path.resolve()
 
 
 def _is_internal_address(raw_ip: str) -> bool:
@@ -42,7 +78,7 @@ def _is_internal_address(raw_ip: str) -> bool:
     return not addr.is_global or addr.is_multicast
 
 
-def _check_url_target(url: str) -> str | None:
+async def _check_url_target(url: str) -> str | None:
     """Resolve a URL's hostname and reject it if any address is non-public.
 
     Returns an error message if blocked, None if safe.
@@ -59,9 +95,14 @@ def _check_url_target(url: str) -> str | None:
     except ValueError:
         pass  # Not an IP literal, resolve below
 
+    # Cap DNS resolution at 5s so a hung resolver can't burn the tool budget.
+    loop = asyncio.get_running_loop()
     try:
-        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except socket.gaierror:
+        results = await asyncio.wait_for(
+            loop.getaddrinfo(hostname, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM),
+            timeout=5.0,
+        )
+    except (TimeoutError, socket.gaierror):
         return f"DNS resolution failed for host: {hostname}"
 
     if not results:
@@ -83,9 +124,7 @@ def register_tools(mcp: FastMCP) -> None:
         url: str,
         selector: str | None = None,
         include_links: bool = False,
-        max_length: int = 50000,
-        offset: int = 0,
-        respect_robots_txt: bool = True,
+        respect_robots_txt: bool = False,
     ) -> dict:
         """
         Scrape and extract text content from a webpage.
@@ -94,52 +133,62 @@ def register_tools(mcp: FastMCP) -> None:
         Use when you need to read the content of a specific URL,
         extract data from a website, or read articles/documentation.
 
+        The extracted text body is **written to a file on disk** rather
+        than returned inline — JSON-wrapping multi-KB page text escapes
+        every newline and quote, which poisons the agent's context. The
+        response carries only metadata (title, description, headings,
+        structured data, links) plus ``saved_to`` pointing at the raw
+        text file. Use ``terminal_exec("cat <saved_to>")`` (page large
+        output via ``terminal_output_get``) or ``terminal_rg`` on
+        ``saved_to`` to inspect the body. Length is reported via
+        ``total_length``.
+
         Args:
             url: URL of the webpage to scrape
             selector: CSS selector to target specific content (e.g., 'article', '.main-content')
             include_links: When True, links are inlined as `[text](url)` in
-                content and also returned as a `links` list
-            max_length: Maximum length of extracted text returned in this call (1000-500000)
-            offset: Character offset into the extracted text. Use with
-                `next_offset` from a prior truncated result to paginate.
-            respect_robots_txt: Whether to respect robots.txt rules (default True)
+                the saved body and also returned as a `links` list
+            respect_robots_txt: Whether to respect robots.txt rules (default False —
+                operator has authorization for these one-off, low-volume fetches;
+                pass True to re-enable the check for a given call)
 
         Returns:
             Dict with: url, final_url, title, description, page_type
-            (article|listing|page), content, length, offset, total_length,
-            truncated, next_offset, headings, structured_data (json_ld + open_graph),
-            and optionally links. On error, returns {"error": str, ...} with a hint when applicable.
+            (article|listing|page), total_length, saved_to, headings,
+            structured_data (json_ld + open_graph), and optionally links.
+            On error, returns {"error": str, ...} with a hint when applicable.
         """
         try:
             # Validate URL
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
 
-            # Validate max_length
-            max_length = max(1000, min(max_length, 500000))
-
             # SSRF check: validate URL before making any request (must run
             # before robots.txt fetch, which also makes a network request)
-            block_reason = _check_url_target(url)
+            block_reason = await _check_url_target(url)
             if block_reason is not None:
                 return {"error": block_reason, "blocked_by_ssrf_protection": True, "url": url}
 
-            # Check robots.txt before launching browser
+            # Check robots.txt before launching browser. RobotFileParser.read()
+            # has no timeout — fetch via httpx with a 5s cap so a slow host
+            # can't burn the tool budget here.
             if respect_robots_txt:
                 try:
                     parsed = urlparse(url)
                     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-                    rp = RobotFileParser()
-                    rp.set_url(robots_url)
-                    rp.read()
-                    if not rp.can_fetch(BROWSER_USER_AGENT, url):
-                        return {
-                            "error": f"Blocked by robots.txt: {url}",
-                            "url": url,
-                            "skipped": True,
-                            "hint": ("Pass respect_robots_txt=False if you have authorization to scrape this site."),
-                        }
-                except Exception:
+                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+                        resp = await client.get(robots_url, headers={"User-Agent": BROWSER_USER_AGENT})
+                    if resp.status_code < 400:
+                        rp = RobotFileParser()
+                        rp.parse(resp.text.splitlines())
+                        if not rp.can_fetch(BROWSER_USER_AGENT, url):
+                            return {
+                                "error": f"Blocked by robots.txt: {url}",
+                                "url": url,
+                                "skipped": True,
+                                "hint": ("Pass respect_robots_txt=False if you have authorization to scrape this site."),
+                            }
+                except (httpx.HTTPError, ValueError):
                     pass  # If robots.txt can't be fetched, proceed anyway
 
             # Launch headless browser with stealth
@@ -177,7 +226,7 @@ def register_tools(mcp: FastMCP) -> None:
                             await route.continue_()
                             return
 
-                        block = _check_url_target(req_url)
+                        block = await _check_url_target(req_url)
                         if block is not None:
                             ssrf_blocked = {
                                 "error": block,
@@ -190,10 +239,13 @@ def register_tools(mcp: FastMCP) -> None:
 
                     await page.route("**/*", _ssrf_route_handler)
 
+                    # Cap goto at 30s so its own PlaywrightTimeout fires
+                    # inside the 60s agent-loop budget — letting the outer
+                    # timeout win leaks the browser subprocess.
                     response = await page.goto(
                         url,
                         wait_until="domcontentloaded",
-                        timeout=60000,
+                        timeout=30000,
                     )
 
                     # Check if a redirect was blocked by SSRF protection
@@ -374,16 +426,23 @@ def register_tools(mcp: FastMCP) -> None:
                         blank = True
                 text = "\n".join(cleaned).strip()
 
-            # Apply offset/truncation with continuation metadata. Reserve 3
-            # chars for the ellipsis so the returned string stays within
-            # max_length (back-compat with existing test expectations).
+            # Persist the extracted body to disk rather than embedding
+            # it in the JSON response. A JSON-wrapped multi-KB page text
+            # escapes every newline and quote, which is noisy and
+            # token-hostile for the agent. The response carries only
+            # metadata + the file path; the agent reads/greps the file
+            # on demand.
             total_length = len(text)
-            offset = max(0, min(offset, total_length))
-            end = offset + max_length
-            truncated = end < total_length
-            sliced = text[offset:end]
-            if truncated and len(sliced) >= 3:
-                sliced = sliced[:-3] + "..."
+            saved_to: str | None = None
+            if total_length > 0:
+                try:
+                    host = urlparse(base_url).hostname or urlparse(url).hostname or "unknown"
+                    saved_to = str(_write_scrape_artifact(host, text))
+                except OSError as write_err:
+                    return {
+                        "error": f"Failed to write scrape artifact: {write_err}",
+                        "url": url,
+                    }
 
             structured_data: dict[str, Any] = {}
             if json_ld:
@@ -397,12 +456,8 @@ def register_tools(mcp: FastMCP) -> None:
                 "title": title,
                 "description": description,
                 "page_type": page_type,
-                "content": sliced,
-                "length": len(sliced),
-                "offset": offset,
                 "total_length": total_length,
-                "truncated": truncated,
-                "next_offset": end if truncated else None,
+                "saved_to": saved_to,
                 "headings": headings,
             }
             if structured_data:

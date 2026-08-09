@@ -43,9 +43,10 @@ class TestSkillContentProtection:
         """Skill content messages are skipped by prune_old_tool_results."""
         conv = _make_conversation()
 
-        # Add many regular tool results to push over prune threshold
+        # Add many regular tool results to push over prune threshold. Give them
+        # a spill path so they're recoverable (and therefore pruneable).
         for _ in range(30):
-            await _add_tool_msg(conv, "x" * 500)  # ~125 tokens each
+            await _add_tool_msg(conv, "x" * 500, spillover_path="/data/r.txt")  # ~125 tokens each
 
         # Add a skill content message
         skill_msg = await _add_tool_msg(
@@ -68,7 +69,7 @@ class TestSkillContentProtection:
         conv = _make_conversation()
 
         for _ in range(20):
-            await _add_tool_msg(conv, "regular tool output " * 50)
+            await _add_tool_msg(conv, "regular tool output " * 50, spillover_path="/data/r.txt")
 
         pruned = await conv.prune_old_tool_results(protect_tokens=500, min_prune_tokens=100)
 

@@ -81,9 +81,7 @@ def register_tools(mcp: FastMCP) -> None:
                     {
                         "severity": "critical",
                         "finding": f"SSL certificate verification failed: {e}",
-                        "remediation": (
-                            "Obtain a valid certificate from a trusted CA. Let's Encrypt provides free certificates."
-                        ),
+                        "remediation": ("Obtain a valid certificate from a trusted CA. Let's Encrypt provides free certificates."),
                     }
                 )
 
@@ -151,9 +149,7 @@ def register_tools(mcp: FastMCP) -> None:
                 {
                     "severity": "high",
                     "finding": f"Weak cipher suite: {cipher_name}",
-                    "remediation": (
-                        "Configure your server to use strong cipher suites only. Prefer AES-GCM and ChaCha20-Poly1305."
-                    ),
+                    "remediation": ("Configure your server to use strong cipher suites only. Prefer AES-GCM and ChaCha20-Poly1305."),
                 }
             )
         if cipher_bits and cipher_bits < 128:
@@ -195,9 +191,7 @@ def register_tools(mcp: FastMCP) -> None:
                 {
                     "severity": "high",
                     "finding": "Self-signed certificate detected",
-                    "remediation": (
-                        "Replace with a certificate from a trusted CA. Let's Encrypt provides free certificates."
-                    ),
+                    "remediation": ("Replace with a certificate from a trusted CA. Let's Encrypt provides free certificates."),
                 }
             )
 

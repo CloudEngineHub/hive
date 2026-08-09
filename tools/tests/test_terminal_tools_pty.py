@@ -74,7 +74,9 @@ def test_raw_send_then_read_only(pty_tools):
         )
         pty_tools["run"](session_id=sid, command="x = 7\n", raw_send=True)
         pty_tools["run"](session_id=sid, command="print(x*x)\n", raw_send=True)
-        time.sleep(0.5)
+        # drain() settles on quiet output; a small lead-in is enough for the
+        # REPL bytes to start flowing so the first 50ms poll sees activity.
+        time.sleep(0.1)
         drained = pty_tools["run"](session_id=sid, read_only=True, timeout_sec=2)
         assert "49" in drained["output"]
     finally:
@@ -91,15 +93,16 @@ def test_session_busy(pty_tools):
         results = []
 
         def run_long():
-            results.append(pty_tools["run"](session_id=sid, command="sleep 2", timeout_sec=5))
+            results.append(pty_tools["run"](session_id=sid, command="sleep 0.5", timeout_sec=3))
 
         t = threading.Thread(target=run_long)
         t.start()
-        time.sleep(0.2)
-        # Concurrent call should fail
+        # Just enough delay for run() to acquire the busy-lock; the busy check
+        # is non-blocking so we don't need the full sleep duration here.
+        time.sleep(0.1)
         result = pty_tools["run"](session_id=sid, command="echo nope", timeout_sec=1)
         assert "error" in result and "busy" in result["error"].lower()
-        t.join(timeout=10)
+        t.join(timeout=3)
     finally:
         pty_tools["close"](session_id=sid, force=True)
 

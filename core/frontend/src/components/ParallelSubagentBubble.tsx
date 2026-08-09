@@ -373,13 +373,13 @@ const ParallelSubagentBubble = memo(
 
     return (
       <div className="flex gap-3">
-        {/* Left icon — subagents aren't top-level colony workers, so the
+        {/* Left icon — subagents aren't top-level colony, so the
             click opens the sidebar without pre-selection. */}
         <button
           type="button"
           onClick={() => openColonyWorkers()}
-          aria-label="Open colony workers sidebar"
-          title="Open colony workers sidebar"
+          aria-label="Open colony sidebar"
+          title="Open colony sidebar"
           className="flex-shrink-0 w-7 h-7 rounded-xl flex items-center justify-center mt-1 transition-opacity hover:opacity-80 cursor-pointer"
           style={{
             backgroundColor: `${workerColor}18`,

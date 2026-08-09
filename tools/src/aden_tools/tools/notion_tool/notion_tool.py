@@ -36,10 +36,25 @@ class BlockType(StrEnum):
     CALLOUT = "callout"
 
 
-def _get_credentials(credentials: CredentialStoreAdapter | None) -> str | None:
-    """Return the Notion integration token."""
+def _get_credentials(
+    credentials: CredentialStoreAdapter | None,
+    account: str = "",
+) -> str | None:
+    """Return the Notion integration token.
+
+    ``account`` selects a specific authorized workspace alias when more
+    than one Notion account is connected. Empty falls through to the
+    default lookup, which under queen strict-account-mode raises
+    ``AccountSelectionRequiredError`` so the LLM can ask the user.
+    """
     if credentials is not None:
-        return credentials.get("notion_token")
+        # Spec id was renamed from ``notion_token`` to ``notion`` so it
+        # matches the OAuth provider name and the credentials-store
+        # provider index. Tools that still asked for ``notion_token``
+        # would hit "Unknown credential" even after a successful auth.
+        if account:
+            return credentials.get_by_alias("notion", account)
+        return credentials.get("notion")
     return os.getenv("NOTION_API_TOKEN")
 
 
@@ -104,6 +119,7 @@ def register_tools(
         query: str = "",
         filter_type: str = "",
         page_size: int = 20,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Search Notion pages and databases.
@@ -112,11 +128,12 @@ def register_tools(
             query: Search text to match against titles (optional, empty = all)
             filter_type: Filter by object type: page or database (optional)
             page_size: Max results (1-100, default 20)
+            account: Workspace alias when multiple Notion accounts authorized (optional)
 
         Returns:
             Dict with matching pages/databases (id, title, type, url)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
 
@@ -154,7 +171,7 @@ def register_tools(
         return {"results": results, "count": len(results), "has_more": data.get("has_more", False)}
 
     @mcp.tool()
-    def notion_get_page(page_id: str) -> dict[str, Any]:
+    def notion_get_page(page_id: str, account: str = "") -> dict[str, Any]:
         """
         Get a Notion page by ID.
 
@@ -164,7 +181,7 @@ def register_tools(
         Returns:
             Dict with page details (id, title, properties, url)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not page_id:
@@ -220,6 +237,7 @@ def register_tools(
         title_property: str = "",
         properties_json: str = "",
         content: str = "",
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Create a new page in a Notion database or as a child of another page.
@@ -244,7 +262,7 @@ def register_tools(
         """
         import json as json_mod
 
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not title:
@@ -260,8 +278,7 @@ def register_tools(
             case (True, False):
                 if not title_property:
                     return {
-                        "error": "title_property is required when using parent_database_id. "
-                        "Use notion_get_database to find the title column name.",
+                        "error": "title_property is required when using parent_database_id. Use notion_get_database to find the title column name.",
                     }
                 body["parent"] = {"database_id": parent_database_id}
                 body["properties"] = {
@@ -305,6 +322,7 @@ def register_tools(
         sorts_json: str = "",
         start_cursor: str = "",
         page_size: int = 50,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Query rows/pages from a Notion database.
@@ -325,7 +343,7 @@ def register_tools(
         """
         import json as json_mod
 
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not database_id:
@@ -374,7 +392,7 @@ def register_tools(
         }
 
     @mcp.tool()
-    def notion_get_database(database_id: str) -> dict[str, Any]:
+    def notion_get_database(database_id: str, account: str = "") -> dict[str, Any]:
         """
         Get a Notion database schema.
 
@@ -384,7 +402,7 @@ def register_tools(
         Returns:
             Dict with database info and property definitions
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not database_id:
@@ -415,6 +433,7 @@ def register_tools(
         parent_page_id: str,
         title: str,
         properties_json: str = "",
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Create a new database as a child of an existing page.
@@ -433,7 +452,7 @@ def register_tools(
         """
         import json as json_mod
 
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not parent_page_id or not title:
@@ -472,6 +491,7 @@ def register_tools(
         title: str = "",
         properties_json: str = "",
         archived: bool | None = None,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Update a database's title, properties, or archive it.
@@ -490,7 +510,7 @@ def register_tools(
         """
         import json as json_mod
 
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not database_id:
@@ -528,6 +548,7 @@ def register_tools(
         page_id: str,
         properties_json: str = "",
         archived: bool | None = None,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Update a Notion page's properties.
@@ -544,7 +565,7 @@ def register_tools(
         """
         import json as json_mod
 
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not page_id:
@@ -578,6 +599,7 @@ def register_tools(
     def notion_get_block_children(
         block_id: str,
         page_size: int = 50,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Get child blocks (content) of a page or block.
@@ -589,7 +611,7 @@ def register_tools(
         Returns:
             Dict with block content (type, text, children indicator)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not block_id:
@@ -624,7 +646,7 @@ def register_tools(
         }
 
     @mcp.tool()
-    def notion_get_block(block_id: str) -> dict[str, Any]:
+    def notion_get_block(block_id: str, account: str = "") -> dict[str, Any]:
         """
         Retrieve a single block by ID.
 
@@ -634,7 +656,7 @@ def register_tools(
         Returns:
             Dict with block details (id, type, text, has_children)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not block_id:
@@ -667,6 +689,7 @@ def register_tools(
         content: str = "",
         block_type: str = "",
         archived: bool | None = None,
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Update a block's content or archive it.
@@ -683,7 +706,7 @@ def register_tools(
         Returns:
             Dict with updated block info (id, type, status)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not block_id:
@@ -724,7 +747,7 @@ def register_tools(
         }
 
     @mcp.tool()
-    def notion_delete_block(block_id: str) -> dict[str, Any]:
+    def notion_delete_block(block_id: str, account: str = "") -> dict[str, Any]:
         """
         Delete a block (moves to trash).
 
@@ -734,7 +757,7 @@ def register_tools(
         Returns:
             Dict with deleted block info (id, status)
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not block_id:
@@ -754,6 +777,7 @@ def register_tools(
         block_id: str,
         content: str,
         block_type: str = "paragraph",
+        account: str = "",
     ) -> dict[str, Any]:
         """
         Append content blocks to a page or block.
@@ -770,7 +794,7 @@ def register_tools(
         Returns:
             Dict with appended block info or error
         """
-        token = _get_credentials(credentials)
+        token = _get_credentials(credentials, account)
         if not token:
             return _auth_error()
         if not block_id or not content:

@@ -30,9 +30,7 @@ class SubagentJudge:
         remaining = self._max_iterations - iteration - 1
 
         if remaining <= 3:
-            urgency = (
-                f"URGENT: Only {remaining} iterations left. Stop all other work and call set_output NOW for: {missing}"
-            )
+            urgency = f"URGENT: Only {remaining} iterations left. Stop all other work and call set_output NOW for: {missing}"
         elif remaining <= self._max_iterations // 2:
             urgency = f"WARNING: {remaining} iterations remaining. You must call set_output for: {missing}"
         else:
@@ -89,9 +87,7 @@ async def judge_turn(
             "iteration": iteration,
             "conversation_summary": conversation.export_summary(),
             "output_keys": ctx.agent_spec.output_keys,
-            "missing_keys": get_missing_output_keys_fn(
-                accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys
-            ),
+            "missing_keys": get_missing_output_keys_fn(accumulator, ctx.agent_spec.output_keys, ctx.agent_spec.nullable_output_keys),
         }
         verdict = await judge.evaluate(context)
         # Ensure evaluated RETRY always carries feedback for logging.
@@ -110,10 +106,7 @@ async def judge_turn(
     if missing:
         return JudgeVerdict(
             action="RETRY",
-            feedback=(
-                f"Task incomplete. Required outputs not yet produced: {missing}. "
-                f"Follow your system prompt instructions to complete the work."
-            ),
+            feedback=(f"Task incomplete. Required outputs not yet produced: {missing}. Follow your system prompt instructions to complete the work."),
         )
 
     # All output keys present — run safety checks before accepting.

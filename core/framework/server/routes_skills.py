@@ -1,23 +1,28 @@
-"""HTTP routes for per-queen / per-colony skill control + aggregated library.
+"""HTTP routes for per-queen skill control + aggregated library.
 
-Three parallel surfaces:
+Two surfaces:
 
 1. Per-queen routes
    GET    /api/queen/{queen_id}/skills
    POST   /api/queen/{queen_id}/skills
    PATCH  /api/queen/{queen_id}/skills/{skill_name}
+   GET    /api/queen/{queen_id}/skills/{skill_name}/body
    PUT    /api/queen/{queen_id}/skills/{skill_name}/body
+   POST   /api/queen/{queen_id}/skills/{skill_name}/rename
    DELETE /api/queen/{queen_id}/skills/{skill_name}
    POST   /api/queen/{queen_id}/skills/reload
 
-2. Per-colony routes (same shape, but keyed by colony_name)
-   GET / POST / PATCH / PUT / DELETE / reload
-
-3. Aggregated library (powers the Skills Library page)
+2. Aggregated library (powers the Skills Library page)
    GET   /api/skills           -- full catalog + inversion (visible_to.*)
    GET   /api/skills/{name}    -- full body + file listing for drawer view
    GET   /api/skills/scopes    -- {queens: [...], colonies: [...]}
    POST  /api/skills/upload    -- multipart (.md or .zip) into a named scope
+
+Skills are configured per queen only. Colonies inherit their owning
+queen's override store; colony-authored skills (written by
+``create_colony`` / ``write_skill`` into ``{colony_dir}/skills``) still
+surface via the ``colony_ui`` extra scope, but there is no per-colony
+override store anymore.
 
 Live managers are reloaded when an override mutation occurs so in-flight
 queens/workers pick up the new catalog on their next iteration via the
@@ -37,13 +42,8 @@ from typing import Any
 
 from aiohttp import web
 
+from framework.cloud_sync_hooks import schedule_push
 from framework.config import COLONIES_DIR, QUEENS_DIR
-from framework.skills.authoring import (
-    build_draft,
-    remove_skill as authoring_remove_skill,
-    validate_skill_name,
-    write_skill,
-)
 from framework.skills.discovery import DiscoveryConfig, ExtraScope, SkillDiscovery
 from framework.skills.manager import SkillsManager, SkillsManagerConfig
 from framework.skills.overrides import (
@@ -53,6 +53,12 @@ from framework.skills.overrides import (
     utc_now,
 )
 from framework.skills.parser import ParsedSkill
+from framework.skills.skill_writer import (
+    build_draft,
+    remove_skill as authoring_remove_skill,
+    validate_skill_name,
+    write_skill,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +78,15 @@ _ZIP_MAGIC = b"PK\x03\x04"
 class SkillScope:
     """Everything a handler needs to mutate a scope's skill surface."""
 
-    kind: str  # "queen" | "colony"
-    target_id: str  # queen_id or colony_name
+    kind: str  # "queen"
+    target_id: str  # queen_id
     write_dir: Path  # where SKILL.md folders live
     overrides_path: Path  # where the JSON store lives
     store: SkillOverrideStore
     # Live runtimes whose SkillsManager must be reloaded on mutation.
     affected_runtimes: list = field(default_factory=list)
-    # The SkillsManager used by GET to enumerate skills. Queen scope
-    # prefers a live DM session's manager; colony scope uses the colony
-    # runtime. When no runtime is live we build an ad-hoc manager.
+    # The SkillsManager used by GET to enumerate skills. When no runtime
+    # is live we build an ad-hoc manager.
     manager: SkillsManager | None = None
 
 
@@ -163,81 +168,40 @@ def _queen_scope(manager: Any, queen_id: str) -> SkillScope | None:
     )
 
 
-def _colony_scope(manager: Any, colony_name: str) -> SkillScope | None:
-    colony_home = COLONIES_DIR / colony_name
-    if not colony_home.is_dir():
-        return None
-    # Read colony metadata to find the owning queen, so cascades and
-    # inherited-from-queen listing work on GET.
-    queen_id: str | None = None
-    try:
-        from framework.host.colony_metadata import load_colony_metadata
+def _all_scope_extras() -> list[ExtraScope]:
+    """ExtraScopes covering every queen_ui and colony_ui skills dir.
 
-        meta = load_colony_metadata(colony_name)
-        queen_id = meta.get("queen_name") or None
-    except Exception:
-        logger.debug("colony metadata lookup failed for %s", colony_name, exc_info=True)
-
-    overrides_path = colony_home / "skills_overrides.json"
-    store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{colony_name}")
-    write_dir = colony_home / "skills"
-
-    admin_manager = _build_admin_manager(queen_id=queen_id, colony_name=colony_name)
-
-    runtimes: list = []
-    try:
-        for colony in manager.iter_colony_runtimes(colony_name=colony_name):  # type: ignore[union-attr]
-            runtimes.append(colony)
-    except Exception:
-        logger.debug("colony scope: live manager lookup failed", exc_info=True)
-
-    return SkillScope(
-        kind="colony",
-        target_id=colony_name,
-        write_dir=write_dir,
-        overrides_path=overrides_path,
-        store=store,
-        affected_runtimes=runtimes,
-        manager=admin_manager,
-    )
+    Mirrors the scope set built inline by ``handle_list_all_skills`` so that a
+    skill surfaced in the aggregated catalog is also resolvable by name in the
+    detail endpoint. Keep the two in sync.
+    """
+    _ensure_queens_known()
+    extras: list[ExtraScope] = []
+    if QUEENS_DIR.is_dir():
+        for qid in sorted(p.name for p in QUEENS_DIR.glob("*") if (p / "profile.yaml").exists()):
+            extras.append(ExtraScope(directory=QUEENS_DIR / qid / "skills", label="queen_ui", priority=2))
+    if COLONIES_DIR.is_dir():
+        for cn in sorted(p.name for p in COLONIES_DIR.iterdir() if p.is_dir()):
+            extras.append(ExtraScope(directory=COLONIES_DIR / cn / "skills", label="colony_ui", priority=3))
+            extras.append(ExtraScope(directory=COLONIES_DIR / cn / ".hive" / "skills", label="colony_ui", priority=3))
+    return extras
 
 
 def _build_admin_manager(
     *,
     queen_id: str | None = None,
-    colony_name: str | None = None,
+    extra_scopes: list[ExtraScope] | None = None,
 ) -> SkillsManager:
-    """Build a read-only SkillsManager for GET when no live session exists.
-
-    Intentionally leaves ``project_root`` unset even for a colony: the
-    colony's ``skills/`` directory (and the legacy ``.hive/skills/`` for
-    pre-flatten colonies) is surfaced via the ``colony_ui`` extra scope.
-    Routing it through ``project_root`` would double-scan the same dir,
-    and last-wins collision resolution would retag the skills as
-    ``source_scope="project"`` — which flips the provenance fallback to
-    ``PROJECT_DROPPED`` and drops ``editable`` to ``False`` for anything
-    without an explicit override-store entry.
-    """
-    extras: list[ExtraScope] = []
+    """Build a read-only SkillsManager for GET when no live session exists."""
+    extras: list[ExtraScope] = list(extra_scopes or [])
     queen_overrides_path: Path | None = None
-    colony_overrides_path: Path | None = None
     if queen_id:
         queen_home = QUEENS_DIR / queen_id
         queen_overrides_path = queen_home / "skills_overrides.json"
         extras.append(ExtraScope(directory=queen_home / "skills", label="queen_ui", priority=2))
-    if colony_name:
-        colony_home = COLONIES_DIR / colony_name
-        colony_overrides_path = colony_home / "skills_overrides.json"
-        # Surface both the new flat path (where new skills are written) and
-        # the legacy nested path (left intact for pre-flatten colonies). UI
-        # writes always target the flat path; reads see both.
-        extras.append(ExtraScope(directory=colony_home / "skills", label="colony_ui", priority=3))
-        extras.append(ExtraScope(directory=colony_home / ".hive" / "skills", label="colony_ui", priority=3))
     cfg = SkillsManagerConfig(
         queen_id=queen_id,
         queen_overrides_path=queen_overrides_path,
-        colony_name=colony_name,
-        colony_overrides_path=colony_overrides_path,
         extra_scope_dirs=extras,
         project_root=None,
         skip_community_discovery=True,
@@ -263,7 +227,6 @@ _EDITABLE_PROVENANCE = {
 def _resolve_provenance(
     skill: ParsedSkill,
     queen_store: SkillOverrideStore | None,
-    colony_store: SkillOverrideStore | None,
 ) -> tuple[Provenance, OverrideEntry | None]:
     """Override-store entry wins, otherwise fall back to source_scope inference.
 
@@ -276,10 +239,8 @@ def _resolve_provenance(
     # framework scope was written by the old buggy PATCH handler; treat it
     # like OTHER so the inference below reports an honest provenance.
     store_entry: OverrideEntry | None = None
-    for store in (colony_store, queen_store):
-        if store is None:
-            continue
-        entry = store.get(skill.name)
+    if queen_store is not None:
+        entry = queen_store.get(skill.name)
         if entry is not None:
             store_entry = entry
             stamped = entry.provenance
@@ -290,7 +251,6 @@ def _resolve_provenance(
                 stamped = Provenance.OTHER
             if stamped != Provenance.OTHER:
                 return stamped, entry
-            break
     # Infer from scope label. ``colony_ui`` with no informative entry
     # is only reachable via create_colony() since the UI POST path
     # always stamps USER_UI_CREATED.
@@ -310,25 +270,21 @@ def _resolve_provenance(
 def _effective_enabled(
     skill: ParsedSkill,
     queen_store: SkillOverrideStore | None,
-    colony_store: SkillOverrideStore | None,
 ) -> bool:
     # Mirrors ``SkillsManager._apply_overrides`` so the UI's "enabled" column
-    # matches what the queen actually sees in her prompt. Colony explicit wins
-    # over queen explicit; either explicit wins over preset-off-by-default and
-    # over the ``all_defaults_disabled`` master switch.
-    for store in (colony_store, queen_store):
-        if store is None:
-            continue
-        entry = store.get(skill.name)
+    # matches what the queen actually sees in her prompt. An explicit entry
+    # wins over preset-off-by-default and over the ``all_defaults_disabled``
+    # master switch.
+    if queen_store is not None:
+        entry = queen_store.get(skill.name)
         if entry is not None and entry.enabled is not None:
             return entry.enabled
     # Preset-scope capability packs ship OFF; they only appear in the queen's
-    # catalog after an explicit per-queen/colony opt-in.
+    # catalog after an explicit per-queen opt-in.
     if skill.source_scope == "preset":
         return False
-    for store in (colony_store, queen_store):
-        if store is not None and store.all_defaults_disabled and skill.source_scope == "framework":
-            return False
+    if queen_store is not None and queen_store.all_defaults_disabled and skill.source_scope == "framework":
+        return False
     return True
 
 
@@ -336,16 +292,15 @@ def _serialize_skill(
     skill: ParsedSkill,
     *,
     queen_store: SkillOverrideStore | None,
-    colony_store: SkillOverrideStore | None,
 ) -> dict[str, Any]:
-    provenance, entry = _resolve_provenance(skill, queen_store, colony_store)
+    provenance, entry = _resolve_provenance(skill, queen_store)
     editable = provenance in _EDITABLE_PROVENANCE
     return {
         "name": skill.name,
         "description": skill.description,
         "source_scope": skill.source_scope,
         "provenance": str(provenance),
-        "enabled": _effective_enabled(skill, queen_store, colony_store),
+        "enabled": _effective_enabled(skill, queen_store),
         "editable": editable,
         "deletable": editable,
         "location": skill.location,
@@ -372,54 +327,13 @@ async def handle_list_queen_skills(request: web.Request) -> web.Response:
         return web.json_response({"error": f"queen '{queen_id}' not found"}, status=404)
     mgr = scope.manager
     assert mgr is not None
-    skills = [
-        _serialize_skill(s, queen_store=scope.store, colony_store=None) for s in mgr.enumerate_skills_with_source()
-    ]
+    skills = [_serialize_skill(s, queen_store=scope.store) for s in mgr.enumerate_skills_with_source()]
     skills.sort(key=lambda r: r["name"])
     return web.json_response(
         {
             "queen_id": queen_id,
             "all_defaults_disabled": scope.store.all_defaults_disabled,
             "skills": skills,
-        }
-    )
-
-
-async def handle_list_colony_skills(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    colony_name = request.match_info["colony_name"]
-    scope = _colony_scope(manager, colony_name)
-    if scope is None:
-        return web.json_response({"error": f"colony '{colony_name}' not found"}, status=404)
-    mgr = scope.manager
-    assert mgr is not None
-    # Queen store contributes cascade inheritance — load it so provenance /
-    # enabled resolution matches what the colony actually sees.
-    queen_store = None
-    queen_id: str | None = None
-    try:
-        from framework.host.colony_metadata import load_colony_metadata
-
-        queen_id = load_colony_metadata(colony_name).get("queen_name") or None
-    except Exception:
-        queen_id = None
-    if queen_id:
-        queen_store = SkillOverrideStore.load(
-            QUEENS_DIR / queen_id / "skills_overrides.json",
-            scope_label=f"queen:{queen_id}",
-        )
-
-    all_skills = mgr.enumerate_skills_with_source()
-    rows = [_serialize_skill(s, queen_store=queen_store, colony_store=scope.store) for s in all_skills]
-    rows.sort(key=lambda r: r["name"])
-    inherited = [s.name for s in all_skills if s.source_scope == "queen_ui"]
-    return web.json_response(
-        {
-            "colony_name": colony_name,
-            "queen_id": queen_id,
-            "all_defaults_disabled": scope.store.all_defaults_disabled,
-            "skills": rows,
-            "inherited_from_queen": sorted(inherited),
         }
     )
 
@@ -433,12 +347,10 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
     """Global catalog: every skill in every scope + inversion ``visible_to``."""
     # Enumerate queens and colonies by walking the standard dirs.
     _ensure_queens_known()
-    queen_ids = (
-        sorted(p.name for p in QUEENS_DIR.glob("*") if (p / "profile.yaml").exists()) if QUEENS_DIR.is_dir() else []
-    )
-    colony_names: list[str] = []
+    queen_ids = sorted(p.name for p in QUEENS_DIR.glob("*") if (p / "profile.yaml").exists()) if QUEENS_DIR.is_dir() else []
+    colony_ids: list[str] = []
     if COLONIES_DIR.is_dir():
-        colony_names = sorted(p.name for p in COLONIES_DIR.iterdir() if p.is_dir())
+        colony_ids = sorted(p.name for p in COLONIES_DIR.iterdir() if p.is_dir())
 
     # Build one admin manager that covers every scope — expensive on cold
     # boot but cached thanks to the parser's per-file reads being cheap.
@@ -451,7 +363,7 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
     # .hive/skills/ for pre-flatten colonies) as tagged extra scopes
     # instead. That keeps the xml-catalog-per-scope invariant intact
     # without requiring N managers.
-    for cn in colony_names:
+    for cn in colony_ids:
         extras.append(
             ExtraScope(
                 directory=COLONIES_DIR / cn / "skills",
@@ -472,17 +384,13 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
     discovery = SkillDiscovery(DiscoveryConfig(project_root=None, skip_framework_scope=False, extra_scopes=extras))
     discovered = discovery.discover()
 
-    # Load all stores once.
+    # Load all stores once. Colonies have no store of their own — they
+    # inherit their owning queen's, so visibility is queen-level only.
     queen_stores: dict[str, SkillOverrideStore] = {
-        qid: SkillOverrideStore.load(QUEENS_DIR / qid / "skills_overrides.json", scope_label=f"queen:{qid}")
-        for qid in queen_ids
+        qid: SkillOverrideStore.load(QUEENS_DIR / qid / "skills_overrides.json", scope_label=f"queen:{qid}") for qid in queen_ids
     }
-    colony_stores: dict[str, SkillOverrideStore] = {}
     colony_queens: dict[str, str | None] = {}
-    for cn in colony_names:
-        colony_stores[cn] = SkillOverrideStore.load(
-            COLONIES_DIR / cn / "skills_overrides.json", scope_label=f"colony:{cn}"
-        )
+    for cn in colony_ids:
         try:
             from framework.host.colony_metadata import load_colony_metadata
 
@@ -517,21 +425,20 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
         visible_queens: list[str] = []
         visible_colonies: list[str] = []
         for qid, qstore in queen_stores.items():
-            if _effective_enabled(skill, qstore, None):
+            if _effective_enabled(skill, qstore):
                 visible_queens.append(qid)
-        for cn, cstore in colony_stores.items():
-            qstore = queen_stores.get(colony_queens.get(cn) or "", None)
-            if _effective_enabled(skill, qstore, cstore):
+        # A colony sees whatever its owning queen sees.
+        for cn, qid in colony_queens.items():
+            qstore = queen_stores.get(qid or "", None)
+            if _effective_enabled(skill, qstore):
                 visible_colonies.append(cn)
 
-        # Provenance: choose the nearest owning store's record if any.
+        # Provenance: choose the owning queen's store record if any.
         owner = _owner_for(skill)
         prov_store: SkillOverrideStore | None = None
         if owner and owner["type"] == "queen":
             prov_store = queen_stores.get(owner["id"])
-        elif owner and owner["type"] == "colony":
-            prov_store = colony_stores.get(owner["id"])
-        provenance, entry = _resolve_provenance(skill, prov_store, None)
+        provenance, entry = _resolve_provenance(skill, prov_store)
         editable = provenance in _EDITABLE_PROVENANCE
         rows.append(
             {
@@ -553,7 +460,7 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
         {
             "skills": rows,
             "queens": [{"id": q, "name": q} for q in queen_ids],
-            "colonies": [{"name": c, "queen_id": colony_queens.get(c)} for c in colony_names],
+            "colonies": [{"name": c, "queen_id": colony_queens.get(c)} for c in colony_ids],
         }
     )
 
@@ -564,7 +471,10 @@ async def handle_get_skill_detail(request: web.Request) -> web.Response:
     name, err = validate_skill_name(skill_name)
     if err or name is None:
         return web.json_response({"error": err}, status=400)
-    manager = _build_admin_manager()
+    # Scan every scope (framework/preset/user + all queen_ui/colony_ui dirs) so
+    # that skills authored into a queen or colony — which appear in the catalog
+    # listing — are also resolvable here. Without the extra scopes this 404s.
+    manager = _build_admin_manager(extra_scopes=_all_scope_extras())
     for s in manager.enumerate_skills_with_source():
         if s.name == name:
             # Re-read body so we get the freshest content (the cached
@@ -741,6 +651,104 @@ async def _handle_put_body(scope: SkillScope, skill_name: str, payload: dict[str
     return web.json_response({"name": name, "installed_path": str(installed)})
 
 
+async def _handle_get_body(scope: SkillScope, skill_name: str) -> web.Response:
+    """Return the queen's *own* copy of a skill (frontmatter-stripped body).
+
+    ``handle_get_skill_detail`` is scope-less and returns the first name match
+    across every scope, so it can surface a different queen's copy. Edit/rename
+    must operate on THIS queen's file, so we enumerate the queen-scoped manager
+    (framework/preset/user + only this queen's dir) instead. The ``body`` is the
+    parsed markdown (no frontmatter) so it round-trips cleanly through
+    ``PUT .../body`` (which re-adds frontmatter via ``build_draft``).
+    """
+    name, err = validate_skill_name(skill_name)
+    if err or name is None:
+        return web.json_response({"error": err}, status=400)
+    for s in scope.manager.enumerate_skills_with_source():
+        if s.name == name:
+            provenance, _ = _resolve_provenance(s, scope.store)
+            return web.json_response(
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "source_scope": s.source_scope,
+                    "location": s.location,
+                    "base_dir": s.base_dir,
+                    "body": s.body,
+                    "visibility": s.visibility,
+                    "editable": provenance in _EDITABLE_PROVENANCE,
+                }
+            )
+    return web.json_response({"error": f"skill '{name}' not found"}, status=404)
+
+
+async def _handle_rename(scope: SkillScope, skill_name: str, payload: dict[str, Any]) -> web.Response:
+    """Rename this queen's copy of a skill (dir + frontmatter ``name``).
+
+    Only renames THIS queen's file; the same-named skill on other queens is a
+    separate copy and is left untouched (the UI warns about this). Preserves the
+    override entry's metadata (provenance/created_at/created_by) by cloning it
+    under the new key rather than delete+recreate.
+    """
+    old, err = validate_skill_name(skill_name)
+    if err or old is None:
+        return web.json_response({"error": err}, status=400)
+    new, err = validate_skill_name(payload.get("new_name"))
+    if err or new is None:
+        return web.json_response({"error": err}, status=400)
+    if new == old:
+        return web.json_response({"error": "new_name matches the current name"}, status=400)
+
+    # Only editable (user/queen-authored) skills live in the queen's write_dir
+    # and can be renamed. Framework/preset/user-dropped skills are shared and
+    # read-only.
+    entry = scope.store.get(old)
+    provenance = entry.provenance if entry else Provenance.FRAMEWORK
+    if provenance not in _EDITABLE_PROVENANCE:
+        return web.json_response(
+            {"error": f"skill '{old}' is not editable (provenance={provenance})"}, status=403
+        )
+
+    old_dir = scope.write_dir / old
+    new_dir = scope.write_dir / new
+    if not old_dir.is_dir():
+        return web.json_response(
+            {"error": f"skill '{old}' has no editable copy for this queen"}, status=404
+        )
+    if new_dir.exists():
+        return web.json_response({"error": f"skill '{new}' already exists"}, status=409)
+
+    # Move the directory (preserves sub-files), then patch the frontmatter
+    # ``name`` so it stays consistent with the directory name.
+    try:
+        old_dir.rename(new_dir)
+    except OSError as e:
+        return web.json_response({"error": f"failed to rename skill folder: {e}"}, status=500)
+    skill_md = new_dir / "SKILL.md"
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+        patched, n = re.subn(r"^name:\s*.+$", f"name: {new}", text, count=1, flags=re.MULTILINE)
+        if n:
+            skill_md.write_text(patched, encoding="utf-8")
+    except OSError as e:
+        # Best-effort roll back the directory move so we don't leave a
+        # dir/frontmatter mismatch behind.
+        try:
+            new_dir.rename(old_dir)
+        except OSError:
+            pass
+        return web.json_response({"error": f"failed to update SKILL.md: {e}"}, status=500)
+
+    # Carry the override entry (enabled state + provenance + authorship) to the
+    # new key; drop the old key without a tombstone (rename, not delete).
+    if entry is not None:
+        scope.store.upsert(new, entry.clone())
+        scope.store.remove(old, tombstone=False)
+        scope.store.save()
+    await _reload_scope(scope)
+    return web.json_response({"old_name": old, "new_name": new, "ok": True})
+
+
 async def _handle_delete(scope: SkillScope, skill_name: str) -> web.Response:
     name, err = validate_skill_name(skill_name)
     if err or name is None:
@@ -774,48 +782,84 @@ def _requester_id(request: web.Request) -> str:
     return request.headers.get("X-User", "ui")
 
 
+def _push_skill_override(response: web.Response, queen_id: str) -> web.Response:
+    """Mirror a queen's skills_overrides.json to the cloud after a successful
+    skill mutation. Pass-through on the response so call sites stay terse."""
+    if response.status < 400:
+        schedule_push("skill_override", f"queen:{queen_id}")
+    return response
+
+
 async def handle_create_queen_skill(request: web.Request) -> web.Response:
     manager = request.app.get("manager")
-    scope = _queen_scope(manager, request.match_info["queen_id"])
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
     if scope is None:
         return web.json_response({"error": "queen not found"}, status=404)
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_create(scope, payload, _requester_id(request))
+    return _push_skill_override(await _handle_create(scope, payload, _requester_id(request)), queen_id)
 
 
 async def handle_patch_queen_skill(request: web.Request) -> web.Response:
     manager = request.app.get("manager")
-    scope = _queen_scope(manager, request.match_info["queen_id"])
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
     if scope is None:
         return web.json_response({"error": "queen not found"}, status=404)
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_patch(scope, request.match_info["skill_name"], payload)
+    return _push_skill_override(await _handle_patch(scope, request.match_info["skill_name"], payload), queen_id)
 
 
 async def handle_put_queen_skill_body(request: web.Request) -> web.Response:
     manager = request.app.get("manager")
-    scope = _queen_scope(manager, request.match_info["queen_id"])
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
     if scope is None:
         return web.json_response({"error": "queen not found"}, status=404)
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_put_body(scope, request.match_info["skill_name"], payload)
+    return _push_skill_override(await _handle_put_body(scope, request.match_info["skill_name"], payload), queen_id)
+
+
+async def handle_get_queen_skill_body(request: web.Request) -> web.Response:
+    manager = request.app.get("manager")
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
+    if scope is None:
+        return web.json_response({"error": "queen not found"}, status=404)
+    return await _handle_get_body(scope, request.match_info["skill_name"])
+
+
+async def handle_rename_queen_skill(request: web.Request) -> web.Response:
+    manager = request.app.get("manager")
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
+    if scope is None:
+        return web.json_response({"error": "queen not found"}, status=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    return _push_skill_override(
+        await _handle_rename(scope, request.match_info["skill_name"], payload), queen_id
+    )
 
 
 async def handle_delete_queen_skill(request: web.Request) -> web.Response:
     manager = request.app.get("manager")
-    scope = _queen_scope(manager, request.match_info["queen_id"])
+    queen_id = request.match_info["queen_id"]
+    scope = _queen_scope(manager, queen_id)
     if scope is None:
         return web.json_response({"error": "queen not found"}, status=404)
-    return await _handle_delete(scope, request.match_info["skill_name"])
+    return _push_skill_override(await _handle_delete(scope, request.match_info["skill_name"]), queen_id)
 
 
 async def handle_reload_queen_skills(request: web.Request) -> web.Response:
@@ -823,58 +867,6 @@ async def handle_reload_queen_skills(request: web.Request) -> web.Response:
     scope = _queen_scope(manager, request.match_info["queen_id"])
     if scope is None:
         return web.json_response({"error": "queen not found"}, status=404)
-    return await _handle_reload(scope)
-
-
-async def handle_create_colony_skill(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    scope = _colony_scope(manager, request.match_info["colony_name"])
-    if scope is None:
-        return web.json_response({"error": "colony not found"}, status=404)
-    try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_create(scope, payload, _requester_id(request))
-
-
-async def handle_patch_colony_skill(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    scope = _colony_scope(manager, request.match_info["colony_name"])
-    if scope is None:
-        return web.json_response({"error": "colony not found"}, status=404)
-    try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_patch(scope, request.match_info["skill_name"], payload)
-
-
-async def handle_put_colony_skill_body(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    scope = _colony_scope(manager, request.match_info["colony_name"])
-    if scope is None:
-        return web.json_response({"error": "colony not found"}, status=404)
-    try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    return await _handle_put_body(scope, request.match_info["skill_name"], payload)
-
-
-async def handle_delete_colony_skill(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    scope = _colony_scope(manager, request.match_info["colony_name"])
-    if scope is None:
-        return web.json_response({"error": "colony not found"}, status=404)
-    return await _handle_delete(scope, request.match_info["skill_name"])
-
-
-async def handle_reload_colony_skills(request: web.Request) -> web.Response:
-    manager = request.app.get("manager")
-    scope = _colony_scope(manager, request.match_info["colony_name"])
-    if scope is None:
-        return web.json_response({"error": "colony not found"}, status=404)
     return await _handle_reload(scope)
 
 
@@ -888,8 +880,8 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
 
     Form fields:
       ``file`` (required)           — the .md / .zip payload
-      ``scope`` (required)          — "user" | "queen" | "colony"
-      ``target_id`` (queen|colony)  — queen_id or colony_name for those scopes
+      ``scope`` (required)          — "user" | "queen"
+      ``target_id`` (queen)         — queen_id for that scope
       ``enabled`` (optional)        — "true"/"false" (defaults true)
       ``replace_existing``          — "true"/"false" (defaults false)
       ``name``                      — optional override for single-.md uploads
@@ -925,10 +917,10 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing 'file' part"}, status=400)
 
     scope_kind = form.get("scope", "").lower()
-    if scope_kind not in {"user", "queen", "colony"}:
-        return web.json_response({"error": "scope must be user|queen|colony"}, status=400)
+    if scope_kind not in {"user", "queen"}:
+        return web.json_response({"error": "scope must be user|queen"}, status=400)
     target_id = form.get("target_id", "").strip()
-    if scope_kind in {"queen", "colony"} and not target_id:
+    if scope_kind == "queen" and not target_id:
         return web.json_response({"error": f"target_id required for scope={scope_kind}"}, status=400)
     enabled = form.get("enabled", "true").lower() != "false"
     replace_existing = form.get("replace_existing", "false").lower() == "true"
@@ -942,18 +934,10 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
         overrides_path: Path | None = None
         store: SkillOverrideStore | None = None
         affected_runtimes: list = []
-    elif scope_kind == "queen":
+    else:  # queen
         scope = _queen_scope(manager, target_id)
         if scope is None:
             return web.json_response({"error": "queen not found"}, status=404)
-        write_dir = scope.write_dir
-        overrides_path = scope.overrides_path
-        store = scope.store
-        affected_runtimes = scope.affected_runtimes
-    else:  # colony
-        scope = _colony_scope(manager, target_id)
-        if scope is None:
-            return web.json_response({"error": "colony not found"}, status=404)
         write_dir = scope.write_dir
         overrides_path = scope.overrides_path
         store = scope.store
@@ -966,9 +950,7 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
         if err:
             return web.json_response({"error": err}, status=400)
     else:
-        draft_name, draft_desc, draft_body, draft_files, err = _extract_from_md(
-            upload_bytes, filename=upload_filename, name_hint=name_override
-        )
+        draft_name, draft_desc, draft_body, draft_files, err = _extract_from_md(upload_bytes, filename=upload_filename, name_hint=name_override)
         if err:
             return web.json_response({"error": err}, status=400)
 
@@ -998,9 +980,9 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
         )
         store.save()
 
-    # Reload affected runtimes (queen/colony scopes only). For user
-    # scope, changes take effect the next time a runtime reloads —
-    # usually on the next queen boot.
+    # Reload affected runtimes (queen scope only). For user scope,
+    # changes take effect the next time a runtime reloads — usually on
+    # the next queen boot.
     for rt in affected_runtimes:
         try:
             await rt.reload_skills()
@@ -1130,20 +1112,11 @@ def register_routes(app: web.Application) -> None:
     r.add_get("/api/queen/{queen_id}/skills", handle_list_queen_skills)
     r.add_post("/api/queen/{queen_id}/skills", handle_create_queen_skill)
     r.add_patch("/api/queen/{queen_id}/skills/{skill_name}", handle_patch_queen_skill)
+    r.add_get("/api/queen/{queen_id}/skills/{skill_name}/body", handle_get_queen_skill_body)
     r.add_put("/api/queen/{queen_id}/skills/{skill_name}/body", handle_put_queen_skill_body)
+    r.add_post("/api/queen/{queen_id}/skills/{skill_name}/rename", handle_rename_queen_skill)
     r.add_delete("/api/queen/{queen_id}/skills/{skill_name}", handle_delete_queen_skill)
     r.add_post("/api/queen/{queen_id}/skills/reload", handle_reload_queen_skills)
-
-    # Per-colony
-    r.add_get("/api/colonies/{colony_name}/skills", handle_list_colony_skills)
-    r.add_post("/api/colonies/{colony_name}/skills", handle_create_colony_skill)
-    r.add_patch("/api/colonies/{colony_name}/skills/{skill_name}", handle_patch_colony_skill)
-    r.add_put(
-        "/api/colonies/{colony_name}/skills/{skill_name}/body",
-        handle_put_colony_skill_body,
-    )
-    r.add_delete("/api/colonies/{colony_name}/skills/{skill_name}", handle_delete_colony_skill)
-    r.add_post("/api/colonies/{colony_name}/skills/reload", handle_reload_colony_skills)
 
     # Aggregated library (powers the Skills Library page)
     r.add_get("/api/skills", handle_list_all_skills)

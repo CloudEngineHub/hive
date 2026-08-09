@@ -287,9 +287,7 @@ class TestGoogleSheetsClient:
     def test_add_sheet(self, mock_post):
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "replies": [{"addSheet": {"properties": {"sheetId": 1, "title": "New Sheet"}}}]
-        }
+        mock_response.json.return_value = {"replies": [{"addSheet": {"properties": {"sheetId": 1, "title": "New Sheet"}}}]}
         mock_post.return_value = mock_response
 
         result = self.client.add_sheet("123", "New Sheet")
@@ -519,35 +517,25 @@ class TestWriteDataTools:
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.put")
     def test_update_values(self, mock_put):
         mock_put.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"updatedCells": 2}))
-        result = self._fn("google_sheets_update_values")(
-            spreadsheet_id="123", range_name="Sheet1!A1:B1", values=[["A", "B"]]
-        )
+        result = self._fn("google_sheets_update_values")(spreadsheet_id="123", range_name="Sheet1!A1:B1", values=[["A", "B"]])
         assert result["updatedCells"] == 2
 
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.post")
     def test_append_values(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"updates": {"updatedCells": 2}})
-        )
-        result = self._fn("google_sheets_append_values")(
-            spreadsheet_id="123", range_name="Sheet1!A1", values=[["new", "row"]]
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"updates": {"updatedCells": 2}}))
+        result = self._fn("google_sheets_append_values")(spreadsheet_id="123", range_name="Sheet1!A1", values=[["new", "row"]])
         assert "updates" in result
 
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.post")
     def test_clear_values(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"clearedRange": "Sheet1!A1:B2"})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"clearedRange": "Sheet1!A1:B2"}))
         result = self._fn("google_sheets_clear_values")(spreadsheet_id="123", range_name="Sheet1!A1:B2")
         assert result["clearedRange"] == "Sheet1!A1:B2"
 
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.put")
     def test_update_values_network_error(self, mock_put):
         mock_put.side_effect = httpx.RequestError("connection failed")
-        result = self._fn("google_sheets_update_values")(
-            spreadsheet_id="123", range_name="Sheet1!A1", values=[["test"]]
-        )
+        result = self._fn("google_sheets_update_values")(spreadsheet_id="123", range_name="Sheet1!A1", values=[["test"]])
         assert "error" in result
         assert "Network error" in result["error"]
 
@@ -576,18 +564,14 @@ class TestBatchOperationsTools:
 
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.post")
     def test_batch_clear_values(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"clearedRanges": ["Sheet1!A1"]})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"clearedRanges": ["Sheet1!A1"]}))
         result = self._fn("google_sheets_batch_clear_values")(spreadsheet_id="123", ranges=["Sheet1!A1"])
         assert "clearedRanges" in result
 
     @patch("aden_tools.tools.google_sheets_tool.google_sheets_tool.httpx.post")
     def test_batch_update_values_timeout(self, mock_post):
         mock_post.side_effect = httpx.TimeoutException("timed out")
-        result = self._fn("google_sheets_batch_update_values")(
-            spreadsheet_id="123", data=[{"range": "A1", "values": [["test"]]}]
-        )
+        result = self._fn("google_sheets_batch_update_values")(spreadsheet_id="123", data=[{"range": "A1", "values": [["test"]]}])
         assert "error" in result
         assert "timed out" in result["error"]
 

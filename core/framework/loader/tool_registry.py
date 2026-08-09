@@ -29,12 +29,90 @@ _IMAGE_TOOL_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A `hive-browser screenshot` (run via terminal_exec) writes its JPEG to disk and
+# prints a JSON pointer carrying this marker + a `saved_to` path. Since the tool
+# the agent called is `terminal_exec` (not a `browser_screenshot` MCP tool), the
+# old name-based `produces_image` inlining never fires — so the framework detects
+# the marker here and re-inlines the image into the session, exactly as the user
+# asked ("the framework writes the image into the session"). The path regex
+# survives JSON-string escaping (the value chars aren't escaped).
+_BROWSER_IMAGE_MARKER = "_image"
+# NOTE: the class must ALLOW spaces — the real storage path is under
+# "~/Library/Application Support/Hive/..." (a space in "Application Support").
+# The earlier `[^\s...]` form matched only the fragment after the last space,
+# yielded a non-existent path, and silently dropped every screenshot. It stops
+# only at a JSON quote / escaping backslash / newline.
+_BROWSER_IMAGE_PATH_RE = re.compile(r"(/[^\"'\\\n\r]*\.jpe?g)")
+
+
+def _extract_browser_image_path(text: str) -> str | None:
+    """Pull the screenshot file path out of a terminal_exec result.
+
+    Prefers a real JSON parse (terminal envelope → ``stdout`` → the hive-browser
+    result → ``_image.path`` / ``saved_to``) so paths with spaces are exact;
+    falls back to a space-tolerant regex if the shape differs.
+    """
+    for depth_val in (text,):
+        try:
+            env = json.loads(depth_val)
+        except (ValueError, TypeError):
+            env = None
+        for obj in (env, _try_json(env.get("stdout")) if isinstance(env, dict) else None):
+            if isinstance(obj, dict):
+                img = obj.get("_image")
+                if isinstance(img, dict) and isinstance(img.get("path"), str):
+                    return img["path"]
+                st = obj.get("saved_to")
+                if isinstance(st, str) and st.lower().endswith((".jpg", ".jpeg")):
+                    return st
+    m = _BROWSER_IMAGE_PATH_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _try_json(s: Any) -> Any:
+    if not isinstance(s, str):
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _maybe_inline_browser_image(tool_name: str, result: Any) -> Any:
+    """If a terminal result is a ``hive-browser`` screenshot, inline its JPEG.
+
+    Returns a ``{"_text", "_images"}`` dict (the same shape MCP image tools
+    produce, consumed by ``_wrap_result``) so the agent sees the image inline;
+    otherwise returns ``result`` unchanged. Best-effort and defensive — any
+    failure just leaves the original text result.
+    """
+    if not tool_name.startswith("terminal"):
+        return result
+    text = result if isinstance(result, str) else (result.get("_text") if isinstance(result, dict) else None)
+    if not isinstance(text, str) or _BROWSER_IMAGE_MARKER not in text:
+        return result
+    if isinstance(result, dict) and result.get("_images"):
+        return result  # already carries images; don't clobber
+    path = _extract_browser_image_path(text)
+    if not path:
+        return result
+    try:
+        if not os.path.isfile(path):
+            return result
+        import base64
+
+        with open(path, "rb") as fh:
+            data = base64.b64encode(fh.read()).decode()
+    except OSError:
+        return result
+    block = {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}}
+    base_text = text if isinstance(result, str) else result.get("_text", "")
+    return {"_text": base_text, "_images": [block]}
+
 # Per-execution context overrides.  Each asyncio task (and thus each
 # concurrent graph execution) gets its own copy, so there are no races
 # when multiple ExecutionStreams run in parallel.
-_execution_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "_execution_context", default=None
-)
+_execution_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("_execution_context", default=None)
 
 
 @dataclass
@@ -59,7 +137,28 @@ class ToolRegistry:
     # Framework-internal context keys injected into tool calls.
     # Stripped from LLM-facing schemas (the LLM doesn't know these values)
     # and auto-injected at call time for tools that accept them.
-    CONTEXT_PARAMS = frozenset({"agent_id", "data_dir", "profile"})
+    # ``colony_id`` lets an MCP tool learn which colony invoked it — needed by
+    # anything whose effects OUTLIVE the call and must later be routed back to
+    # the caller (e.g. an outbound email whose reply has to wake the colony that
+    # sent it). It must travel as a call ARGUMENT, not an env var: MCP client
+    # subprocesses are pooled process-wide by server name
+    # (mcp_connection_manager), so a second colony reuses the first's process —
+    # and would silently inherit the first colony's env identity.
+    #
+    # ``principal`` (the acting agent's definitive identity) travels for the same
+    # reason and is handed to the ``hive-crm`` CLI subprocess as ``HIVE_PRINCIPAL`` —
+    # the CLI runs in its own process with no execution context, and the backend's
+    # IAM is inert without it (an unnamed caller resolves to the human, with the
+    # human's permissions). See framework.crm.principal.
+    #
+    # Deliberately NOT adding ``session_id`` here: langfuse_tool already exposes
+    # a `session_id` argument the LLM legitimately fills in to filter traces, and
+    # a CONTEXT_PARAM is stripped from the schema and force-injected, which would
+    # silently break it.
+    CONTEXT_PARAMS = frozenset(
+        {"agent_id", "data_dir", "profile", "profile_display_name", "session_cwd", "colony_id",
+         "principal"}
+    )
 
     # Tools that perform no filesystem/process/network writes and are safe
     # to run concurrently with other safe tools in the same assistant turn.
@@ -69,28 +168,22 @@ class ToolRegistry:
     # POST/PUT/DELETE requests, or drives a browser MUST NOT be listed.
     CONCURRENCY_SAFE_TOOLS = frozenset(
         {
-            # File system reads
-            "read_file",
-            "search_files",
+            # Document reads
             "pdf_read",
-            # Terminal reads (rg / find / output buffer polling — neither
+            # Terminal reads (rg / glob / output buffer polling — neither
             # changes process state)
             "terminal_rg",
-            "terminal_find",
+            "terminal_glob",
             "terminal_output_get",
             # Web / research reads (re-issuable, side-effect-free fetches)
             "web_scrape",
             "search_papers",
             "search_wikipedia",
             "download_paper",
-            # Browser read-only snapshots (mutate-free observations)
-            "browser_screenshot",
-            "browser_snapshot",
-            "browser_console",
-            "browser_get_text",
-            "browser_html",
-            "browser_get_attribute",
-            "browser_get_rect",
+            # (The former browser read-only snapshots — screenshot/snapshot/console/
+            # get_text/html — are now `hive-browser page ...` CLI subcommands run
+            # under terminal_exec, which is never concurrency-safe, so they're gone
+            # from this set.)
         }
     )
 
@@ -131,6 +224,11 @@ class ToolRegistry:
         self._mcp_extra_env: dict[str, str] = {}
         # Agent dir for re-loading registry MCP after credential resync.
         self._mcp_registry_agent_path: Path | None = None
+        # Transient (tool_provider_map, live_providers) snapshot reused across
+        # one ``load_registry_servers`` batch so the admission gate doesn't
+        # re-probe every credential once per server. Set/cleared by that
+        # method; None outside a batch (standalone register calls recompute).
+        self._mcp_gate_cred_snapshot: tuple[dict[str, str], set[str]] | None = None
 
     def set_mcp_extra_env(self, env: dict[str, str]) -> None:
         """Attach per-agent env vars to every MCPServerConfig this registry builds.
@@ -397,8 +495,11 @@ class ToolRegistry:
                 )
 
         # Expose force-kill hook so the timeout handler can tear down a
-        # hung MCP subprocess (asyncio.wait_for alone cannot).
+        # hung MCP subprocess (asyncio.wait_for alone cannot), and the
+        # liveness probe so it only does that when the server is actually
+        # dead — the client is SHARED, so a kill takes out every worker.
         executor.kill_for_tool = registry_ref.kill_mcp_for_tool  # type: ignore[attr-defined]
+        executor.probe_for_tool = registry_ref.probe_mcp_for_tool  # type: ignore[attr-defined]
         return executor
 
     def get_registered_names(self) -> list[str]:
@@ -569,9 +670,7 @@ class ToolRegistry:
             # Treat top-level keys as server names
             server_list = [{"name": name, **cfg} for name, cfg in config.items()]
 
-        resolved_server_list = [
-            self._resolve_mcp_server_config(server_config, base_dir) for server_config in server_list
-        ]
+        resolved_server_list = [self._resolve_mcp_server_config(server_config, base_dir) for server_config in server_list]
         # Ordered first-wins for duplicate tool names across servers; keep tools.py tools.
         self.load_registry_servers(
             resolved_server_list,
@@ -648,6 +747,7 @@ class ToolRegistry:
         preserve_existing_tools: bool = True,
         max_tools: int | None = None,
         log_collisions: bool = False,
+        essential_servers: set[str] | frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Register MCP servers from a resolved config list (registry and/or static).
 
@@ -658,33 +758,26 @@ class ToolRegistry:
         ``max_tools`` caps how many *new* tool names are registered across this batch
         (collisions do not consume the cap). When ``log_collisions`` is True, skipped
         duplicate names emit a warning (FR-101).
+
+        ``essential_servers`` names servers exempt from the ``max_tools`` cap; they
+        always register and never count against the budget. Defaults to Hive's
+        bundled servers (:data:`DEFAULT_LOCAL_SERVER_NAMES`). The cap is greedy in
+        list order, so without this exemption a user server early in the list could
+        exhaust the budget and a hard ``break`` would silently drop every server
+        after it — including essential bundled tools like chart-tools (the
+        intermittent, order-dependent ``chart_render`` "missing tool" bug). We skip
+        capped *non-essential* servers individually and keep scanning instead.
         """
+        if essential_servers is None:
+            from framework.loader.mcp_registry import DEFAULT_LOCAL_SERVER_NAMES
+
+            essential_servers = DEFAULT_LOCAL_SERVER_NAMES
+
         results: list[dict[str, Any]] = []
         tools_added_batch = 0
 
-        for server_config in server_list:
-            remaining: int | None = None
-            if max_tools is not None:
-                remaining = max_tools - tools_added_batch
-                if remaining <= 0:
-                    break
-
-            name = server_config.get("name", "unknown")
-            success, tools_loaded, error = self._register_mcp_server_with_retry(
-                server_config,
-                preserve_existing_tools=preserve_existing_tools,
-                tool_cap=remaining,
-                log_collisions=log_collisions,
-            )
-            tools_added_batch += tools_loaded
-            result = {
-                "server": name,
-                "status": "loaded" if success else "skipped",
-                "tools_loaded": tools_loaded,
-                "skipped_reason": None if success else (error or "unknown error"),
-            }
+        def _record(result: dict[str, Any]) -> None:
             results.append(result)
-
             if log_summary:
                 logger.info(
                     "MCP registry server resolution",
@@ -696,6 +789,49 @@ class ToolRegistry:
                         "skipped_reason": result["skipped_reason"],
                     },
                 )
+
+        # Compute the admission-gate credential snapshot once for the whole
+        # batch — every server's gate would otherwise re-probe every
+        # credential, and no credential change can happen mid-loop.
+        self._mcp_gate_cred_snapshot = self._compute_mcp_gate_cred_snapshot()
+        try:
+            for server_config in server_list:
+                name = server_config.get("name", "unknown")
+                is_essential = name in essential_servers
+
+                remaining: int | None = None
+                if max_tools is not None and not is_essential:
+                    remaining = max_tools - tools_added_batch
+                    if remaining <= 0:
+                        # Budget exhausted: skip this non-essential server but
+                        # KEEP scanning so a later essential server still loads.
+                        _record(
+                            {
+                                "server": name,
+                                "status": "skipped",
+                                "tools_loaded": 0,
+                                "skipped_reason": f"max_tools={max_tools} budget exhausted",
+                            }
+                        )
+                        continue
+
+                success, tools_loaded, error = self._register_mcp_server_with_retry(
+                    server_config,
+                    preserve_existing_tools=preserve_existing_tools,
+                    tool_cap=None if is_essential else remaining,
+                    log_collisions=log_collisions,
+                )
+                tools_added_batch += tools_loaded
+                _record(
+                    {
+                        "server": name,
+                        "status": "loaded" if success else "skipped",
+                        "tools_loaded": tools_loaded,
+                        "skipped_reason": None if success else (error or "unknown error"),
+                    }
+                )
+        finally:
+            self._mcp_gate_cred_snapshot = None
 
         return results
 
@@ -781,15 +917,20 @@ class ToolRegistry:
             # Reset the per-server library catalog before re-populating so
             # a re-register (e.g. credential resync) starts clean.
             self._mcp_full_catalog[server_name] = []
+            server_catalog_names: set[str] = set()
 
             count = 0
             admitted_names: list[str] = []
             for mcp_tool in client.list_tools():
-                # Populate the Tool Library catalog regardless of the
-                # strict credential gate so the UI can show greyed-out
-                # rows with a Connect button. The library_admit gate
-                # still drops the manifest sentinel and unverified tools.
-                if library_admit(mcp_tool.name):
+                origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name)
+                catalog_shadowed = preserve_existing_tools and origin_server is not None and origin_server != server_name
+                # Populate the Tool Library catalog with the same logical
+                # first-wins identity as execution. Credentialed tools still
+                # appear before the user connects a provider, but duplicate
+                # tool names from later MCP servers do not produce duplicate
+                # rows/categories because allowlists and executors are keyed
+                # by tool name, not by (server, tool).
+                if library_admit(mcp_tool.name) and mcp_tool.name not in server_catalog_names and not catalog_shadowed:
                     self._mcp_full_catalog[server_name].append(
                         {
                             "name": mcp_tool.name,
@@ -798,6 +939,7 @@ class ToolRegistry:
                             "provider": tool_provider_map.get(mcp_tool.name),
                         }
                     )
+                    server_catalog_names.add(mcp_tool.name)
                 if not admit(mcp_tool.name):
                     continue
                 if tool_cap is not None and count >= tool_cap:
@@ -805,7 +947,7 @@ class ToolRegistry:
 
                 if preserve_existing_tools and mcp_tool.name in self._tools:
                     if log_collisions:
-                        origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
+                        origin_server = origin_server or "<existing>"
                         # Don't warn when a server is being re-registered
                         # by itself — that's a redundant-init case (e.g.
                         # the same tool_registry seeing the same server
@@ -846,7 +988,40 @@ class ToolRegistry:
                             # e.g. data_dir="/data" and overriding the real path).
                             clean_inputs = {k: v for k, v in inputs.items() if k not in registry_ref.CONTEXT_PARAMS}
                             merged_inputs = {**clean_inputs, **filtered_context}
+                            # Hand identity down to a terminal tool's subprocess via env,
+                            # so the hive-crm / hive-browser CLIs (which have no execution
+                            # context of their own) can name the caller and target the
+                            # right browser tab group. These are CONTEXT_PARAMS (not tool
+                            # args), routed here rather than passed positionally; gate on
+                            # the tool declaring `env` (the terminal tools) so nothing else
+                            # is touched.
+                            if "env" in tool_params:
+                                injected_env: dict[str, str] = {}
+                                if base_context.get("principal"):
+                                    injected_env["HIVE_PRINCIPAL"] = str(base_context["principal"])
+                                # Browser CLI identity: the session id selects THIS agent's
+                                # tab group (the isolation the CONTEXT_PARAM gave in-process);
+                                # the display name labels the group in the side panel; the
+                                # storage path is where screenshots/snapshots spill. The
+                                # Chrome-connection choice stays a visible --browser-profile
+                                # flag, never injected — injecting it forced every worker
+                                # onto the default profile.
+                                if base_context.get("profile"):
+                                    injected_env["HIVE_BROWSER_SESSION"] = str(base_context["profile"])
+                                if base_context.get("profile_display_name"):
+                                    injected_env["HIVE_BROWSER_PROFILE_DISPLAY_NAME"] = str(base_context["profile_display_name"])
+                                if base_context.get("session_cwd"):
+                                    injected_env["HIVE_STORAGE_PATH"] = str(base_context["session_cwd"])
+                                if injected_env:
+                                    merged_inputs["env"] = {
+                                        **(merged_inputs.get("env") or {}),
+                                        **injected_env,
+                                    }
                             result = client_ref.call_tool(tool_name, merged_inputs)
+                            # A hive-browser screenshot (run via terminal_exec) writes
+                            # its JPEG to disk and prints a pointer; re-inline the image
+                            # into the session so the agent sees it without a manual read.
+                            result = _maybe_inline_browser_image(tool_name, result)
                             # MCP client already extracts content (returns str
                             # or {"_text": ..., "_images": ...} for image results).
                             # Handle legacy list format from HTTP transport.
@@ -944,9 +1119,26 @@ class ToolRegistry:
 
     _MCP_VERIFIED_MANIFEST_TOOL = "__aden_verified_manifest"
 
-    def _build_mcp_admission_gate(
-        self, client: Any
-    ) -> tuple[Callable[[str], bool], Callable[[str], bool], dict[str, str]]:
+    def _compute_mcp_gate_cred_snapshot(self) -> tuple[dict[str, str], set[str]]:
+        """Snapshot (tool→provider map, live provider set) for the admission gate.
+
+        ``get_all_account_info()`` iterates every credential spec and loads
+        each one, so this is the expensive part of building a gate. Callers
+        that register many servers in one batch should compute it once and
+        reuse it rather than calling this per server.
+        """
+        try:
+            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
+
+            adapter = CredentialStoreAdapter.default()
+            tool_provider_map = adapter.get_tool_provider_map()
+            live_providers = {a.get("provider", "") for a in adapter.get_all_account_info() if a.get("provider")}
+            return tool_provider_map, live_providers
+        except Exception:
+            logger.debug("Credential snapshot unavailable for MCP gate", exc_info=True)
+            return {}, set()
+
+    def _build_mcp_admission_gate(self, client: Any) -> tuple[Callable[[str], bool], Callable[[str], bool], dict[str, str]]:
         """Build per-server predicates that filter MCP tools at registration.
 
         Returns ``(admit, library_admit, tool_provider_map)``:
@@ -1009,16 +1201,12 @@ class ToolRegistry:
                 # — treat as no manifest; fall back to third-party bypass.
                 pass
 
-        tool_provider_map: dict[str, str] = {}
-        live_providers: set[str] = set()
-        try:
-            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
-
-            adapter = CredentialStoreAdapter.default()
-            tool_provider_map = adapter.get_tool_provider_map()
-            live_providers = {a.get("provider", "") for a in adapter.get_all_account_info() if a.get("provider")}
-        except Exception:
-            logger.debug("Credential snapshot unavailable for MCP gate", exc_info=True)
+        # Reuse the batch-scoped snapshot when registering inside a
+        # ``load_registry_servers`` loop; standalone calls recompute fresh.
+        if self._mcp_gate_cred_snapshot is not None:
+            tool_provider_map, live_providers = self._mcp_gate_cred_snapshot
+        else:
+            tool_provider_map, live_providers = self._compute_mcp_gate_cred_snapshot()
 
         def admit(tool_name: str) -> bool:
             if tool_name == self._MCP_VERIFIED_MANIFEST_TOOL:
@@ -1174,7 +1362,7 @@ class ToolRegistry:
         except OSError:
             return set()
 
-    def resync_mcp_servers_if_needed(self) -> bool:
+    def resync_mcp_servers_if_needed(self, *, force: bool = False) -> bool:
         """Restart MCP servers if credential files changed since last load.
 
         Compares the current credential directory listing against the snapshot
@@ -1182,6 +1370,12 @@ class ToolRegistry:
         user connected an OAuth account mid-session), disconnects all MCP
         clients and re-loads them so the new subprocess picks up the fresh
         credentials.
+
+        ``force=True`` skips the credential-snapshot diff and ALWAYS rebuilds.
+        Used by the credential save handler so re-authorising a provider
+        (which can overwrite the same credential file in-place without
+        changing its mtime) immediately rebuilds the catalog rather than
+        waiting for some other change to nudge it.
 
         Note: Individual credential TTL/refresh is handled by the MCP server
         process internally -- it resolves tokens from the credential store
@@ -1198,16 +1392,19 @@ class ToolRegistry:
         files_changed = current != self._mcp_cred_snapshot
         aden_key_changed = current_aden_key != self._mcp_aden_key_snapshot
 
-        if not files_changed and not aden_key_changed:
+        if not force and not files_changed and not aden_key_changed:
             return False
 
-        reason = (
-            "Credential files and ADEN_API_KEY changed"
-            if files_changed and aden_key_changed
-            else "ADEN_API_KEY changed"
-            if aden_key_changed
-            else "Credential files changed"
-        )
+        if force and not files_changed and not aden_key_changed:
+            reason = "Forced resync (credential save / explicit refresh)"
+        else:
+            reason = (
+                "Credential files and ADEN_API_KEY changed"
+                if files_changed and aden_key_changed
+                else "ADEN_API_KEY changed"
+                if aden_key_changed
+                else "Credential files changed"
+            )
         logger.info("%s — resyncing MCP servers", reason)
 
         # 1. Disconnect existing MCP clients
@@ -1261,10 +1458,11 @@ class ToolRegistry:
         """Force-disconnect the MCP client that owns *tool_name*.
 
         Called from the timeout handler in ``execute_tool`` when a tool
-        call hangs. Plain ``asyncio.wait_for`` cancellation cannot stop
-        a sync executor running inside a thread pool (and therefore
-        cannot stop the MCP subprocess), so we reach through to the
-        client here and tear it down. The next ``call_tool`` triggers
+        call hangs AND the server failed its liveness probe (see
+        ``probe_mcp_for_tool``). Plain ``asyncio.wait_for`` cancellation
+        cannot stop a sync executor running inside a thread pool (and
+        therefore cannot stop the MCP subprocess), so we reach through to
+        the client here and tear it down. The next ``call_tool`` triggers
         an automatic reconnect.
 
         Returns True if a client was found and disconnect was attempted.
@@ -1272,6 +1470,10 @@ class ToolRegistry:
         client = self._mcp_tool_clients.get(tool_name)
         if client is None:
             return False
+        if not getattr(client, "_connected", True):
+            # Already torn down (e.g. by a concurrent timeout handler) —
+            # don't stack a second teardown on an in-flight reconnect.
+            return True
         try:
             logger.warning(
                 "Force-disconnecting MCP client for hung tool '%s' on server '%s'",
@@ -1282,6 +1484,47 @@ class ToolRegistry:
         except Exception as exc:
             logger.warning("Error force-disconnecting MCP client for '%s': %s", tool_name, exc)
         return True
+
+    def probe_mcp_for_tool(self, tool_name: str) -> str:
+        """Classify the health of the MCP client/server behind *tool_name*.
+
+        The timeout handler uses this to decide whether a hung call means
+        the SHARED server is dead (kill + reconnect) or merely busy with a
+        slow call (abandon this call, leave every other worker's transport
+        alone). The 2026-06-11 incident: one slow browser_evaluate caused
+        agent-side timeouts that force-killed the shared gcu-tools client
+        for all workers, who then concluded "the browser is stuck".
+
+        Returns:
+            "alive":     server answered an MCP ping — do NOT kill.
+            "resetting": a connect/disconnect/reconnect is already in
+                         progress, or the client is already disconnected —
+                         do NOT stack another teardown.
+            "dead":      ping failed twice in a row (or with no calls in
+                         flight) — killing is justified.
+            "unknown":   no probe support (non-stdio/sse transport or no
+                         client) — caller falls back to legacy behavior.
+        """
+        client = self._mcp_tool_clients.get(tool_name)
+        if client is None:
+            return "unknown"
+        probe = getattr(client, "probe_liveness", None)
+        if probe is None or getattr(client.config, "transport", None) not in {"stdio", "sse"}:
+            return "unknown"
+        if getattr(client, "lifecycle_busy", lambda: False)() or not getattr(client, "_connected", False):
+            return "resetting"
+        try:
+            if probe():
+                return "alive"
+        except Exception as exc:
+            logger.debug("Liveness probe errored for '%s': %s", tool_name, exc)
+        # One failed ping on a busy server can be noise; require a second
+        # strike unless nothing is in flight (idle + unresponsive = dead).
+        failures = getattr(client, "consecutive_probe_failures", 1)
+        inflight = getattr(client, "inflight_calls", 0)
+        if failures >= 2 or inflight == 0:
+            return "dead"
+        return "resetting"
 
     def __del__(self):
         """Destructor to ensure cleanup."""

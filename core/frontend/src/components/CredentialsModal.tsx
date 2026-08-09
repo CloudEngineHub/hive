@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { KeyRound, Check, AlertCircle, X, Shield, Loader2, Trash2, ExternalLink, Pencil } from "lucide-react";
 import { credentialsApi, type AgentCredentialRequirement } from "@/api/credentials";
+import { getProviderLogo } from "@/data/providerLogos";
+import { ProviderLogo } from "@/components/ProviderLogo";
+
+function CredIconInline({ credId, size = 18 }: { credId: string; size?: number }) {
+  const logo = getProviderLogo(credId);
+  if (!logo) return <span style={{ fontSize: size * 0.85 }}>🔑</span>;
+  return <ProviderLogo provider={credId} size={size} />;
+}
 
 export interface Credential {
   id: string;
@@ -206,18 +214,9 @@ export default function CredentialsModal({
       if (row.id !== "aden_api_key") return;
     }
 
-    if (row.id === "aden_api_key" && row.adenSupported) {
-      // Aden Platform key — open Aden so user can grab key from Developers tab
-      window.open("https://hive.adenhq.com/", "_blank", "noopener");
-      pendingAdenAuth.current = true;
-      return;
-    }
-
-    if (row.adenSupported) {
-      // OAuth credential — redirect to Aden platform
-      window.open("https://hive.adenhq.com/", "_blank", "noopener");
-      return;
-    }
+    // OAuth / Aden-backed providers were connected via the cloud dashboard,
+    // which doesn't exist in local mode. Everything else falls through to the
+    // inline API-key input.
 
     // Start editing — show inline API key input
     setEditingId(row.id);
@@ -351,7 +350,7 @@ export default function CredentialsModal({
                           : "border-border/60 bg-muted/20"
                     }`}
                   >
-                    <span className="text-lg flex-shrink-0">{row.icon}</span>
+                    <span className="flex-shrink-0 inline-flex items-center"><CredIconInline credId={row.id} size={20} /></span>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium text-foreground">{row.name}</span>
@@ -390,7 +389,7 @@ export default function CredentialsModal({
                             title={row.validationMessage || "Invalid — click to update"}
                           >
                             <AlertCircle className="w-3 h-3" />
-                            {row.adenSupported ? "Reauthorize" : "Update Key"}
+                            {row.adenSupported ? "Reconnect" : "Update Key"}
                           </button>
                         ) : (
                           <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary/10 text-primary">
@@ -434,7 +433,7 @@ export default function CredentialsModal({
                       <button
                         onClick={() => handleConnect(row)}
                         disabled={saving}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-muted/60 text-foreground hover:bg-muted transition-colors flex-shrink-0"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-muted/60 text-foreground hover:bg-muted transition-colors flex-shrink-0 disabled:opacity-50"
                       >
                         {row.adenSupported ? (
                           <>

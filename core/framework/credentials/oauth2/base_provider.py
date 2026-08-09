@@ -308,9 +308,7 @@ class BaseOAuth2Provider(CredentialProvider):
             new_token = self.refresh_access_token(refresh_tok)
         except OAuth2Error as e:
             if e.error == "invalid_grant":
-                raise CredentialRefreshError(
-                    f"Refresh token for '{credential.id}' is invalid or revoked. Re-authorization required."
-                ) from e
+                raise CredentialRefreshError(f"Refresh token for '{credential.id}' is invalid or revoked. Re-authorization required.") from e
             raise CredentialRefreshError(f"Failed to refresh '{credential.id}': {e}") from e
 
         # Update credential

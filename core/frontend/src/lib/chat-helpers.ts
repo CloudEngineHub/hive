@@ -3,7 +3,7 @@
  * No React dependencies — just JSON in, object out.
  */
 
-import type { ChatMessage } from "@/components/ChatPanel";
+import type { ChatMessage, ImageContent } from "@/components/ChatPanel";
 import type { AgentEvent } from "@/api/types";
 
 /**
@@ -20,7 +20,7 @@ import type { AgentEvent } from "@/api/types";
  *
  * Worker messages tag their ``streamId`` as either ``"worker"`` (single-worker
  * legacy case) or ``"worker:{uuid}"`` (parallel fan-out). The uuid half is
- * the colony worker id — the same identifier the Colony Workers sidebar uses
+ * the colony worker id — the same identifier the Colony sidebar uses
  * to key its Sessions cards. Returns null for the legacy single-worker case
  * or any other stream kind.
  */
@@ -184,7 +184,49 @@ export function sseEventToChatMessage(
 
     case "client_input_received": {
       const userContent = (event.data?.content as string) || "";
-      if (!userContent) return null;
+      const imagePaths = event.data?.image_paths as string[] | undefined;
+      // Internal directives the backend injects through the user-input
+      // channel (e.g. the fork kickoff prompt) are tagged with this
+      // marker. The queen acts on them, but they are NOT user-authored —
+      // never render them as a "You" bubble.
+      if (userContent.startsWith("<hive-internal>")) return null;
+      // Allow image-only messages (no text but has attachments)
+      if (!userContent && (!imagePaths || imagePaths.length === 0)) return null;
+      // Reconstruct images from saved attachment paths.
+      //
+      // When a PDF is uploaded the desktop ships one base64 page image
+      // per PDF page in the chat payload so the LLM can "see" the doc.
+      // The backend writes every one of those alongside the original
+      // PDF in the session's attachments/ directory, using a stable
+      // naming scheme:
+      //   1777589697032_0.pdf            ← original upload
+      //   1777589697032_0_p0.png  ─┐
+      //   1777589697032_0_p1.png   ├─ rendered pages, same prefix + _p<N>
+      //   1777589697032_0_p7.png  ─┘
+      // All of these come back in image_paths on restore. Without
+      // filtering we'd render the PDF chip + N thumbnails and open the
+      // image carousel. Match the `_p<digits>.<ext>` suffix pattern and
+      // drop those siblings — leaves real user-uploaded images alone.
+      const pageRender = /_p\d+\.[a-z0-9]+$/i;
+      const filtered = imagePaths
+        ? imagePaths.filter((p) => !pageRender.test(p))
+        : imagePaths;
+      const images: ImageContent[] | undefined =
+        filtered && filtered.length > 0
+          ? filtered.map((p) => {
+              // Layer F2: emit canonical `hive-attachment://<rel_path>`.
+              // AttachmentChip's resolveAttachmentUrl handles the basename
+              // → /api/sessions/{sid}/attachment/{name} mapping at render
+              // time, and tolerates both legacy ("attachments/X") and
+              // current ("data/attachments/X") prefixes via split('/').pop().
+              const filename = p.split("/").pop() ?? p;
+              return {
+                type: "image_url" as const,
+                image_url: { url: `hive-attachment://${p}` },
+                _fileName: filename,
+              };
+            })
+          : undefined;
       return {
         id: `user-input-${event.timestamp}`,
         agent: "You",
@@ -194,10 +236,14 @@ export function sseEventToChatMessage(
         type: "user",
         thread,
         createdAt,
+        images,
         // Carrying execution_id here lets the optimistic-message reconciler
         // distinguish server-echoed user bubbles from still-unflushed ones.
         executionId: event.execution_id || undefined,
         streamId: event.stream_id || undefined,
+        // Tie this bubble to the later client_input_committed event, which
+        // re-stamps createdAt to the true injection time.
+        correlationId: event.correlation_id || undefined,
       };
     }
 
@@ -296,10 +342,12 @@ export function sseEventToChatMessage(
  * to after the turn counter moves on.
  */
 /**
- * For chart_* tools we retain the args (from tool_call_started) and
- * result envelope (from tool_call_completed) so the chat panel can
- * render the live chart inline from the same spec the runtime
- * rasterized to PNG. Other tools omit these fields to keep the
+ * Per-tool-call state inside a turn's pill.
+ *
+ * For terminal_* tools we additionally retain the arguments (from
+ * tool_call_started) and result envelope (from tool_call_completed) so
+ * the chat panel can render an inline command + output preview without
+ * re-querying the runtime. Other tools omit these fields to keep the
  * tool_status content payload small (catalogs are pill-only).
  */
 type ToolEntry = {
@@ -307,65 +355,196 @@ type ToolEntry = {
   done: boolean;
   /** opaque per-call id surfaced to the UI; used to key React rows */
   callKey?: string;
-  /** present only for tools whose name matches shouldRetainDetail */
+  /** ms epoch when tool_call_started fired — drives running-pill elapsed
+   * counters and per-call timestamps in the expanded detail panel. */
+  startedAt?: number;
+  /** ms epoch when tool_call_completed fired — present iff `done`. Lets
+   * the renderer compute duration without needing the result envelope
+   * (terminal_* tools also have `runtime_ms` in `result`, but we want
+   * a uniform timing for non-terminal pills too). */
+  endedAt?: number;
+  /** Set when the tool was forcibly marked done because the session
+   * ended without a tool_call_completed (runtime crash, killed, or
+   * not auto-resumed). The renderer treats it as a terminal "we
+   * don't know what happened" state — visually muted, distinct from
+   * a clean done. */
+  isInterrupted?: boolean;
+  /** present only for tools whose name starts with terminal_ */
   args?: unknown;
   result?: unknown;
   isError?: boolean;
 };
 
-type ToolRowState = {
-  streamId: string;
-  executionId: string;
-  tools: Record<string, ToolEntry>;
-};
-
 /**
- * Names whose detail (args + result envelope) we surface in the chat.
- * Other tools stay pill-only — keeping their args/results out of the
- * message content avoids ballooning the chat history with tool
- * catalogs, file blobs, etc.
+ * Names whose detail (command + output, or chart spec + file_url) we
+ * surface in the chat. Other tools stay pill-only — keeping their
+ * args/results out of the message content avoids ballooning the chat
+ * history with tool catalogs, file blobs, etc.
  */
 function shouldRetainDetail(toolName: string): boolean {
-  return toolName.startsWith("chart_");
+  return toolName.startsWith("terminal_") || toolName.startsWith("chart_");
 }
+
+/**
+ * Per-call tracker. One per `tool_call_started` event; stays in
+ * `state.toolTrackers` until either `tool_call_completed` arrives
+ * (which mutates `entry.done = true` and re-emits the message) or
+ * `finalizeOpenToolRows` flips it to interrupted at end of replay.
+ */
+type ToolTracker = {
+  msgId: string;
+  streamId: string;
+  thread: string;
+  agentName: string;
+  role: "queen" | "worker";
+  entry: ToolEntry;
+  createdAt: number;
+};
 
 export interface ReplayState {
   turnCounters: Record<string, number>;
-  toolRows: Record<string, ToolRowState>;
-  toolUseToPill: Record<
-    string,
-    { msgId: string; toolKey: string; name: string }
-  >;
+  /**
+   * Worker streams (`worker:<uuid>`) we have already emitted a bubble anchor
+   * for. A worker's bubble must exist as soon as ANY of its events lands —
+   * we cannot key off one specific type, because a spawned worker never emits
+   * `execution_started` (its loop announces itself with `node_loop_started`,
+   * and a worker stopped while still queued only ever emits a synthesized
+   * `subagent_report`). Anchoring on the first event of any type, once per
+   * stream, is what keeps the bubble's `createdAt` stable.
+   */
+  workerAnchored: Set<string>;
+  /**
+   * Live trackers keyed by `(streamId, executionId, toolUseId)` for
+   * matched lookups, or `anon:<msgId>` for tool calls that arrived
+   * without a tool_use_id (rare but possible). Removed on
+   * tool_call_completed; surviving entries at end-of-replay get
+   * marked `isInterrupted` by `finalizeOpenToolRows`.
+   */
+  toolTrackers: Record<string, ToolTracker>;
   queenIterText: Record<string, Record<number, string>>;
+  /** Parallel to `queenIterText`: the (first-seen) timestamp of each inner
+   *  turn, so a merged bubble can expose a per-span time for hover tooltips
+   *  on its timeline nodes. */
+  queenIterTimes: Record<string, Record<number, number>>;
+  /** Per-execution injection (drain) timestamps for steered/queued user
+   *  messages, from `client_input_committed`, keyed by conversation seq (for
+   *  idempotence). A single queen loop `iteration` can span many inner-turns;
+   *  the renderer normally merges them into ONE bubble. When the user steers
+   *  mid-iteration, we split that bubble into segments so the steer's reply
+   *  lands in a NEW bubble that sorts AFTER the steer instead of folding into
+   *  the pre-steer narration. A queen delta's segment = how many injections
+   *  occurred before it (by timestamp) — order-independent, so disk-restore
+   *  and live SSE assign the same bubble id. See `queenSegmentFor`. */
+  queenInjections: Record<string, Map<number, number>>;
+  /** Queue of `attach_file` chip URLs published per execution_id but not
+   * yet attached to a queen bubble. Drained into the FIRST new queen
+   * text bubble that appears after each tool_call_completed — we can't
+   * just key by iteration because `tool_call_completed` events carry
+   * no iteration field (defaults to 0) while the queen's response can
+   * land at any iter. */
+  queenPendingChips: Record<string, { url: string; filename?: string; credits?: number; generated?: boolean }[]>;
+  /** Per-bubble snapshot of which chips landed on a given queen msg.id.
+   * Keeps streaming-delta upserts consistent: each new COD for the
+   * same bubble re-reads the already-applied chip list instead of
+   * stealing more from the pending queue. */
+  queenChipsAppliedByMsgId: Record<string, { url: string; filename?: string; credits?: number; generated?: boolean }[]>;
+  /** Metadata for queen-generated images, keyed by output-file basename.
+   * Captured from `image_generate` / `collect_result` results and matched to
+   * the `attach_file` chip by filename so a generated image renders as a
+   * confident "Generated image" card (vs a plain attachment) and shows the
+   * credits it cost (when the proxy injected `usage.credits`). A key's
+   * presence marks the file as generated even when the cost is unknown. */
+  imageGenMeta: Record<string, { credits?: number }>;
+  /** Dedupe keys (`<timestamp>|<seq>`) of events already processed.
+   * Lets the live SSE replay path skip events that the disk
+   * eventsHistory fetch or a ring-buffer resubscribe already
+   * delivered. The SSE handler replays a wide event set
+   * (TOOL_CALL_STARTED/COMPLETED, EXECUTION_COMPLETED, etc.) so
+   * dedupe is mandatory — without it tool pills would render twice.
+   * Keyed via `eventDedupeKey`; see there for why bare `seq` is unsafe. */
+  seenEventKeys: Set<string>;
+  /** Monotonic counter from the most recent session_snapshot we've
+   * applied. Used to ignore events whose underlying publish
+   * predates the snapshot but whose state is already reflected
+   * in current_tool_calls / awaiting_input. Anything with
+   * `seq <= snapshotSeq` is treated as historical only — dispatched
+   * for transcript replay but not for "is the queen busy right now"
+   * inference. */
+  snapshotSeq: number;
+  /** Epoch-ms of the most recent session_snapshot event. `seq` restarts
+   * at 1 on every runtime run, so a low `seq <= snapshotSeq` is only
+   * genuinely "historical" when the event was *also* published at or
+   * before the snapshot — a fresh run's live events have low seqs too,
+   * but a later timestamp. 0 until a snapshot lands. */
+  snapshotAt: number;
+  /** Display name of the queen that authored the CURRENT run, captured
+   * from the `queen_identity_selected` event that opens each run. Used to
+   * label queen bubbles with their true per-run author instead of the
+   * colony's currently-linked queen — otherwise a colony that swapped
+   * queens relabels every historical bubble to the current one. Undefined
+   * until the first identity event; queen bubbles then fall back to the
+   * page-level `queenDisplayName`. */
+  queenIdentityName?: string;
 }
 
 export function newReplayState(): ReplayState {
   return {
     turnCounters: {},
-    toolRows: {},
-    toolUseToPill: {},
+    workerAnchored: new Set<string>(),
+    toolTrackers: {},
     queenIterText: {},
+    queenIterTimes: {},
+    queenInjections: {},
+    queenPendingChips: {},
+    queenChipsAppliedByMsgId: {},
+    imageGenMeta: {},
+    seenEventKeys: new Set<string>(),
+    snapshotSeq: 0,
+    snapshotAt: 0,
   };
 }
 
 /**
- * Token / cost accumulator for cold-restore.
+ * Stable, run-independent dedupe key for an AgentEvent.
  *
- * Folded into ``replayEventsToMessages`` so callers don't need a second
- * pass over the event array just to sum ``llm_turn_complete`` payloads.
- * The accumulator object is mutated in place — pass a fresh one in,
- * read its fields out after the call.
+ * `event.seq` alone is NOT unique. The runtime restarts its seq counter
+ * at 1 on every new run (each run opens with a `queen_identity_selected`),
+ * so a long-lived session's events.jsonl — and a long-lived SSE
+ * connection — accumulate many events sharing low seq values. Keying
+ * dedupe on bare `seq` makes a fresh run's events collide with an earlier
+ * run's and silently drop the entire job ("latest messages swallowed").
+ * Pairing `seq` with the event's own timestamp restores uniqueness
+ * across runs while still matching a genuinely redelivered event — the
+ * SSE ring-buffer replay re-sends the identical timestamp+seq.
+ *
+ * Returns null when there's no usable seq; those events fall back to the
+ * id-based upsert dedupe in the message list.
  */
-export interface TokenAccumulator {
-  input: number;
-  output: number;
-  cached: number;
-  cacheCreated: number;
-  costUsd: number;
+export function eventDedupeKey(event: AgentEvent): string | null {
+  const seq = event.seq;
+  if (typeof seq !== "number" || seq <= 0) return null;
+  return `${event.timestamp ?? ""}|${seq}`;
 }
 
-export function newTokenAccumulator(): TokenAccumulator {
-  return { input: 0, output: 0, cached: 0, cacheCreated: 0, costUsd: 0 };
+/** Returns true when this event has already been processed in this
+ * replay state. Events with no seq (legacy or synthesised on the
+ * renderer) always pass through — falling back to the existing
+ * id-based upsert dedupe in the message list. */
+export function shouldSkipForDedupe(state: ReplayState, event: AgentEvent): boolean {
+  const key = eventDedupeKey(event);
+  if (key === null) return false;
+  if (state.seenEventKeys.has(key)) return true;
+  state.seenEventKeys.add(key);
+  // Bound the set so a long-lived session doesn't grow unboundedly.
+  // 10k events covers ~hours of busy queen activity; older entries
+  // can never be replayed again because the server-side ring buffer
+  // is also bounded.
+  if (state.seenEventKeys.size > 10_000) {
+    const trimmed = Array.from(state.seenEventKeys).slice(-8000);
+    state.seenEventKeys.clear();
+    for (const k of trimmed) state.seenEventKeys.add(k);
+  }
+  return false;
 }
 
 function toolLookupKey(
@@ -376,23 +555,74 @@ function toolLookupKey(
   return `${streamId}:${executionId || "exec"}:${toolUseId}`;
 }
 
-function toolRowContent(row: ToolRowState): string {
-  const tools = Object.values(row.tools).map((t) => {
-    const out: ToolEntry = { name: t.name, done: t.done };
-    // Carry callKey + retained fields only for tools whose detail the
-    // UI mounts (chart_*). Pill-only tools stay terse so the
-    // tool_status payload doesn't grow with every catalog/file_ops
-    // call and existing snapshot tests stay valid.
-    if (shouldRetainDetail(t.name)) {
-      if (t.callKey !== undefined) out.callKey = t.callKey;
-      if (t.args !== undefined) out.args = t.args;
-      if (t.result !== undefined) out.result = t.result;
-      if (t.isError !== undefined) out.isError = t.isError;
-    }
-    return out;
-  });
-  const allDone = tools.length > 0 && tools.every((t) => t.done);
-  return JSON.stringify({ tools, allDone });
+/**
+ * Walk every tracker still in the state and mark its entry as
+ * interrupted. Used at the end of disk replay so an undone tool from
+ * a session that crashed/was killed without firing
+ * tool_call_completed renders as terminal-but-unknown rather than
+ * forever-running. Live SSE redelivery overwrites by id if the tool
+ * is in fact still alive.
+ */
+function finalizeOpenToolRows(
+  state: ReplayState,
+  thread: string,
+  agentDisplayName: string | undefined,
+  queenDisplayName: string | undefined,
+): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const tracker of Object.values(state.toolTrackers)) {
+    if (tracker.entry.done) continue;
+    tracker.entry.done = true;
+    tracker.entry.isInterrupted = true;
+    out.push(trackerToMessage(tracker, thread, agentDisplayName, queenDisplayName));
+  }
+  state.toolTrackers = {};
+  return out;
+}
+
+/**
+ * Serialize a single tool entry into the `tool_status` content shape.
+ * The renderer parses `{tools, allDone}` so the array form is kept
+ * even though one tool_status message now always carries exactly one
+ * tool — the render-side `tool_status_group` merge concatenates
+ * adjacent messages back into a multi-pill row.
+ */
+function entryContent(entry: ToolEntry): string {
+  const out: ToolEntry = { name: entry.name, done: entry.done };
+  if (entry.callKey !== undefined) out.callKey = entry.callKey;
+  if (entry.startedAt !== undefined) out.startedAt = entry.startedAt;
+  if (entry.endedAt !== undefined) out.endedAt = entry.endedAt;
+  if (entry.isInterrupted !== undefined) out.isInterrupted = entry.isInterrupted;
+  if (shouldRetainDetail(entry.name)) {
+    if (entry.args !== undefined) out.args = entry.args;
+    if (entry.result !== undefined) out.result = entry.result;
+    if (entry.isError !== undefined) out.isError = entry.isError;
+  }
+  return JSON.stringify({ tools: [out], allDone: entry.done });
+}
+
+function trackerToMessage(
+  tracker: ToolTracker,
+  thread: string,
+  agentDisplayName: string | undefined,
+  queenDisplayName: string | undefined,
+): ChatMessage {
+  const isQueen = tracker.streamId === "queen";
+  const fallbackName = isQueen
+    ? queenDisplayName || agentDisplayName
+    : agentDisplayName;
+  return {
+    id: tracker.msgId,
+    agent: tracker.agentName || fallbackName || "Agent",
+    agentColor: "",
+    content: entryContent(tracker.entry),
+    timestamp: "",
+    type: "tool_status",
+    role: tracker.role,
+    thread: tracker.thread || thread,
+    createdAt: tracker.createdAt,
+    streamId: tracker.streamId || undefined,
+  };
 }
 
 /**
@@ -413,6 +643,33 @@ function toolRowContent(row: ToolRowState): string {
  * emit the same pill id with updated content, which should REPLACE the
  * earlier row in the caller's message list.
  */
+/** Record a steer/queue injection (drain) time from a client_input_committed
+ *  event. Idempotent — keyed by conversation seq, so redelivery (disk restore
+ *  + live ring buffer) doesn't double-count. */
+export function recordQueenInjection(state: ReplayState, event: AgentEvent): void {
+  const exec = event.execution_id;
+  const cseq = event.data?.seq as number | undefined;
+  if (!exec || typeof cseq !== "number") return;
+  const t = event.timestamp ? new Date(event.timestamp).getTime() : 0;
+  (state.queenInjections[exec] ??= new Map<number, number>()).set(cseq, t);
+}
+
+/** Segment index for a queen text delta = how many injections (steers)
+ *  occurred before it, by timestamp. Pre-steer deltas → segment 0, deltas
+ *  after the Nth injection → segment N. Order-independent (compares times),
+ *  so disk restore and live SSE produce the same bubble id. */
+function queenSegmentFor(
+  state: ReplayState,
+  executionId: string,
+  deltaTime: number,
+): number {
+  const m = state.queenInjections[executionId];
+  if (!m || m.size === 0) return 0;
+  let seg = 0;
+  for (const t of m.values()) if (t < deltaTime) seg += 1;
+  return seg;
+}
+
 export function replayEvent(
   state: ReplayState,
   event: AgentEvent,
@@ -422,7 +679,13 @@ export function replayEvent(
 ): ChatMessage[] {
   const streamId = event.stream_id;
   const isQueen = streamId === "queen";
-  const effectiveName = isQueen ? (queenDisplayName || agentDisplayName) : agentDisplayName;
+  // Prefer the current run's own queen identity (from queen_identity_selected)
+  // over the colony's page-level queen name, so bubbles authored by a
+  // previously-linked queen keep that queen's name instead of relabeling to
+  // whoever is linked now.
+  const effectiveName = isQueen
+    ? state.queenIdentityName || queenDisplayName || agentDisplayName
+    : agentDisplayName;
   const role: "queen" | "worker" = isQueen ? "queen" : "worker";
   const turnKey = streamId;
   const currentTurn = state.turnCounters[turnKey] ?? 0;
@@ -432,9 +695,61 @@ export function replayEvent(
 
   const out: ChatMessage[] = [];
 
+  // Record steer/queue injection boundaries; produces no message itself.
+  // Subsequent queen deltas after this drain time fall into a new bubble
+  // segment (see queenSegmentFor) so the steer's reply doesn't fold into the
+  // pre-steer narration.
+  if (event.type === "client_input_committed") {
+    recordQueenInjection(state, event);
+    return out;
+  }
+
+  // A run opens with queen_identity_selected naming the queen that authored
+  // it. Capture that per-run identity so subsequent queen bubbles in this run
+  // are labeled with their true author. Produces no bubble itself.
+  if (event.type === "queen_identity_selected") {
+    const name = event.data?.name;
+    if (typeof name === "string" && name.trim()) {
+      state.queenIdentityName = name;
+    }
+    return out;
+  }
+
   // Update state machine BEFORE the generic converter runs so regular
   // messages and synthesized tool pills use the same turn counters in
   // both live SSE handling and cold replay.
+  // ── Worker bubble anchor ────────────────────────────────────────────────
+  // A parallel worker's bubble is seeded by a synthetic, empty-content
+  // role:"worker" message rather than by its first text delta — the server no
+  // longer streams a worker's chatter unless the user is watching that worker,
+  // and everything the bubble displays (task, status, result, task progress)
+  // comes from the workers poll. ChatPanel only opens a worker_run span on a
+  // role:"worker" message, so without this anchor an unwatched worker renders
+  // no bubble at all.
+  //
+  // Anchor on the FIRST event of any type, not on a chosen one: a spawned
+  // worker never emits `execution_started` (checked against a real 80-worker
+  // colony log — 62 node_loop_started, 82 subagent_report, zero
+  // execution_started), and a worker stopped while still queued emits nothing
+  // but a synthesized `subagent_report`. Once-per-stream keeps `createdAt`
+  // stable so the bubble doesn't jump around as more of its events arrive.
+  if (streamId && workerIdFromStreamId(streamId) && !state.workerAnchored.has(streamId)) {
+    state.workerAnchored.add(streamId);
+    out.push({
+      id: `worker-anchor-${streamId}`,
+      agent: agentDisplayName || "Worker",
+      agentColor: "",
+      content: "",
+      timestamp: "",
+      role: "worker",
+      thread,
+      createdAt: eventCreatedAt,
+      nodeId: event.node_id || undefined,
+      executionId: event.execution_id || undefined,
+      streamId,
+    });
+  }
+
   switch (event.type) {
     case "execution_started":
       state.turnCounters[turnKey] = currentTurn + 1;
@@ -446,106 +761,202 @@ export function replayEvent(
       if (!event.node_id) break;
       const toolName = (event.data?.tool_name as string) || "unknown";
       const toolUseId = (event.data?.tool_use_id as string) || "";
-      const pillId = `tool-pill-${streamId}-${event.execution_id || "exec"}-${currentTurn}`;
-      const row =
-        state.toolRows[pillId] ||
-        (state.toolRows[pillId] = {
-          streamId,
-          executionId: event.execution_id || "exec",
-          tools: {},
-        });
-      const toolKey = toolUseId || `anonymous-${Object.keys(row.tools).length}`;
+      // Path-independent message id. tool_use_id is stamped by the LLM
+      // provider and persisted with the event, so the same logical tool
+      // call yields the same msgId whether it arrives via disk replay
+      // (events.jsonl) or live SSE (ring-buffer resubscribe). That's
+      // what dedupes tool_status messages when the user switches away
+      // from a session and back. Anonymous calls (no tool_use_id, very
+      // rare) fall back to a seq-based id — they won't dedupe across
+      // paths but they're short-lived: finalizeOpenToolRows clears them
+      // at end-of-replay.
+      const msgId = toolUseId
+        ? `tool-${streamId}-${event.execution_id || "exec"}-${toolUseId}`
+        : `tool-${streamId}-${eventCreatedAt}-${event.seq ?? 0}`;
       const entry: ToolEntry = {
         name: toolName,
         done: false,
-        callKey: toolKey,
+        callKey: toolUseId || undefined,
+        startedAt: eventCreatedAt,
       };
-      // Capture args at start for retained-detail tools so the chat
-      // can show what the agent rendered. Other tools' arguments are
-      // intentionally dropped to keep the tool_status JSON small.
       if (shouldRetainDetail(toolName)) {
         const toolInput = event.data?.tool_input;
         if (toolInput !== undefined) entry.args = toolInput;
       }
-      row.tools[toolKey] = entry;
-      if (toolUseId) {
-        state.toolUseToPill[toolLookupKey(streamId, event.execution_id, toolUseId)] = {
-          msgId: pillId,
-          toolKey,
-          name: toolName,
-        };
-      }
-      out.push({
-        id: pillId,
-        agent: effectiveName || event.node_id || "Agent",
-        agentColor: "",
-        content: toolRowContent(row),
-        timestamp: "",
-        type: "tool_status",
-        role,
+      const tracker: ToolTracker = {
+        msgId,
+        streamId,
         thread,
+        agentName: effectiveName || event.node_id || "Agent",
+        role,
+        entry,
         createdAt: eventCreatedAt,
-        nodeId: event.node_id || undefined,
-        executionId: event.execution_id || undefined,
-        streamId: streamId || undefined,
-      });
+      };
+      const trackerKey = toolUseId
+        ? toolLookupKey(streamId, event.execution_id, toolUseId)
+        : `anon:${msgId}`;
+      state.toolTrackers[trackerKey] = tracker;
+      out.push(trackerToMessage(tracker, thread, agentDisplayName, queenDisplayName));
       break;
     }
     case "tool_call_completed": {
       if (!event.node_id) break;
       const toolUseId = (event.data?.tool_use_id as string) || "";
-      const lookupKey = toolLookupKey(streamId, event.execution_id, toolUseId);
-      const tracked = state.toolUseToPill[lookupKey];
-      if (toolUseId) delete state.toolUseToPill[lookupKey];
-      if (!tracked) break;
-      const row = state.toolRows[tracked.msgId];
-      if (!row) break;
-      const prior = row.tools[tracked.toolKey];
-      const completedName = prior?.name || tracked.name;
-      const completed: ToolEntry = {
-        name: completedName,
-        done: true,
-        callKey: tracked.toolKey,
-      };
-      // Preserve any args captured at start; capture the result
-      // envelope for retained-detail tools (chart_* needs spec/file_url
-      // to mount the live chart).
-      if (shouldRetainDetail(completedName)) {
-        if (prior?.args !== undefined) completed.args = prior.args;
+      if (!toolUseId) break;
+      const trackerKey = toolLookupKey(streamId, event.execution_id, toolUseId);
+      let tracker = state.toolTrackers[trackerKey];
+      if (tracker) {
+        delete state.toolTrackers[trackerKey];
+      } else {
+        // Orphan completion: the matching tool_call_started was
+        // truncated out of the event-log tail (eventsHistory only
+        // returns the last N events). Synthesize a terminal pill from
+        // the completion event alone so the transcript still shows the
+        // tool ran with its result — silently dropping it would leave a
+        // gap. Mirror image of finalizeOpenToolRows, which handles the
+        // opposite truncation (started without completed).
+        const toolName = (event.data?.tool_name as string) || "unknown";
+        tracker = {
+          msgId: `tool-${streamId}-${event.execution_id || "exec"}-${toolUseId}`,
+          streamId,
+          thread,
+          agentName: effectiveName || event.node_id || "Agent",
+          role,
+          entry: {
+            name: toolName,
+            done: false,
+            callKey: toolUseId,
+            startedAt: eventCreatedAt,
+          },
+          createdAt: eventCreatedAt,
+        };
+      }
+      tracker.entry.done = true;
+      tracker.entry.endedAt = eventCreatedAt;
+      if (shouldRetainDetail(tracker.entry.name)) {
         const rawResult = event.data?.result;
         if (rawResult !== undefined) {
-          // The framework serializes envelopes as JSON strings. Try to
-          // parse so the renderer can pick fields cheaply; fall back to
-          // the raw value when parsing fails (already-an-object or
-          // non-JSON string).
+          // Envelopes arrive as JSON strings; parse so the renderer
+          // can pick fields cheaply, falling back to the raw string
+          // for unknown shapes.
+          let parsed: unknown = rawResult;
           if (typeof rawResult === "string") {
             try {
-              completed.result = JSON.parse(rawResult);
+              parsed = JSON.parse(rawResult);
             } catch {
-              completed.result = rawResult;
+              parsed = rawResult;
             }
-          } else {
-            completed.result = rawResult;
           }
+          tracker.entry.result = parsed;
         }
         const isErr = event.data?.is_error;
-        if (typeof isErr === "boolean") completed.isError = isErr;
+        if (typeof isErr === "boolean") tracker.entry.isError = isErr;
       }
-      row.tools[tracked.toolKey] = completed;
-      out.push({
-        id: tracked.msgId,
-        agent: effectiveName || event.node_id || "Agent",
-        agentColor: "",
-        content: toolRowContent(row),
-        timestamp: "",
-        type: "tool_status",
-        role,
-        thread,
-        createdAt: eventCreatedAt,
-        nodeId: event.node_id || undefined,
-        executionId: event.execution_id || undefined,
-        streamId: streamId || undefined,
-      });
+      // attach_file: harvest hive_attachment_url(s) from the result and
+      // queue them under the execution_id. They'll be drained into the
+      // next new queen text bubble that appears (see the COD branch).
+      //
+      // Note: the result string starts with attach_file's JSON summary
+      // followed by the inlined text body for text-shaped attachments
+      // (the MCP executor concatenates TextContent blocks). Use
+      // raw_decode-style parsing — pull just the leading JSON envelope
+      // and ignore the trailing text.
+      // image_generate runs in the background and is collected via
+      // `collect_result`, whose result carries the proxy-injected
+      // `usage.credits` and the saved image path(s). (Direct image_generate
+      // output is handled too, for non-async configs.) The image is shown to
+      // the user via a subsequent attach_file call, so stash the per-image
+      // credit cost here (keyed by output filename) and attach it to that chip.
+      if (
+        isQueen &&
+        ((event.data?.tool_name as string) === "image_generate" ||
+          (event.data?.tool_name as string) === "collect_result")
+      ) {
+        const rawResult = event.data?.result;
+        if (typeof rawResult === "string") {
+          const leading = rawResult.replace(/^\s+/, "");
+          if (leading.startsWith("{")) {
+            try {
+              const parsed = JSON.parse(leading) as {
+                images?: { path?: unknown }[];
+                usage?: { credits?: unknown };
+              };
+              const imgs = Array.isArray(parsed.images) ? parsed.images : [];
+              const credits =
+                typeof parsed.usage?.credits === "number" ? parsed.usage.credits : undefined;
+              if (imgs.length > 0) {
+                // Record every generated image by basename (this marks it as
+                // generated); attach the per-image credit cost when known.
+                const per = credits !== undefined ? credits / imgs.length : undefined;
+                for (const im of imgs) {
+                  const p = (im as { path?: unknown }).path;
+                  if (typeof p === "string") {
+                    const base = p.split(/[\\/]/).pop();
+                    if (base) state.imageGenMeta[base] = { credits: per };
+                  }
+                }
+              }
+            } catch {
+              /* not JSON; skip */
+            }
+          }
+        }
+      }
+      if (isQueen && (event.data?.tool_name as string) === "attach_file" && event.execution_id) {
+        const rawResult = event.data?.result;
+        if (typeof rawResult === "string") {
+          const leading = rawResult.replace(/^\s+/, "");
+          if (leading.startsWith("{")) {
+            // Walk a brace-matched JSON envelope off the front of the
+            // string. We can't use JSON.parse(leading) directly because
+            // attach_file's trailing inlined file body breaks it.
+            let depth = 0;
+            let inStr = false;
+            let escape = false;
+            let end = -1;
+            for (let i = 0; i < leading.length; i++) {
+              const c = leading[i];
+              if (escape) { escape = false; continue; }
+              if (c === "\\" && inStr) { escape = true; continue; }
+              if (c === "\"") { inStr = !inStr; continue; }
+              if (inStr) continue;
+              if (c === "{") depth++;
+              else if (c === "}") {
+                depth--;
+                if (depth === 0) { end = i + 1; break; }
+              }
+            }
+            if (end > 0) {
+              let parsed: unknown = null;
+              try { parsed = JSON.parse(leading.slice(0, end)); } catch { /* not JSON; skip */ }
+              const attached = (parsed as { attached?: unknown[] })?.attached;
+              if (Array.isArray(attached)) {
+                if (!state.queenPendingChips[event.execution_id]) {
+                  state.queenPendingChips[event.execution_id] = [];
+                }
+                for (const entry of attached) {
+                  if (!entry || typeof entry !== "object") continue;
+                  const url = (entry as { hive_attachment_url?: unknown }).hive_attachment_url;
+                  const filename = (entry as { filename?: unknown }).filename;
+                  if (typeof url === "string" && url.length > 0) {
+                    const fname = typeof filename === "string" ? filename : undefined;
+                    const genMeta = fname ? state.imageGenMeta[fname] : undefined;
+                    state.queenPendingChips[event.execution_id].push({
+                      url,
+                      filename: fname,
+                      // Mark queen-generated images so they render as a
+                      // confident "Generated image" card, with the credit cost.
+                      generated: !!genMeta,
+                      credits: genMeta?.credits,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      out.push(trackerToMessage(tracker, thread, agentDisplayName, queenDisplayName));
       break;
     }
   }
@@ -566,23 +977,129 @@ export function replayEvent(
       ) {
         const iter = (event.data?.iteration as number | undefined) ?? 0;
         const inner = (event.data?.inner_turn as number | undefined) ?? 0;
-        const iterKey = `${event.execution_id}:${iter}`;
+        // Split a long iteration into segments at each mid-iteration steer so
+        // the post-steer reply renders as its own bubble below the steer,
+        // instead of folding into the bubble pinned at the iteration's start.
+        const seg = queenSegmentFor(state, event.execution_id, eventCreatedAt);
+        const iterKey = `${event.execution_id}:${iter}:${seg}`;
         if (!state.queenIterText[iterKey]) {
           state.queenIterText[iterKey] = {};
         }
+        (state.queenIterTimes[iterKey] ??= {});
         state.queenIterText[iterKey][inner] = msg.content;
+        // Keep the first-seen time for this inner turn (when the step began),
+        // not the latest streaming delta's.
+        state.queenIterTimes[iterKey][inner] ??= eventCreatedAt;
         const parts = state.queenIterText[iterKey];
         const sorted = Object.keys(parts)
           .map(Number)
           .sort((a, b) => a - b);
-        msg.content = sorted.map((k) => parts[k]).join("\n");
-        msg.id = `queen-stream-${event.execution_id}-${iter}`;
+        const spans = sorted.map((k) => parts[k]);
+        // Join inner-turn spans with a blank line so copied/printed/plain-text
+        // forms read as paragraphs. The rendered bubble draws a wider (1.5x
+        // paragraph) gap between spans via `innerTurns` (see ChatPanel).
+        msg.content = spans.join("\n\n");
+        if (spans.length > 1) {
+          msg.innerTurns = spans;
+          msg.innerTurnTimes = sorted.map((k) => state.queenIterTimes[iterKey][k]);
+        }
+        msg.id = `queen-stream-${event.execution_id}-${iter}-s${seg}`;
+        // Chip-attach policy:
+        //   1. If we've already applied chips to THIS bubble (msg.id),
+        //      re-attach the same list. Keeps the chip stable across
+        //      every streaming delta for the bubble.
+        //   2. Otherwise, drain any chips queued for the execution
+        //      (pushed by tool_call_completed for attach_file) into
+        //      this bubble — it's the first new queen-text bubble to
+        //      appear since the tool ran.
+        const alreadyApplied = state.queenChipsAppliedByMsgId[msg.id];
+        const pending = event.execution_id
+          ? state.queenPendingChips[event.execution_id]
+          : undefined;
+        let chips = alreadyApplied;
+        if (!chips && pending && pending.length > 0) {
+          chips = pending.splice(0);  // drain
+          state.queenChipsAppliedByMsgId[msg.id] = chips;
+        }
+        if (chips && chips.length > 0) {
+          msg.images = chips.map((c) => ({
+            type: "image_url" as const,
+            image_url: { url: c.url },
+            _fileName: c.filename,
+            _credits: c.credits,
+            _generated: c.generated,
+          }));
+        }
       }
     }
     out.push(msg);
   }
 
   return out;
+}
+
+/**
+ * Combine two ChatMessage entries that share an id. tool_status pills
+ * carry their accumulated tools[] in JSON content, so a naive
+ * "restored overwrites prev" merge silently drops tools that one side
+ * saw but the other didn't — common when the user switches back to a
+ * mid-streaming session: the disk events.jsonl write lags the SSE
+ * ring buffer by a few hundred ms, so disk's pill is missing the
+ * just-streamed tool. This helper unions the tools by callKey,
+ * preferring the more-complete entry (done > running, has-result >
+ * no-result), so neither side's events are lost in the merge.
+ *
+ * Non-tool_status messages and unparseable content fall through to
+ * "restored wins" (the existing behaviour) — they're idempotent
+ * across replays and don't need merging.
+ */
+export function mergeChatMessages(prev: ChatMessage, restored: ChatMessage): ChatMessage {
+  if (prev.type !== "tool_status" || restored.type !== "tool_status") {
+    return restored;
+  }
+  let prevData: { tools?: ToolEntry[]; allDone?: boolean };
+  let restoredData: { tools?: ToolEntry[]; allDone?: boolean };
+  try {
+    prevData = JSON.parse(prev.content);
+    restoredData = JSON.parse(restored.content);
+  } catch {
+    return restored;
+  }
+  const byKey = new Map<string, ToolEntry>();
+  const order: string[] = [];
+  let anonCount = 0;
+  const ingest = (t: ToolEntry) => {
+    const key = t.callKey ?? `__anon-${anonCount++}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, t);
+      order.push(key);
+      return;
+    }
+    // Prefer the more-complete entry: done wins over running; preserve
+    // result/args/isError from whichever side captured them.
+    const merged: ToolEntry = {
+      name: existing.name || t.name,
+      done: existing.done || t.done,
+      callKey: existing.callKey ?? t.callKey,
+    };
+    if (t.args !== undefined) merged.args = t.args;
+    else if (existing.args !== undefined) merged.args = existing.args;
+    if (t.result !== undefined) merged.result = t.result;
+    else if (existing.result !== undefined) merged.result = existing.result;
+    if (t.isError !== undefined) merged.isError = t.isError;
+    else if (existing.isError !== undefined) merged.isError = existing.isError;
+    byKey.set(key, merged);
+  };
+  for (const t of prevData.tools ?? []) ingest(t);
+  for (const t of restoredData.tools ?? []) ingest(t);
+  const tools = order.map((k) => byKey.get(k)!);
+  const allDone = tools.length > 0 && tools.every((t) => t.done);
+  return {
+    ...restored,
+    content: JSON.stringify({ tools, allDone }),
+    createdAt: Math.max(prev.createdAt ?? 0, restored.createdAt ?? 0),
+  };
 }
 
 /**
@@ -603,7 +1120,6 @@ export function replayEventsToMessages(
   agentDisplayName: string | undefined,
   queenDisplayName?: string,
   state: ReplayState = newReplayState(),
-  tokenAccumulator?: TokenAccumulator,
 ): ChatMessage[] {
   // Upsert by id — later emissions for the same pill replace earlier ones.
   const byId = new Map<string, ChatMessage>();
@@ -615,19 +1131,14 @@ export function replayEventsToMessages(
   let markerCreatedAt: number | null = null;
   const inheritedIds = new Set<string>();
 
+  // Pre-pass: record every steer/queue injection time up front so the
+  // queen-bubble segmentation in the main loop is independent of event
+  // ordering (a delta streamed before its drain still segments correctly).
   for (const evt of events) {
-    // Fold the token-usage sum into this same loop so cold-restore
-    // doesn't need a second pass over the event array. SSE does not
-    // replay llm_turn_complete (see routes_events.py _REPLAY_TYPES) so
-    // there's no double-count risk against later live updates.
-    if (tokenAccumulator && evt.type === "llm_turn_complete" && evt.data) {
-      const d = evt.data as Record<string, unknown>;
-      tokenAccumulator.input += (d.input_tokens as number) || 0;
-      tokenAccumulator.output += (d.output_tokens as number) || 0;
-      tokenAccumulator.cached += (d.cached_tokens as number) || 0;
-      tokenAccumulator.cacheCreated += (d.cache_creation_tokens as number) || 0;
-      tokenAccumulator.costUsd += (d.cost_usd as number) || 0;
-    }
+    if (evt.type === "client_input_committed") recordQueenInjection(state, evt);
+  }
+
+  for (const evt of events) {
     if (evt.type === "colony_fork_marker") {
       if (markerEvent === null) {
         markerEvent = evt;
@@ -640,6 +1151,30 @@ export function replayEventsToMessages(
       }
       continue;
     }
+    if (evt.type === "client_input_committed") {
+      // Re-stamp the user bubble (created earlier by client_input_received)
+      // to its true injection time, so a revisit/replay orders it exactly
+      // like the live transcript — after the in-flight turn, not at receive
+      // time. Matched by correlation id. Idempotent if seen twice.
+      const committedAt = evt.timestamp
+        ? new Date(evt.timestamp).getTime()
+        : null;
+      const corr = evt.correlation_id || undefined;
+      if (committedAt && corr) {
+        for (const [id, m] of byId) {
+          if (m.type === "user" && m.correlationId === corr) {
+            byId.set(id, { ...m, createdAt: committedAt });
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    // Dedupe by seq before delegating to the per-event state machine.
+    // Without this, the same event delivered via both eventsHistory
+    // (disk) and the live SSE replay (ring buffer) would render its
+    // tool pill twice on revisit.
+    if (shouldSkipForDedupe(state, evt)) continue;
     for (const m of replayEvent(state, evt, thread, agentDisplayName, queenDisplayName)) {
       const previous = byId.get(m.id);
       byId.set(
@@ -647,6 +1182,22 @@ export function replayEventsToMessages(
         previous ? { ...m, createdAt: previous.createdAt ?? m.createdAt } : m,
       );
     }
+  }
+
+  // After processing all events, any tool row still "open" had at
+  // least one call without a corresponding tool_call_completed —
+  // typically because the session ended (runtime crashed/killed/not
+  // auto-resumed) mid-tool. Mark those entries as interrupted so the
+  // renderer can show them as a terminal "didn't finish" state
+  // instead of perpetually green/running. Live SSE redelivery (if
+  // the runtime is in fact still running the tool) will overwrite
+  // this via upsertMessage on the same deterministic pillId.
+  for (const m of finalizeOpenToolRows(state, thread, agentDisplayName, queenDisplayName)) {
+    const previous = byId.get(m.id);
+    byId.set(
+      m.id,
+      previous ? { ...m, content: m.content, createdAt: previous.createdAt ?? m.createdAt } : m,
+    );
   }
 
   const all = Array.from(byId.values()).sort(
@@ -690,13 +1241,57 @@ export function replayEventsToMessages(
   return [block, ...native];
 }
 
-type QueenPhase = "independent" | "incubating" | "working" | "reviewing";
-const VALID_PHASES = new Set<string>([
-  "independent",
-  "incubating",
-  "working",
-  "reviewing",
-]);
+/** How many events each backward page fetches (infinite scroll). The render
+ *  window reveals messages 30 at a time; this is the network-fetch
+ *  granularity. */
+export const EVENTS_PAGE_SIZE = 500;
+
+/** Backward-paging cursor for a session's event log. Seeded from the first
+ *  (newest) page and advanced as older pages are fetched on scroll-up. */
+export type OlderCursor = {
+  /** Byte offset of the first held event's line — pass as `beforeOffset`. */
+  startOffset: number;
+  /** Absolute 1-based line-index of the first held event — pass as
+   *  `beforeIndex`. */
+  startIndex: number;
+  /** True while older events remain on disk. */
+  hasMoreOlder: boolean;
+};
+
+/**
+ * Replay a session's OLDER paged events into messages.
+ *
+ * Used by the infinite-scroll paging path: the newest page seeds the live
+ * transcript, and as the user scrolls up earlier pages are fetched and
+ * prepended to a separate oldest-first accumulator. This re-runs the full
+ * accumulator through `replayEventsToMessages` with a FRESH `ReplayState`
+ * every call — a fresh state each time is mandatory because the replay is a
+ * stateful oldest→newest walk (tool spans, turn counters, chip-attach
+ * draining, the fork-marker fold all cross page boundaries), so re-deriving
+ * from the whole accumulator is the only way to stay correct as pages land.
+ * It must NOT share state with the live SSE `replayStateRef`.
+ *
+ * Idempotent: the backend renumbers `seq` to the absolute file line-index, so
+ * message ids (keyed on tool_use_id / execution_id+iteration) are stable
+ * across re-runs and merge cleanly at the boundary with the live transcript.
+ */
+export function replayOlderEvents(
+  olderEvents: AgentEvent[],
+  thread: string,
+  agentDisplayName: string | undefined,
+  queenDisplayName?: string,
+): ChatMessage[] {
+  return replayEventsToMessages(
+    olderEvents,
+    thread,
+    agentDisplayName,
+    queenDisplayName,
+    newReplayState(),
+  );
+}
+
+type QueenPhase = "independent" | "colony";
+const VALID_PHASES = new Set<string>(["independent", "colony"]);
 
 /**
  * Scan an array of persisted events and return the last queen phase seen,

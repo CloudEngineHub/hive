@@ -39,8 +39,6 @@ class InputValidationStage(PipelineStage):
             if not isinstance(value, expected_type):
                 return PipelineResult(
                     action="reject",
-                    rejection_reason=(
-                        f"Input key '{key}' has type {type(value).__name__}, expected {expected_type.__name__}"
-                    ),
+                    rejection_reason=(f"Input key '{key}' has type {type(value).__name__}, expected {expected_type.__name__}"),
                 )
         return PipelineResult(action="continue")

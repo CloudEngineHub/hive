@@ -162,9 +162,7 @@ class TestAzureSQLGetDatabase:
                 return_value=_mock_resp(data),
             ),
         ):
-            result = tool_fns["azure_sql_get_database"](
-                resource_group="rg", server_name="myserver", database_name="mydb"
-            )
+            result = tool_fns["azure_sql_get_database"](resource_group="rg", server_name="myserver", database_name="mydb")
 
         assert result["name"] == "mydb"
         assert result["zone_redundant"] is True

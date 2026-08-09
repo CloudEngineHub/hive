@@ -12,7 +12,9 @@ Each log entry includes:
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import inspect
 import json
 import time
 import traceback
@@ -105,14 +107,43 @@ def write_log(entry: dict[str, Any]) -> None:
         pass
 
 
+def _resolved_tab_id(params: dict, result: dict | None) -> int | None:
+    """Pick the tab id the action actually ran against.
+
+    Tools accept ``tab_id`` as optional (defaulting to the agent's active
+    tab) and surface the resolved id in their result. Prefer the result's
+    ``tabId`` since that's the settled value; fall back to the param.
+    """
+    res = result or {}
+    for k in ("tabId", "tab_id"):
+        v = res.get(k)
+        if isinstance(v, int):
+            return v
+    v = params.get("tab_id")
+    return v if isinstance(v, int) else None
+
+
 def log_tool_call(
     tool_name: str,
     params: dict[str, Any],
     result: dict[str, Any] | None = None,
     error: Exception | None = None,
     duration_ms: float | None = None,
+    *,
+    tab_id: int | None = None,
+    action: tuple[str, str] | None = None,
 ) -> None:
-    """Log a tool invocation."""
+    """Log a tool invocation, and optionally push an entry into the side
+    panel's per-tab action history.
+
+    To record an action-history row, the tool passes ``action=(verb, target)``
+    and ``tab_id=<the tab the call ran against>``. Tools that omit ``action``
+    (observation tools like snapshot/screenshot, or early-exit failure paths
+    where no tab was resolved) write the JSONL entry but do not push to the
+    history buffer. Each tool is the source of truth for its own verb/target
+    because it has the params in their original shape — telemetry should not
+    re-derive what the tool already knew.
+    """
     entry: dict[str, Any] = {
         "type": "tool_call",
         "tool": tool_name,
@@ -132,6 +163,37 @@ def log_tool_call(
         entry["duration_ms"] = round(duration_ms, 2)
 
     write_log(entry)
+
+    # Push to per-tab ring buffer only when the caller declared an action.
+    # Lazy-imported to avoid the circular bridge ↔ telemetry dependency.
+    # Best-effort: a buffering failure must NEVER break the original tool.
+    if action is None:
+        return
+    if tab_id is None:
+        tab_id = _resolved_tab_id(params, result)
+    if not isinstance(tab_id, int):
+        return
+    try:
+        from .bridge import get_bridge
+
+        bridge = get_bridge()
+        if bridge is None or not hasattr(bridge, "record_action"):
+            return
+        ok = (result or {}).get("ok", True) if error is None else False
+        verb, target = action
+        # In client mode `bridge` is a RemoteBridge proxy and record_action
+        # is `async def` (it forwards over RPC). The browser tools call us
+        # from a running event loop, so schedule the awaitable as a task —
+        # we don't need the result; the side panel only needs the entry to
+        # land in the bridge process's buffer.
+        ret = bridge.record_action(tab_id, verb, target=target or "", ok=bool(ok))
+        if inspect.isawaitable(ret):
+            try:
+                asyncio.get_running_loop().create_task(ret)
+            except RuntimeError:
+                ret.close()  # no running loop — drop cleanly, no warning
+    except Exception:
+        pass
 
 
 def log_bridge_message(
@@ -283,4 +345,3 @@ def instrument_tool(tool_name: str) -> Callable[[F], F]:
 
 
 # Import asyncio at the end to avoid circular import issues
-import asyncio  # noqa: E402

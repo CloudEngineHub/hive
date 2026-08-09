@@ -39,9 +39,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -157,9 +155,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import Workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -231,9 +227,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -318,9 +312,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -395,9 +387,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -465,9 +455,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)
@@ -584,9 +572,7 @@ def register_tools(mcp: FastMCP) -> None:
         except Exception as e:
             error_msg = str(e)
             if "Catalog Error" in error_msg or "Table" in error_msg:
-                return {
-                    "error": f"SQL error: {error_msg}. Use 'data' for target sheet or sheet names with underscores."
-                }
+                return {"error": f"SQL error: {error_msg}. Use 'data' for target sheet or sheet names with underscores."}
             return {"error": f"Query failed: {error_msg}"}
 
     @mcp.tool()
@@ -615,9 +601,7 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             from openpyxl import load_workbook
         except ImportError:
-            return {
-                "error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")
-            }
+            return {"error": ("openpyxl not installed. Install with: pip install openpyxl  or  pip install tools[excel]")}
 
         try:
             secure_path = get_sandboxed_path(path, agent_id)

@@ -379,9 +379,7 @@ class TestAttioClient:
     def test_get_member(self, mock_request):
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "data": {"id": "member-1", "first_name": "Alice", "email_address": "alice@co.com"}
-        }
+        mock_response.json.return_value = {"data": {"id": "member-1", "first_name": "Alice", "email_address": "alice@co.com"}}
         mock_request.return_value = mock_response
 
         result = self.client.get_member("member-1")

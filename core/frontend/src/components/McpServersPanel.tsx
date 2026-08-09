@@ -123,12 +123,15 @@ function buildAddBody(form: AddFormState): AddMcpServerBody {
   return body;
 }
 
-export default function McpServersPanel() {
+export default function McpServersPanel({ addOpen, setAddOpen }: { addOpen?: boolean; setAddOpen?: (v: boolean) => void } = {}) {
   const [servers, setServers] = useState<McpServer[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [adding, setAdding] = useState(false);
+  const [addingInternal, setAddingInternal] = useState(false);
+  // Allow parent to control the add modal, or fall back to internal state.
+  const adding = addOpen ?? addingInternal;
+  const setAdding = setAddOpen ?? setAddingInternal;
   const [form, setForm] = useState<AddFormState>(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -238,36 +241,6 @@ export default function McpServersPanel() {
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-lg font-semibold text-foreground">MCP Servers</h3>
-          <p className="text-sm text-muted-foreground mt-1">
-            Register your own MCP servers so queens can use their tools. New
-            servers take effect in the next queen session you start.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={refresh}
-            disabled={loading}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border/60 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
-            title="Refresh"
-          >
-            <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
-          </button>
-          <button
-            onClick={() => {
-              setAdding(true);
-              setForm(EMPTY_FORM);
-              setSubmitError(null);
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90"
-          >
-            <Plus className="w-3 h-3" />
-            Add MCP Server
-          </button>
-        </div>
-      </div>
 
       {error && (
         <div className="flex items-start gap-2 text-xs text-destructive p-2.5 rounded-md bg-destructive/10 border border-destructive/30">

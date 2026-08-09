@@ -3,7 +3,6 @@
 export interface LiveSession {
   session_id: string;
   colony_id: string | null;
-  colony_name: string | null;
   has_worker: boolean;
   agent_path: string;
   description: string;
@@ -12,10 +11,10 @@ export interface LiveSession {
   loaded_at: number;
   uptime_seconds: number;
   intro_message?: string;
-  /** Queen operating phase — "independent" (DM), "incubating" (drafting a
-   *  colony spec after the readiness eval approved), "working" (workers
-   *  running), or "reviewing" (workers done) */
-  queen_phase?: "independent" | "incubating" | "working" | "reviewing";
+  /** Queen operating phase — "independent" (DM) or "colony" (forked into
+   *  a colony, workers running or finished). Legacy values "incubating",
+   *  "working", and "reviewing" are normalized server-side. */
+  queen_phase?: "independent" | "colony";
   /** Whether the queen's LLM supports image content in messages */
   queen_supports_images?: boolean;
   /** Selected queen identity ID (e.g. "queen_technology") */
@@ -26,7 +25,7 @@ export interface LiveSession {
    *  /chat returns 409 until the user compacts and forks into a new session. */
   colony_spawned?: boolean;
   /** Name of the colony that locked this session (set with colony_spawned). */
-  spawned_colony_name?: string | null;
+  spawned_colony_id?: string | null;
   /** Present in 409 conflict responses when worker is still loading */
   loading?: boolean;
 }
@@ -78,7 +77,7 @@ export interface WorkerEntry {
   task: string;
   spawned_at: string;
   queen_name: string;
-  colony_name: string;
+  colony_id: string;
 }
 
 export interface DiscoverEntry {
@@ -264,12 +263,16 @@ export type EventTypeName =
   | "client_output_delta"
   | "client_input_requested"
   | "client_input_received"
+  | "client_input_committed"
+  | "client_credential_form_requested"
+  | "colony_suggestion_requested"
   | "node_internal_output"
   | "node_input_blocked"
   | "node_stalled"
   | "node_tool_doom_loop"
   | "judge_verdict"
   | "node_retry"
+  | "context_compaction_started"
   | "context_compacted"
   | "context_usage_updated"
   | "webhook_received"
@@ -281,6 +284,8 @@ export type EventTypeName =
   | "queen_phase_changed"
   | "colony_fork_marker"
   | "subagent_report"
+  | "worker_completed"
+  | "worker_failed"
   | "trigger_available"
   | "trigger_activated"
   | "trigger_deactivated"
@@ -293,7 +298,20 @@ export type EventTypeName =
   | "task_deleted"
   | "task_list_reset"
   | "task_list_reattach_mismatch"
-  | "colony_template_assignment";
+  | "session_snapshot"
+  | "credential_provider_connected"
+  | "credential_provider_disconnected"
+  | "tool_catalog_refreshed"
+  | "tools_config_changed"
+  | "crm_changed"
+  | "session_forked"
+  // Stream-health & nudge observability (see core EventType).
+  | "stream_ttft_exceeded"
+  | "stream_inactive"
+  | "stream_nudge_sent"
+  | "reminder_injected"
+  // The agent loop's authoritative top-level state changed.
+  | "loop_state_changed";
 
 export interface AgentEvent {
   type: EventTypeName;
@@ -305,4 +323,29 @@ export interface AgentEvent {
   correlation_id: string | null;
   colony_id: string | null;
   run_id?: string | null;
+  /** Monotonic publish counter assigned by the EventBus. Synthesised
+   * events (e.g. session_snapshot built from the ring buffer) carry
+   * seq=0 to mark them as not-from-history. Used by the renderer for
+   * dedupe across the disk eventsHistory and live SSE replay paths. */
+  seq?: number;
+}
+
+/** Shape of the data payload on a session_snapshot event. The SSE
+ * handler builds this from the per-session ring buffer at the moment
+ * the client subscribes. The renderer uses it to rehydrate
+ * isTyping/awaitingInput/in-flight tool pills instantly on revisit. */
+export interface SessionSnapshotData {
+  snapshot_seq: number;
+  is_executing: boolean;
+  current_execution_id: string | null;
+  current_tool_calls: Array<{
+    id: string;
+    name: string | null;
+    started_at: string;
+    execution_id: string | null;
+    seq: number;
+  }>;
+  awaiting_input: boolean;
+  queen_busy_reason: "tool" | "llm" | null;
+  last_event_at: string | null;
 }

@@ -2,39 +2,52 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { messagesApi } from "@/api/messages";
+import { sessionsApi } from "@/api/sessions";
 import { useColony } from "@/context/ColonyContext";
+import { isQueenDecommissioned, useMe } from "@/lib/me";
+import { slugToColonyId } from "@/lib/colony-registry";
+import { userStorage } from "@/lib/userStorage";
+import { PENDING_CLASSIFY_KEY } from "@/lib/routing-keys";
 
 /**
  * Transient routing screen the user lands on right after submitting from the
- * home page. Reads the pending prompt from sessionStorage, runs queen
- * classification, and redirects (replace) to the resolved queen DM with
- * ?new=1 so the existing bootstrap flow takes over.
+ * home page. Reads the pending prompt from sessionStorage, runs a single LLM
+ * call that picks both the best queen *and* a colony name, spins up a colony
+ * session seeded with the prompt as its goal, and redirects (replace) to that
+ * colony's page.
  *
  * The point of this page is to get the user out of the home screen *before*
- * the classify LLM call runs — they should never sit on the home page
- * watching a spinner.
+ * the classify + create round-trip runs — they should never sit on the home
+ * page watching a spinner.
  */
-export const PENDING_CLASSIFY_KEY = "hive:pendingClassifyMessage";
+export { PENDING_CLASSIFY_KEY } from "@/lib/routing-keys";
 
 export default function QueenRouting() {
   const navigate = useNavigate();
-  const { refresh } = useColony();
+  const { colonies, queenProfiles, refresh } = useColony();
+  const { me } = useMe();
   const [error, setError] = useState<string | null>(null);
   // Re-runs of this effect (StrictMode, fast re-mounts) must not re-fire the
-  // classify call — once we've grabbed the pending message we own it.
+  // classify/create calls — once we've grabbed the pending message we own it.
   const startedRef = useRef(false);
+  // Snapshot the colony list once so the uniquifier doesn't depend on async
+  // context refreshes (which would re-run the effect via the dep array).
+  const coloniesRef = useRef(colonies);
+  coloniesRef.current = colonies;
+  // Same snapshot treatment for the active roster the classifier may pick
+  // from. If profiles haven't loaded yet this is empty and the runtime falls
+  // back to the full catalog.
+  const activeQueenIdsRef = useRef<string[]>([]);
+  activeQueenIdsRef.current = queenProfiles
+    .filter((q) => !isQueenDecommissioned(me, q.id))
+    .map((q) => q.id);
 
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
 
-    let pending: string | null = null;
-    try {
-      pending = sessionStorage.getItem(PENDING_CLASSIFY_KEY);
-      if (pending) sessionStorage.removeItem(PENDING_CLASSIFY_KEY);
-    } catch {
-      pending = null;
-    }
+    const pending = userStorage.session.get<string | null>(PENDING_CLASSIFY_KEY, null);
+    if (pending !== null) userStorage.session.remove(PENDING_CLASSIFY_KEY);
 
     if (!pending || !pending.trim()) {
       navigate("/", { replace: true });
@@ -45,16 +58,43 @@ export default function QueenRouting() {
     let cancelled = false;
     (async () => {
       try {
-        const { queen_id } = await messagesApi.classify(trimmed);
+        const { queen_id, colony_name } = await messagesApi.classifyColony(
+          trimmed,
+          activeQueenIdsRef.current,
+        );
         if (cancelled) return;
-        // Hand the prompt off to queen-dm via the same key its bootstrap
-        // path already consumes. Avoids leaking the message into the URL.
-        sessionStorage.setItem(`queenFirstMessage:${queen_id}`, trimmed);
+
+        // Avoid silently reusing an existing colony when the LLM (or the
+        // fallback) proposes a name that's already taken — suffix until the
+        // route id is free.
+        const taken = new Set(coloniesRef.current.map((c) => c.id));
+        let slug = colony_name;
+        let colonyId = slugToColonyId(slug);
+        for (let n = 2; taken.has(colonyId); n++) {
+          slug = `${colony_name}_${n}`;
+          colonyId = slugToColonyId(slug);
+        }
+
+        // Create the colony session with the prompt as its goal (sent to the
+        // backend as initial_prompt), then land on the colony page. initialGoal
+        // in route state drives the immediate typing indicator (matches the
+        // Sidebar / queen-dm colony-create callers).
+        const created = await sessionsApi.create({
+          colonyId: slug,
+          colonyGoal: trimmed,
+          queenName: queen_id,
+          initialPhase: "colony",
+        });
+        if (cancelled) return;
         refresh();
-        navigate(`/queen/${queen_id}?new=1`, { replace: true });
+        const actualColonyId = slugToColonyId(created.colony_id ?? slug);
+        navigate(`/colony/${actualColonyId}`, {
+          replace: true,
+          state: { initialGoal: trimmed },
+        });
       } catch {
         if (cancelled) return;
-        setError("Couldn't route your request. Try again from the home screen.");
+        setError("Couldn't start your colony. Try again from the home screen.");
       }
     })();
 

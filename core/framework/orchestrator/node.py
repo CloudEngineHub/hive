@@ -114,29 +114,11 @@ class NodeSpec(BaseModel):
     )
 
     # Data flow
-    input_keys: list[str] = Field(
-        default_factory=list, description="Keys this node reads from the shared buffer or input"
-    )
-    output_keys: list[str] = Field(
-        default_factory=list, description="Keys this node writes to the shared buffer or output"
-    )
+    input_keys: list[str] = Field(default_factory=list, description="Keys this node reads from the shared buffer or input")
+    output_keys: list[str] = Field(default_factory=list, description="Keys this node writes to the shared buffer or output")
     nullable_output_keys: list[str] = Field(
         default_factory=list,
         description="Output keys that can be None without triggering validation errors",
-    )
-
-    # Optional schemas for validation and cleansing
-    input_schema: dict[str, dict] = Field(
-        default_factory=dict,
-        description=(
-            "Optional schema for input validation. Format: {key: {type: 'string', required: True, description: '...'}}"
-        ),
-    )
-    output_schema: dict[str, dict] = Field(
-        default_factory=dict,
-        description=(
-            "Optional schema for output validation. Format: {key: {type: 'dict', required: True, description: '...'}}"
-        ),
     )
 
     # For LLM nodes
@@ -171,19 +153,6 @@ class NodeSpec(BaseModel):
             "0 = unlimited (default, required for forever-alive agents). "
             "Set >1 for one-shot agents with feedback loops."
         ),
-    )
-
-    # Pydantic model for output validation
-    output_model: type[BaseModel] | None = Field(
-        default=None,
-        description=(
-            "Optional Pydantic model class for validating and parsing LLM output. "
-            "When set, the LLM response will be validated against this model."
-        ),
-    )
-    max_validation_retries: int = Field(
-        default=2,
-        description="Maximum retries when Pydantic validation fails (with feedback to LLM)",
     )
 
     # Client-facing behavior
@@ -310,8 +279,7 @@ class DataBuffer:
                 # Long strings that look like code are suspicious
                 if self._contains_code_indicators(value):
                     logger.warning(
-                        f"⚠ Suspicious write to key '{key}': appears to be code "
-                        f"({len(value)} chars). Consider using validate=False if intended."
+                        f"⚠ Suspicious write to key '{key}': appears to be code ({len(value)} chars). Consider using validate=False if intended."
                     )
                     raise DataBufferWriteError(
                         f"Rejected suspicious content for key '{key}': "
@@ -353,8 +321,7 @@ class DataBuffer:
                 if len(value) > 5000:
                     if self._contains_code_indicators(value):
                         logger.warning(
-                            f"⚠ Suspicious write to key '{key}': appears to be code "
-                            f"({len(value)} chars). Consider using validate=False if intended."
+                            f"⚠ Suspicious write to key '{key}': appears to be code ({len(value)} chars). Consider using validate=False if intended."
                         )
                         raise DataBufferWriteError(
                             f"Rejected suspicious content for key '{key}': "
@@ -552,15 +519,19 @@ class NodeContext:
     skills_catalog_prompt: str = ""  # Available skills XML catalog
     protocols_prompt: str = ""  # Default skill operational protocols
     skill_dirs: list[str] = field(default_factory=list)  # Skill base dirs for resource access
-    # DS-12: batch auto-detection nudge appended to system prompt when input looks like a batch
-    default_skill_batch_nudge: str | None = None
-    # DS-13: token usage ratio at which to inject a context preservation warning
-    default_skill_warn_ratio: float | None = None
 
     # Per-iteration metadata provider — when set, EventLoopNode merges
     # the returned dict into node_loop_iteration event data.  Used by
     # the queen to record the current phase per iteration.
     iteration_metadata_provider: Any = None  # Callable[[], dict] | None
+
+    # Optional Callable[[], ColonyBinding | None]: resolves the on-disk
+    # colony this node is bound to. Mirrors AgentContext's field of the
+    # same name. When set, the orchestrator prompt builder emits a
+    # ``Tracker DB:`` line in the cache-stable static prefix so the LLM
+    # can see (and reference) its tracker DB path. ``None`` for graph
+    # runs that aren't colony-scoped — the line is omitted.
+    colony_binding_provider: Any = None  # Callable[[], ColonyBinding | None] | None
 
     # ------------------------------------------------------------------
     # Compatibility aliases — AgentLoop accesses ctx.agent_id / ctx.agent_spec

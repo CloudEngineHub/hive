@@ -69,9 +69,6 @@ class Goal(BaseModel):
         description="What the colony needs: 'llm', 'web_search', 'code_execution', etc.",
     )
 
-    input_schema: dict[str, Any] = Field(default_factory=dict)
-    output_schema: dict[str, Any] = Field(default_factory=dict)
-
     version: str = "1.0.0"
     parent_version: str | None = None
     evolution_reason: str | None = None

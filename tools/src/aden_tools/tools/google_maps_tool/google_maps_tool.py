@@ -507,11 +507,7 @@ def register_tools(
     @mcp.tool()
     def maps_place_details(
         place_id: str,
-        fields: str = (
-            "name,formatted_address,geometry,rating,"
-            "formatted_phone_number,website,opening_hours,"
-            "reviews,price_level,types"
-        ),
+        fields: str = ("name,formatted_address,geometry,rating,formatted_phone_number,website,opening_hours,reviews,price_level,types"),
         language: str = "",
         reviews_sort: Literal["most_relevant", "newest"] = "most_relevant",
     ) -> dict:

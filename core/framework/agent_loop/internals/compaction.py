@@ -10,6 +10,7 @@ Implements the multi-level compaction strategy:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -29,6 +30,13 @@ logger = logging.getLogger(__name__)
 # Limits for LLM compaction
 LLM_COMPACT_CHAR_LIMIT: int = 240_000
 LLM_COMPACT_MAX_DEPTH: int = 10
+# Max output tokens for a single compaction summary call. A summary must be a
+# small fraction of the window — using ``max_context_tokens // 2`` (e.g. 90k on a
+# 180k window) lets the model emit a "summary" nearly as large as the input, which
+# both barely reduces usage and is extremely slow (a far-over-window context splits
+# into several chunks, each a slow ~90k-token generation → multi-minute hangs).
+# A few thousand tokens is plenty for a detailed continue-the-work summary.
+LLM_COMPACT_SUMMARY_MAX_TOKENS: int = 8_192
 
 # Microcompaction: tools whose results can be safely cleared from context
 # because the agent can re-derive them on demand. The bar for inclusion is
@@ -38,17 +46,13 @@ LLM_COMPACT_MAX_DEPTH: int = 10
 # value is in the side effect, not the message — also fair game.
 COMPACTABLE_TOOLS: frozenset[str] = frozenset(
     {
-        # File ops — content lives on disk, re-readable.
-        "read_file",
-        "search_files",
-        "write_file",
-        "edit_file",
+        # Document reads — content lives on disk, re-readable.
         "pdf_read",
         # Terminal — re-runnable; advanced job/output tools produce verbose
         # logs whose recent state is what matters.
         "terminal_exec",
         "terminal_rg",
-        "terminal_find",
+        "terminal_glob",
         "terminal_output_get",
         "terminal_job_logs",
         # Web / research — pages and queries can be re-fetched.
@@ -56,17 +60,42 @@ COMPACTABLE_TOOLS: frozenset[str] = frozenset(
         "search_papers",
         "download_paper",
         "search_wikipedia",
-        # Browser read-only inspection — current page state is what matters,
-        # old snapshots are stale by definition.
-        "browser_screenshot",
-        "browser_snapshot",
-        "browser_html",
-        "browser_get_text",
+        # Browser reads now run via the hive-browser CLI under terminal_exec
+        # (already covered above): page snapshot/html/text return a small
+        # saved_to pointer (not a large compactable payload), and screenshots
+        # are re-inlined images on the terminal result. NOTE: evicting stale
+        # inlined CLI screenshots on compaction is a follow-up — they ride on a
+        # terminal_exec result, so they aren't matched by a browser_* tool name.
     }
 )
 
-# Keep at most this many compactable tool results; clear older ones
-MICROCOMPACT_KEEP_RECENT: int = 8
+# Keep at most this many compactable tool results; clear older ones.
+# Tuned 8 → 4 → 2 → 6:
+# - First drop (8 → 4) was based on the observation that real sessions
+#   carry many large compactable results (terminal_exec, terminal_rg,
+#   web_scrape) before any compaction trigger fires.
+# - Second drop (4 → 2) reduced per-turn density further, on the assumption
+#   that older results survive via the spillover path the placeholder cites.
+# - Raised 2 → 6: at 2, a single batch of ~5 read queries lost 3 the instant
+#   it finished — mid-reasoning — so the agent re-issued them to "confirm the
+#   numbers", re-firing microcompaction (a re-read loop). 6 lets a normal batch
+#   survive intact. Recoverability is now an invariant enforced in microcompact
+#   (only results with a citable spill path are ever cleared), so a higher keep
+#   count is purely about batch ergonomics, not safety.
+# Env-overridable for tuning without a code edit (0/negative → falls back to 6).
+_MICROCOMPACT_KEEP_RECENT_RAW = int(os.environ.get("HIVE_MICROCOMPACT_KEEP_RECENT", "6") or 6)
+MICROCOMPACT_KEEP_RECENT: int = _MICROCOMPACT_KEEP_RECENT_RAW if _MICROCOMPACT_KEEP_RECENT_RAW > 0 else 6
+
+# Group-chat compaction guard. The LLM-summary path preserves every
+# ``is_client_input`` message verbatim so a 1:1 agent never loses the
+# operator's exact words. In a group room EVERY member's line is client
+# input, so that rule pins the whole group backlog in-context forever and
+# compaction can never bring usage under budget (observed: 97% of a 50K-token
+# window was 188 preserved group messages). Cap the verbatim tail; older group
+# messages survive in the summary. Override via env for tuning without a code
+# edit. 0/negative disables the cap (legacy unbounded behaviour).
+_MAX_VERBATIM_CLIENT_RAW = int(os.environ.get("HIVE_MAX_VERBATIM_CLIENT_MSGS", "40") or 40)
+MAX_VERBATIM_CLIENT_MESSAGES: int | None = _MAX_VERBATIM_CLIENT_RAW if _MAX_VERBATIM_CLIENT_RAW > 0 else None
 
 # Circuit-breaker: stop auto-compacting after this many consecutive failures
 MAX_CONSECUTIVE_FAILURES: int = 3
@@ -76,6 +105,80 @@ _failure_counts: dict[int, int] = {}
 
 # Track last compaction time per conversation for recompaction detection
 _last_compact_times: dict[int, float] = {}
+
+
+# ---------------------------------------------------------------------------
+# Defensive guard against oversized user messages.
+#
+# The upload-path size gate (Layer E) prevents huge PDFs from landing as full
+# text in a user message going forward. But older sessions persisted before
+# that gate shipped — and any future bug that re-introduces a bloated message
+# — could leave a 2 MB+ user message sitting in the conversation. LLM
+# compaction would try to summarize it, blow the model's own context window
+# building the compaction prompt, and the loop would get stuck in a
+# recompaction chain.
+#
+# Threshold: 100 K chars (~25 K tokens at 4 chars/token). Normal user
+# messages — even long pastes — sit well under this; the bloated calculus
+# textbook case was 2.4 M chars per message, 24× over the threshold.
+USER_MESSAGE_MAX_CHARS: int = 100_000
+USER_MESSAGE_HEAD_CHARS: int = 4_000
+USER_MESSAGE_TAIL_CHARS: int = 4_000
+
+
+def truncate_oversized_user_messages(conversation: NodeConversation) -> int:
+    """Clip user messages that exceed :data:`USER_MESSAGE_MAX_CHARS` so the
+    compaction pipeline survives historical or future bloat.
+
+    Keeps the head + tail of the message so the agent still sees what kind
+    of message the user sent. The tail is preserved deliberately: the
+    upload path appends an ``[Attachments saved to disk]`` block at the
+    end with the on-disk path the agent can re-read selectively via
+    ``pdf_read``. A ``<system-reminder>`` block explains the truncation
+    so the LLM doesn't think the user's message just stops mid-sentence.
+
+    Skips messages already marked ``is_system_reminder`` — those are
+    framework injections, not real user input. ``is_skill_content`` is
+    similarly off-limits.
+
+    Returns the number of messages clipped.
+    """
+    messages = conversation.messages
+    truncated = 0
+    for i, msg in enumerate(messages):
+        if msg.role != "user":
+            continue
+        if msg.is_system_reminder or msg.is_skill_content:
+            continue
+        content = msg.content or ""
+        if len(content) <= USER_MESSAGE_MAX_CHARS:
+            continue
+
+        orig_len = len(content)
+        head = content[:USER_MESSAGE_HEAD_CHARS]
+        tail = content[-USER_MESSAGE_TAIL_CHARS:]
+        cut = orig_len - USER_MESSAGE_HEAD_CHARS - USER_MESSAGE_TAIL_CHARS
+        notice = (
+            "\n\n<system-reminder>\n"
+            f"[{cut:,} chars truncated to keep compaction safe; "
+            f"original message was {orig_len:,} chars. If an attachment "
+            "path appears in the tail below, read it selectively via "
+            "pdf_read.]\n"
+            "</system-reminder>\n\n"
+        )
+        new_content = head + notice + tail
+
+        conversation._messages[i] = dataclasses.replace(msg, content=new_content)
+        truncated += 1
+
+    if truncated > 0:
+        conversation._last_api_input_tokens = None
+        logger.info(
+            "[compaction] truncated %d oversized user message(s) — defensive guard",
+            truncated,
+        )
+
+    return truncated
 
 
 def microcompact(
@@ -91,8 +194,8 @@ def microcompact(
 
     Returns the number of tool results cleared.
     """
-    # Collect indices of compactable tool results (newest first)
-    compactable_indices: list[int] = []
+    # Collect compactable tool results (newest first) as (index, recovery_path).
+    compactable: list[tuple[int, str]] = []
     messages = conversation.messages
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -105,27 +208,38 @@ def microcompact(
 
         # Check if the tool that produced this result is compactable
         tool_name = _find_tool_name_for_result(messages, msg)
-        if tool_name and tool_name in COMPACTABLE_TOOLS:
-            compactable_indices.append(i)
+        if not (tool_name and tool_name in COMPACTABLE_TOOLS):
+            continue
+
+        # Recoverability invariant: only clear a result we can point back to.
+        # Prefer the out-of-band spill path recorded when the result landed
+        # (present for small inline results too); fall back to a path embedded
+        # in the message text (large-preview results). A result with no
+        # recovery path is left INTACT rather than replaced by an unrecoverable
+        # "cleared from context" placeholder — that stranding was the cause of
+        # the re-read loop (agent re-runs the query to recover vanished output,
+        # which re-fires microcompaction).
+        spillover = msg.spillover_path or _extract_spillover_filename_inline(msg.content)
+        if not spillover:
+            continue
+        compactable.append((i, spillover))
 
     # Keep the most recent N, clear the rest
-    to_clear = compactable_indices[keep_recent:]
+    to_clear = compactable[keep_recent:]
     if not to_clear:
         return 0
 
     cleared = 0
-    for i in to_clear:
+    for i, spillover in to_clear:
         msg = messages[i]
-        spillover = _extract_spillover_filename_inline(msg.content)
         orig_len = len(msg.content)
-        if spillover:
-            placeholder = (
-                f"Old tool result ({orig_len:,} chars) cleared from context. "
-                f"Full data saved at: {spillover}\n"
-                f"Read the complete data with read_file(path='{spillover}')."
-            )
-        else:
-            placeholder = f"Old tool result ({orig_len:,} chars) cleared from context."
+        # Recovery hint points at terminal_rg, not a whole-file cat: re-reading
+        # the whole file would only get truncated again at max_tool_result_chars
+        # and force a pagination dance, whereas ripgrep returns just the matching
+        # lines and keeps per-turn density low.
+        placeholder = (
+            f"Old tool result ({orig_len:,} chars) at {spillover}. Use terminal_rg with a pattern against this path to recover specifics."
+        )
 
         # Mutate in-place (microcompact is synchronous, no store writes)
         conversation._messages[i] = Message(
@@ -137,6 +251,7 @@ def microcompact(
             is_error=msg.is_error,
             phase_id=msg.phase_id,
             is_transition_marker=msg.is_transition_marker,
+            spillover_path=msg.spillover_path,
         )
         cleared += 1
 
@@ -162,12 +277,31 @@ def _find_tool_name_for_result(messages: list[Message], tool_msg: Message) -> st
 def _extract_spillover_filename_inline(content: str) -> str | None:
     """Quick inline check for spillover filename in tool result content.
 
-    Matches both the new prose format ("saved at: /path") and the
-    legacy bracketed trailer ("saved to '/path'").
+    Accepts the new "chars) at /path" form emitted by microcompact and
+    truncate_tool_result, plus the legacy "saved at:" / "saved to '...'"
+    forms still present in older conversation snapshots. The new form is
+    parsed by ``\\bat\\s+(/[^\\s]+)``; the legacy ones keep their original
+    patterns so a long-lived conversation that started before this
+    change still resolves spillover paths correctly.
+
+    Matches the new "chars) at /path" form, the previous "saved at: /path"
+    prose, and the legacy bracketed "saved to '/path'" trailer.
+
+    Trailing sentence punctuation (``.,;:``) on a captured path is
+    stripped — filenames don't end in those chars in practice, but
+    sentences do.
     """
+    # Current truncate_tool_result header: "... Full result at: /path"
+    match = re.search(r"full result at:\s*(\S+)", content, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip(".,;:")
+    # New form: "Old tool result (44,754 chars) at /tmp/.../file.txt. ..."
+    match = re.search(r"\)\s+at\s+(/\S+)", content)
+    if match:
+        return match.group(1).rstrip(".,;:")
     match = re.search(r"saved at:\s*(\S+)", content, re.IGNORECASE)
     if match:
-        return match.group(1)
+        return match.group(1).rstrip(".,;:")
     match = re.search(r"saved to '([^']+)'", content, re.IGNORECASE)
     return match.group(1) if match else None
 
@@ -187,9 +321,8 @@ async def compact(
     Pipeline stages (in order, short-circuits when budget is restored):
     0. Microcompaction (count-based tool result clearing — cheapest)
     1. Prune old tool results (token-budget based)
-    2. Structure-preserving compaction (free, no LLM)
-    3. LLM summary compaction (recursive split if too large)
-    4. Emergency deterministic summary (fallback)
+    2. LLM summary compaction (recursive split if too large)
+    3. Emergency deterministic summary (fallback)
     """
     conv_id = id(conversation)
 
@@ -220,6 +353,42 @@ async def compact(
 
     if ratio_before >= 1.0:
         pre_inventory = build_message_inventory(conversation)
+
+    # Tell the UI a compaction pass has begun. Without this the debug
+    # panel (and any "agent is busy" indicator) sees nothing for the
+    # entire compaction window — multi-minute on heavily over-budget
+    # conversations — and the human assumes the agent has frozen.
+    if event_bus is not None:
+        from framework.host.event_bus import AgentEvent, EventType
+
+        await event_bus.publish(
+            AgentEvent(
+                type=EventType.CONTEXT_COMPACTION_STARTED,
+                stream_id=ctx.stream_id or ctx.agent_id,
+                node_id=ctx.agent_id,
+                execution_id=getattr(ctx, "execution_id", None) or None,
+                data={
+                    "usage_before": round(ratio_before * 100),
+                    "message_count": len(conversation.messages),
+                    "llm_compaction_skipped": _llm_compaction_skipped,
+                },
+            )
+        )
+
+    # --- Step 0a: Defensive truncation of oversized user messages ---
+    # Runs before everything else so the LLM-compaction prompt is never
+    # built around a 2 MB user message that would itself exceed the
+    # model's context window. Cheap (O(n) scan + small splice), idempotent
+    # (re-running on already-truncated messages is a no-op since the head
+    # + reminder + tail fit under the threshold).
+    oversized_clipped = truncate_oversized_user_messages(conversation)
+    if oversized_clipped > 0:
+        logger.warning(
+            "[compaction] clipped %d oversized user message(s) before microcompact; usage %.0f%% -> %.0f%%",
+            oversized_clipped,
+            ratio_before * 100,
+            conversation.usage_ratio() * 100,
+        )
 
     # --- Step 0: Microcompaction (count-based, cheapest) ---
     mc_cleared = microcompact(conversation)
@@ -265,26 +434,7 @@ async def compact(
         )
         return
 
-    # --- Step 2: Standard structure-preserving compaction (free, no LLM) ---
-    spill_dir = config.spillover_dir
-    if spill_dir:
-        await conversation.compact_preserving_structure(
-            spillover_dir=spill_dir,
-            keep_recent=4,
-            phase_graduated=phase_grad,
-        )
-    if not conversation.needs_compaction():
-        _record_success(conv_id, now)
-        await log_compaction(
-            ctx,
-            conversation,
-            ratio_before,
-            event_bus,
-            pre_inventory=pre_inventory,
-        )
-        return
-
-    # --- Step 3: LLM summary compaction ---
+    # --- Step 2: LLM summary compaction ---
     if ctx.llm is not None and not _llm_compaction_skipped:
         logger.info(
             "LLM summary compaction triggered (%.0f%% usage)",
@@ -303,34 +453,28 @@ async def compact(
                 summary,
                 keep_recent=2,
                 phase_graduated=phase_grad,
+                max_verbatim_client=MAX_VERBATIM_CLIENT_MESSAGES,
             )
         except Exception as e:
             logger.warning("LLM compaction failed: %s", e)
             _failure_counts[conv_id] = _failure_counts.get(conv_id, 0) + 1
 
+    # The LLM summary is the ONLY (non-destructive) compaction. We never fall
+    # back to a deterministic "emergency" summary — that crude-summarizes and
+    # deletes the conversation, destroying the user's data. If the LLM summary
+    # could not run (provider down / circuit breaker) or did not fully reduce
+    # usage, leave the conversation intact and let the next LLM call's
+    # context-too-large handling surface/retry. Better a loud over-budget state
+    # than silent data loss.
     if not conversation.needs_compaction():
         _record_success(conv_id, now)
-        await log_compaction(
-            ctx,
-            conversation,
-            ratio_before,
-            event_bus,
-            pre_inventory=pre_inventory,
+    else:
+        logger.warning(
+            "Compaction did not bring usage under budget (%.0f%%); leaving "
+            "conversation intact (LLM summary unavailable or insufficient) — "
+            "not crude-summarizing.",
+            conversation.usage_ratio() * 100,
         )
-        return
-
-    # --- Step 4: Emergency deterministic summary (LLM failed/unavailable) ---
-    logger.warning(
-        "Emergency compaction (%.0f%% usage)",
-        conversation.usage_ratio() * 100,
-    )
-    summary = build_emergency_summary(ctx, accumulator, conversation, config)
-    await conversation.compact(
-        summary,
-        keep_recent=1,
-        phase_graduated=phase_grad,
-    )
-    _record_success(conv_id, now)
     await log_compaction(
         ctx,
         conversation,
@@ -452,7 +596,17 @@ async def llm_compact(
                 "continue its work. Preserve user-stated rules, "
                 "constraints, and account/identity preferences verbatim."
             )
-        summary_budget = max(1024, max_context_tokens // 2)
+        if preserve_user_messages:
+            # /compact-and-fork reproduces every user message verbatim, so it
+            # needs room — keep the large budget for that path only.
+            summary_budget = max(1024, max_context_tokens // 2)
+        else:
+            # Normal compaction: a summary should be small. Cap to an absolute
+            # ceiling AND scale with the window (~1/8) so that even when a far-
+            # over-window context splits into several chunks, the COMBINED
+            # summary stays well under the window — keeping each call fast and
+            # guaranteeing real reduction on small and large windows alike.
+            summary_budget = min(LLM_COMPACT_SUMMARY_MAX_TOKENS, max(1024, max_context_tokens // 8))
         try:
             response = await ctx.llm.acomplete(
                 messages=[{"role": "user", "content": prompt}],
@@ -590,8 +744,7 @@ def build_llm_compaction_prompt(
         "code fences, whitespace, and punctuation exactly as the user "
         "wrote them.\n"
         if preserve_user_messages
-        else "6. **User Messages** — Preserve ALL user-stated rules, constraints, "
-        "identity preferences, and account details verbatim.\n"
+        else "6. **User Messages** — Preserve ALL user-stated rules, constraints, identity preferences, and account details verbatim.\n"
     )
 
     return (
@@ -716,9 +869,7 @@ def write_compaction_debug_log(
                 flags.append("error")
             if entry.get("phase"):
                 flags.append(f"phase={entry['phase']}")
-            lines.append(
-                f"| {i} | {entry['seq']} | {entry['role']} | {tool} | {chars:,} | {pct:.1f}% | {', '.join(flags)} |"
-            )
+            lines.append(f"| {i} | {entry['seq']} | {entry['role']} | {tool} | {chars:,} | {pct:.1f}% | {', '.join(flags)} |")
 
         large = [entry for entry in ranked if entry.get("preview")]
         if large:
@@ -748,6 +899,12 @@ async def log_compaction(
     ratio_after = conversation.usage_ratio()
     before_pct = round(ratio_before * 100)
     after_pct = round(ratio_after * 100)
+    # Absolute token counts in K (1K = 1000). ratio_before is a fraction of
+    # max_context_tokens captured pre-compaction; multiply back to recover
+    # the absolute token count without re-estimating the pre-state.
+    max_ctx = conversation._max_context_tokens
+    before_k = round((ratio_before * max_ctx) / 1000) if max_ctx > 0 else 0
+    after_k = round(conversation.estimate_tokens() / 1000)
 
     # Determine label from what happened
     if after_pct >= before_pct - 1:
@@ -758,10 +915,12 @@ async def log_compaction(
         level = "structural"
 
     logger.info(
-        "Compaction complete (%s): %d%% -> %d%%",
+        "Compaction complete (%s): %d%% (%dK) -> %d%% (%dK)",
         level,
         before_pct,
+        before_k,
         after_pct,
+        after_k,
     )
 
     if ctx.runtime_logger:
@@ -769,9 +928,9 @@ async def log_compaction(
             node_id=ctx.agent_id,
             node_type="event_loop",
             step_index=-1,
-            llm_text=f"Context compacted ({level}): {before_pct}% \u2192 {after_pct}%",
+            llm_text=f"Context compacted ({level}): {before_pct}% ({before_k}K) \u2192 {after_pct}% ({after_k}K)",
             verdict="COMPACTION",
-            verdict_feedback=f"level={level} before={before_pct}% after={after_pct}%",
+            verdict_feedback=f"level={level} before={before_pct}%/{before_k}K after={after_pct}%/{after_k}K",
         )
 
     if event_bus:
@@ -781,6 +940,8 @@ async def log_compaction(
             "level": level,
             "usage_before": before_pct,
             "usage_after": after_pct,
+            "tokens_before_k": before_k,
+            "tokens_after_k": after_k,
         }
         if pre_inventory is not None:
             event_data["message_inventory"] = pre_inventory
@@ -798,107 +959,7 @@ async def log_compaction(
     if os.environ.get("HIVE_COMPACTION_DEBUG"):
         write_compaction_debug_log(ctx, before_pct, after_pct, level, pre_inventory)
 
-
-def build_emergency_summary(
-    ctx: NodeContext,
-    accumulator: OutputAccumulator | None = None,
-    conversation: NodeConversation | None = None,
-    config: LoopConfig | None = None,
-) -> str:
-    """Build a structured emergency compaction summary.
-
-    Unlike normal/aggressive compaction which uses an LLM summary,
-    emergency compaction cannot afford an LLM call (context is already
-    way over budget).  Instead, build a deterministic summary from the
-    node's known state so the LLM can continue working after
-    compaction without losing track of its task and inputs.
-    """
-    parts = ["EMERGENCY COMPACTION — previous conversation was too large and has been replaced with this summary.\n"]
-
-    # 1. Node identity
-    spec = ctx.agent_spec
-    parts.append(f"NODE: {spec.name} (id={spec.id})")
-    if spec.description:
-        parts.append(f"PURPOSE: {spec.description}")
-
-    # 2. Inputs the node received
-    input_lines = []
-    for key in spec.input_keys:
-        value = ctx.input_data.get(key)
-        if value is not None:
-            # Truncate long values but keep them recognisable
-            v_str = str(value)
-            if len(v_str) > 200:
-                v_str = v_str[:200] + "…"
-            input_lines.append(f"  {key}: {v_str}")
-    if input_lines:
-        parts.append("INPUTS:\n" + "\n".join(input_lines))
-
-    # 3. Output accumulator state (what's been set so far)
-    if accumulator:
-        acc_state = accumulator.to_dict()
-        set_keys = {k: v for k, v in acc_state.items() if v is not None}
-        missing = [k for k, v in acc_state.items() if v is None]
-        if set_keys:
-            lines = [f"  {k}: {str(v)[:150]}" for k, v in set_keys.items()]
-            parts.append("OUTPUTS ALREADY SET:\n" + "\n".join(lines))
-        if missing:
-            parts.append(f"OUTPUTS STILL NEEDED: {', '.join(missing)}")
-    elif spec.output_keys:
-        parts.append(f"OUTPUTS STILL NEEDED: {', '.join(spec.output_keys)}")
-
-    # 4. Available tools reminder
-    if spec.tools:
-        parts.append(f"AVAILABLE TOOLS: {', '.join(spec.tools)}")
-
-    # 5. Spillover files — list actual files so the LLM can load
-    # them immediately instead of having to call list_data_files first.
-    spillover_dir = config.spillover_dir if config else None
-    if spillover_dir:
-        try:
-            from pathlib import Path
-
-            data_dir = Path(spillover_dir)
-            if data_dir.is_dir():
-                all_files = sorted(f.name for f in data_dir.iterdir() if f.is_file())
-                # Separate conversation history files from regular data files
-                conv_files = [f for f in all_files if re.match(r"conversation_\d+\.md$", f)]
-                data_files = [f for f in all_files if f not in conv_files]
-
-                if conv_files:
-                    conv_list = "\n".join(f"  - {f}  (full path: {data_dir / f})" for f in conv_files)
-                    parts.append(
-                        "CONVERSATION HISTORY (freeform messages saved during compaction — "
-                        "use read_file('<filename>') to review earlier dialogue):\n" + conv_list
-                    )
-                if data_files:
-                    file_list = "\n".join(f"  - {f}  (full path: {data_dir / f})" for f in data_files[:30])
-                    parts.append("DATA FILES (use read_file('<filename>') to read):\n" + file_list)
-                if not all_files:
-                    parts.append(
-                        "NOTE: Large tool results may have been saved to files. "
-                        "Use search_files(target='files', path='.') to check the data directory."
-                    )
-        except Exception:
-            parts.append("NOTE: Large tool results were saved to files. Use read_file(path='<path>') to read them.")
-
-    # 6. Tool call history (prevent re-calling tools)
-    if conversation is not None:
-        tool_history = _extract_tool_call_history(conversation)
-        if tool_history:
-            parts.append(tool_history)
-
-    parts.append("\nContinue working towards setting the remaining outputs. Use your tools and the inputs above.")
-    return "\n\n".join(parts)
-
-
-def _extract_tool_call_history(conversation: NodeConversation) -> str:
-    """Extract tool call history from conversation messages.
-
-    This is the instance-level variant that operates on a NodeConversation
-    directly (vs. the module-level extract_tool_call_history in conversation.py
-    which works on raw message lists).
-    """
-    from framework.agent_loop.conversation import extract_tool_call_history
-
-    return extract_tool_call_history(list(conversation.messages))
+# NOTE: the deterministic "emergency" compaction summary (build_emergency_summary)
+# was removed — it crude-summarized and deleted the conversation, destroying user
+# data. Compaction is now always the non-destructive LLM summary; if that cannot
+# run, the conversation is left intact (see compact()).

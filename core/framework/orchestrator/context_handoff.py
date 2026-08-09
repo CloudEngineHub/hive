@@ -108,10 +108,7 @@ class ContextHandoff:
     @staticmethod
     def format_as_input(handoff: HandoffContext) -> str:
         """Render *handoff* as structured plain text for the next node's input."""
-        header = (
-            f"--- CONTEXT FROM: {handoff.source_node_id} "
-            f"({handoff.turn_count} turns, ~{handoff.total_tokens_used} tokens) ---"
-        )
+        header = f"--- CONTEXT FROM: {handoff.source_node_id} ({handoff.turn_count} turns, ~{handoff.total_tokens_used} tokens) ---"
 
         sections: list[str] = [header, ""]
 
@@ -166,6 +163,11 @@ class ContextHandoff:
             raise ValueError("_llm_summary called without an LLM provider")
 
         conversation_text = "\n".join(f"[{m.role}]: {m.content}" for m in messages)
+        if not conversation_text.strip():
+            # Nothing to summarize. An LLM call with empty input is wasted
+            # spend at best; GLM and DeepSeek reject empty prompts with a
+            # 400 outright, and the caller's retry-on-failure then loops.
+            return self._extractive_summary(messages)
 
         key_hint = ""
         if output_keys:

@@ -104,9 +104,7 @@ class TestMongodbInsertOne:
                 return_value=_mock_resp(data),
             ),
         ):
-            result = tool_fns["mongodb_insert_one"](
-                database="mydb", collection="users", document='{"name": "Alice", "age": 30}'
-            )
+            result = tool_fns["mongodb_insert_one"](database="mydb", collection="users", document='{"name": "Alice", "age": 30}')
 
         assert result["result"] == "inserted"
         assert result["insertedId"] == "abc123"

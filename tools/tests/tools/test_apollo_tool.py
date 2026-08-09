@@ -580,9 +580,7 @@ class TestSearchPeopleTool:
 
     @patch("aden_tools.tools.apollo_tool.apollo_tool.httpx.post")
     def test_search_people_with_all_filters(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"pagination": {}, "people": []})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"pagination": {}, "people": []}))
         self._fn("apollo_search_people")(
             titles=["CEO"],
             seniorities=["c_suite"],
@@ -629,9 +627,7 @@ class TestSearchCompaniesTool:
 
     @patch("aden_tools.tools.apollo_tool.apollo_tool.httpx.post")
     def test_search_companies_with_all_filters(self, mock_post):
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"pagination": {}, "organizations": []})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"pagination": {}, "organizations": []}))
         self._fn("apollo_search_companies")(
             industries=["finance"],
             employee_counts=["201-500"],

@@ -1,11 +1,7 @@
-// "incubating" is queen-DM-only; the colony page never enters it (the queen
-// auto-switches back to independent before the lock fires). Keep it in the
-// union so the type lines up with LiveSession.queen_phase.
-export type ColonyRestorePhase =
-  | "independent"
-  | "incubating"
-  | "working"
-  | "reviewing";
+// Aligns with LiveSession.queen_phase. The colony page boots in "colony"
+// phase whenever it's resuming a forked queen session; the queen-DM enters
+// the suggestion flow but never persists in any intermediate phase.
+export type ColonyRestorePhase = "independent" | "colony";
 
 export function shouldUsePrefetchedColonyRestore(
   prefetchedSessionId: string | undefined,
@@ -33,5 +29,5 @@ export function resolveInitialColonyPhase({
   )
     ? prefetchedPhase
     : null;
-  return restoredPhase || serverPhase || (hasWorker ? "working" : "reviewing");
+  return restoredPhase || serverPhase || (hasWorker ? "colony" : "independent");
 }

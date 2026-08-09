@@ -218,11 +218,7 @@ async def test_form_interaction(bridge: BeelineBridge, tab_id: int) -> dict:
         print(f"  Form state: {form_state}")
 
         # Check all fields are filled correctly
-        results["ok"] = (
-            form_state.get("name") == "Test Customer"
-            and form_state.get("medium") is True
-            and form_state.get("cheese") is True
-        )
+        results["ok"] = form_state.get("name") == "Test Customer" and form_state.get("medium") is True and form_state.get("cheese") is True
 
         print(f"  {'✓' if results['ok'] else '✗'} Form interaction")
         return results

@@ -36,10 +36,7 @@ def _get_creds(
     if not api_key:
         return {
             "error": "Weights & Biases credentials not configured",
-            "help": (
-                "Set WANDB_API_KEY environment variable or configure via credential store. "
-                "Get your API key at https://wandb.ai/authorize"
-            ),
+            "help": ("Set WANDB_API_KEY environment variable or configure via credential store. Get your API key at https://wandb.ai/authorize"),
         }
     return (api_key,)
 

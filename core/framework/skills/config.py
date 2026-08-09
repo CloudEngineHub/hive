@@ -1,7 +1,8 @@
 """Skill configuration dataclasses.
 
-Handles agent-level skill configuration from module-level variables
-(``default_skills`` and ``skills``).
+Handles agent-level skill configuration from the ``default_skills``
+module-level variable. All discovered skills surface through progressive
+disclosure — there is no force-injection of skill bodies into the prompt.
 """
 
 from __future__ import annotations
@@ -28,24 +29,16 @@ class DefaultSkillConfig:
 class SkillsConfig:
     """Agent-level skill configuration.
 
-    Built from module-level variables in agent.py::
+    Built from the ``default_skills`` module-level variable in agent.py::
 
-        # Pre-activated community skills
-        skills = ["deep-research", "code-review"]
-
-        # Default skill configuration
         default_skills = {
-            "hive.note-taking": {"enabled": True},
-            "hive.quality-monitor": {"enabled": False, "assessment_interval": 10},
-            "hive.error-recovery": {"max_retries_per_tool": 5},
+            "hive.writing-hive-skills": {"enabled": True},
+            "hive.browser-automation": {"enabled": False},
         }
     """
 
-    # Per-default-skill config, keyed by skill name (e.g. "hive.note-taking")
+    # Per-default-skill config, keyed by skill name (e.g. "hive.writing-hive-skills")
     default_skills: dict[str, DefaultSkillConfig] = field(default_factory=dict)
-
-    # Pre-activated community skills (by name)
-    skills: list[str] = field(default_factory=list)
 
     # Master switch: disable all default skills at once
     all_defaults_disabled: bool = False
@@ -70,14 +63,12 @@ class SkillsConfig:
     def from_agent_vars(
         cls,
         default_skills: dict[str, Any] | None = None,
-        skills: list[str] | None = None,
     ) -> SkillsConfig:
         """Build config from agent module-level variables.
 
         Args:
             default_skills: Dict from agent module, e.g.
-                ``{"hive.note-taking": {"enabled": True}}``
-            skills: List of pre-activated skill names from agent module
+                ``{"hive.writing-hive-skills": {"enabled": True}}``
         """
         all_disabled = False
         parsed_defaults: dict[str, DefaultSkillConfig] = {}
@@ -95,6 +86,5 @@ class SkillsConfig:
 
         return cls(
             default_skills=parsed_defaults,
-            skills=list(skills or []),
             all_defaults_disabled=all_disabled,
         )

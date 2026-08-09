@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import http.server
 import json
+import os
+import sys
 import urllib.parse
 import webbrowser
 from collections import defaultdict
@@ -37,6 +39,7 @@ class SessionSummary:
     streams: list[str]
     nodes: list[str]
     models: list[str]
+    category: str
 
 
 def _parse_args() -> argparse.Namespace:
@@ -44,8 +47,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logs-dir",
         type=Path,
-        default=Path.home() / ".hive" / "llm_logs",
-        help="Directory containing Hive LLM debug JSONL files.",
+        action="append",
+        default=[],
+        help=(
+            "Directory containing Hive LLM debug JSONL files. May be passed "
+            "multiple times. If omitted, auto-discovers $HIVE_HOME/llm_logs "
+            "and the desktop per-user dirs under "
+            "~/Library/Application Support/Hive/users/*/llm_logs."
+        ),
     )
     parser.add_argument("--session", help="Execution ID to select initially.")
     parser.add_argument("--limit-files", type=int, default=200)
@@ -55,13 +64,52 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_logs_dirs(explicit: list[Path]) -> list[Path]:
+    """Return the ordered, de-duplicated list of log directories to search.
+
+    Mirrors how the runtime resolves ``HIVE_HOME`` (see core/framework/config.py)
+    and additionally discovers the desktop's per-user directories so the viewer
+    sees logs no matter which mode the runtime ran in.
+    """
+    candidates: list[Path] = [p.expanduser() for p in explicit]
+
+    hive_home_env = os.environ.get("HIVE_HOME")
+    if hive_home_env:
+        candidates.append(Path(hive_home_env).expanduser() / "llm_logs")
+
+    # Desktop (macOS): one llm_logs dir per user-hash. Other platforms have
+    # different conventions; only the macOS path is well-defined today.
+    if sys.platform == "darwin":
+        desktop_root = Path.home() / "Library" / "Application Support" / "Hive" / "users"
+        if desktop_root.is_dir():
+            candidates.extend(sorted(p / "llm_logs" for p in desktop_root.iterdir() if p.is_dir()))
+
+    seen: set[Path] = set()
+    resolved: list[Path] = []
+    for path in candidates:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_dir():
+            resolved.append(path)
+    return resolved
+
+
 def _format_timestamp(raw: str) -> str:
     if not raw:
         return "-"
     try:
-        return datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M:%S")
+        dt = datetime.fromisoformat(raw)
     except ValueError:
         return raw
+    # tz-aware → convert to local; naive → assume already local (older logs).
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _reassemble_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -112,12 +160,26 @@ def _reassemble_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _classify_session(streams: list[str], nodes: list[str]) -> str:
+    """Bucket a session into queen / worker / reflection / other for the quick
+    filter. Derived from the llm logger's node_id/stream_id: the queen runs under
+    node ``queen``, reflections under node ``reflection``, and each worker emits a
+    ``worker:<id>`` stream. Anything else (e.g. vision_fallback_subagent) is other.
+    """
+    node_set = set(nodes)
+    if "queen" in node_set:
+        return "queen"
+    if "reflection" in node_set:
+        return "reflection"
+    if any(s.startswith("worker:") for s in streams):
+        return "worker"
+    return "other"
+
+
 def _is_test_session(execution_id: str, records: list[dict[str, Any]]) -> bool:
     if execution_id.startswith("<MagicMock"):
         return True
-    models = {
-        str(r.get("token_counts", {}).get("model", "")) for r in records if isinstance(r.get("token_counts"), dict)
-    }
+    models = {str(r.get("token_counts", {}).get("model", "")) for r in records if isinstance(r.get("token_counts"), dict)}
     models.discard("")
     if models and models <= {"mock"}:
         return True
@@ -126,15 +188,22 @@ def _is_test_session(execution_id: str, records: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _discover_session_summaries(logs_dir: Path, limit_files: int, include_tests: bool) -> list[SessionSummary]:
-    if not logs_dir.exists():
-        raise FileNotFoundError(f"log directory not found: {logs_dir}")
+def _collect_jsonl_files(logs_dirs: list[Path], limit_files: int) -> list[Path]:
+    """Gather .jsonl files across all log dirs, newest-mtime first."""
+    files: list[Path] = []
+    for logs_dir in logs_dirs:
+        if not logs_dir.is_dir():
+            continue
+        files.extend(p for p in logs_dir.iterdir() if p.is_file() and p.suffix == ".jsonl")
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[:limit_files]
 
-    files = sorted(
-        [p for p in logs_dir.iterdir() if p.is_file() and p.suffix == ".jsonl"],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit_files]
+
+def _discover_session_summaries(logs_dirs: list[Path], limit_files: int, include_tests: bool) -> list[SessionSummary]:
+    if not logs_dirs:
+        raise FileNotFoundError("no log directories found (try --logs-dir or set $HIVE_HOME)")
+
+    files = _collect_jsonl_files(logs_dirs, limit_files)
 
     by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for path in files:
@@ -173,6 +242,8 @@ def _discover_session_summaries(logs_dir: Path, limit_files: int, include_tests:
     for eid, recs in by_session.items():
         recs.sort(key=lambda r: (str(r.get("timestamp", "")), r.get("iteration", 0)))
         first, last = recs[0], recs[-1]
+        streams = sorted({str(r.get("stream_id", "")) for r in recs if r.get("stream_id")})
+        nodes = sorted({str(r.get("node_id", "")) for r in recs if r.get("node_id")})
         summaries.append(
             SessionSummary(
                 execution_id=eid,
@@ -180,8 +251,8 @@ def _discover_session_summaries(logs_dir: Path, limit_files: int, include_tests:
                 start_timestamp=str(first.get("timestamp", "")),
                 end_timestamp=str(last.get("timestamp", "")),
                 turn_count=len(recs),
-                streams=sorted({str(r.get("stream_id", "")) for r in recs if r.get("stream_id")}),
-                nodes=sorted({str(r.get("node_id", "")) for r in recs if r.get("node_id")}),
+                streams=streams,
+                nodes=nodes,
                 models=sorted(
                     {
                         str(r.get("token_counts", {}).get("model", ""))
@@ -189,6 +260,7 @@ def _discover_session_summaries(logs_dir: Path, limit_files: int, include_tests:
                         if isinstance(r.get("token_counts"), dict) and r.get("token_counts", {}).get("model")
                     }
                 ),
+                category=_classify_session(streams, nodes),
             )
         )
 
@@ -196,15 +268,11 @@ def _discover_session_summaries(logs_dir: Path, limit_files: int, include_tests:
     return summaries
 
 
-def _load_session_data(logs_dir: Path, session_id: str, limit_files: int) -> list[dict[str, Any]] | None:
-    if not logs_dir.exists():
+def _load_session_data(logs_dirs: list[Path], session_id: str, limit_files: int) -> list[dict[str, Any]] | None:
+    if not logs_dirs:
         return None
 
-    files = sorted(
-        [p for p in logs_dir.iterdir() if p.is_file() and p.suffix == ".jsonl"],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit_files]
+    files = _collect_jsonl_files(logs_dirs, limit_files)
 
     records: list[dict[str, Any]] = []
     for path in files:
@@ -258,6 +326,7 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
             "streams": s.streams,
             "nodes": s.nodes,
             "models": s.models,
+            "category": s.category,
         }
         for s in summaries
     ]
@@ -320,6 +389,37 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
       font: inherit;
       width: 100%;
     }}
+    .cat-filter {{ display: flex; gap: 6px; width: 100%; flex-wrap: wrap; }}
+    .cat-chip {{
+      flex: 1;
+      text-align: center;
+      background: var(--panel-2);
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 5px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }}
+    .cat-chip:hover {{ color: var(--ink); }}
+    .cat-chip.active {{ background: var(--accent); color: #1a1008; border-color: var(--accent); }}
+    .cat-chip .cnt {{ opacity: 0.7; font-weight: 400; }}
+    .cat-badge {{
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .cat-badge.cat-queen {{ background: rgba(224, 122, 72, 0.18); color: var(--accent); }}
+    .cat-badge.cat-worker {{ background: rgba(106, 169, 255, 0.18); color: var(--accent-2); }}
+    .cat-badge.cat-reflection {{ background: rgba(192, 132, 252, 0.18); color: var(--assistant); }}
+    .cat-badge.cat-other {{ background: rgba(148, 163, 184, 0.18); color: var(--system); }}
     .session-list {{ padding: 8px; }}
     .session {{
       padding: 10px 12px;
@@ -330,8 +430,9 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
     .session:hover {{ background: var(--panel); }}
     .session.active {{ background: linear-gradient(135deg, #2a1d14, #1a1410);
                        border: 1px solid #4a2e1c; }}
+    .session .row {{ display: flex; gap: 6px; align-items: center; }}
     .session .sid {{ font-family: ui-monospace, Menlo, monospace; font-size: 11px;
-                     word-break: break-all; }}
+                     word-break: break-all; min-width: 0; }}
     .session .meta {{ margin-top: 6px; color: var(--muted); font-size: 11px; }}
     .timeline {{ padding: 4px 0; }}
     .ev {{
@@ -457,6 +558,7 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
       <div class="col-head">
         <h2>Sessions</h2>
         <input id="sessionSearch" type="search" placeholder="Filter">
+        <div class="cat-filter" id="catFilter"></div>
       </div>
       <div class="session-list" id="sessionList"></div>
     </div>
@@ -489,6 +591,7 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
     const recordCache = {{}};
 
     let activeSessionId = initialSessionId || (summaries[0] ? summaries[0].execution_id : "");
+    let activeCategory = "";  // "" = all; otherwise queen|worker|reflection|other
     let activeRecords = [];
     let activeEvents = [];
     let activeToolMeta = new Map();  // tool_call_id -> {{toolName, isError, ...}}
@@ -539,9 +642,27 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
       try {{ return JSON.stringify(content).slice(0, 200); }} catch {{ return ""; }}
     }}
 
+    const CATEGORIES = [
+      {{ key: "", label: "All" }},
+      {{ key: "queen", label: "Queen" }},
+      {{ key: "worker", label: "Worker" }},
+      {{ key: "reflection", label: "Reflection" }},
+    ];
+
+    function renderCatFilter() {{
+      const counts = {{}};
+      for (const s of summaries) counts[s.category] = (counts[s.category] || 0) + 1;
+      $("catFilter").innerHTML = CATEGORIES.map((c) => {{
+        const n = c.key === "" ? summaries.length : (counts[c.key] || 0);
+        const cls = c.key === activeCategory ? "cat-chip active" : "cat-chip";
+        return `<div class="${{cls}}" data-cat="${{escapeHtml(c.key)}}">${{c.label}} <span class="cnt">${{n}}</span></div>`;
+      }}).join("");
+    }}
+
     function renderSessions() {{
       const q = ($("sessionSearch").value || "").toLowerCase().trim();
       const filtered = summaries.filter((s) => {{
+        if (activeCategory && s.category !== activeCategory) return false;
         if (!q) return true;
         return [s.execution_id, s.start_display, ...(s.models || []), ...(s.nodes || [])]
           .join("\\n").toLowerCase().includes(q);
@@ -550,11 +671,15 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
         const cls = s.execution_id === activeSessionId ? "session active" : "session";
         const chips = [s.start_display, `${{s.turn_count}} turns`, ...(s.models || []).slice(0, 1)]
           .filter(Boolean).map((c) => escapeHtml(c)).join(" · ");
+        const cat = s.category || "other";
         return `<div class="${{cls}}" data-sid="${{escapeHtml(s.execution_id)}}">
-                  <div class="sid">${{escapeHtml(s.execution_id)}}</div>
+                  <div class="row">
+                    <span class="cat-badge cat-${{escapeHtml(cat)}}">${{escapeHtml(cat)}}</span>
+                    <span class="sid">${{escapeHtml(s.execution_id)}}</span>
+                  </div>
                   <div class="meta">${{chips}}</div>
                 </div>`;
-      }}).join("") || '<div class="empty">No sessions.</div>';
+      }}).join("") || '<div class="empty">No sessions for this filter.</div>';
     }}
 
     /**
@@ -981,6 +1106,13 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
       if (card) loadSession(card.dataset.sid);
     }});
     $("sessionSearch").addEventListener("input", renderSessions);
+    $("catFilter").addEventListener("click", (e) => {{
+      const chip = e.target.closest(".cat-chip");
+      if (!chip) return;
+      activeCategory = chip.dataset.cat;
+      renderCatFilter();
+      renderSessions();
+    }});
     $("kindFilter").addEventListener("change", renderTimeline);
     $("timeline").addEventListener("click", (e) => {{
       const evEl = e.target.closest(".ev");
@@ -991,6 +1123,7 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
       renderRaw(ev);
     }});
 
+    renderCatFilter();
     renderSessions();
     const hashSid = decodeURIComponent(window.location.hash.replace(/^#/, ""));
     const known = new Set(summaries.map((s) => s.execution_id));
@@ -1002,7 +1135,7 @@ def _render_html(summaries: list[SessionSummary], initial_session_id: str) -> st
 """
 
 
-def _run_server(html: str, logs_dir: Path, limit_files: int, port: int, no_open: bool) -> None:
+def _run_server(html: str, logs_dirs: list[Path], limit_files: int, port: int, no_open: bool) -> None:
     html_bytes = html.encode("utf-8")
     cache: dict[str, list[dict[str, Any]]] = {}
 
@@ -1014,7 +1147,7 @@ def _run_server(html: str, logs_dir: Path, limit_files: int, port: int, no_open:
                 sid = urllib.parse.unquote(self.path[len("/api/session/") :])
                 records = cache.get(sid)
                 if records is None:
-                    records = _load_session_data(logs_dir, sid, limit_files)
+                    records = _load_session_data(logs_dirs, sid, limit_files)
                     if records is not None:
                         cache[sid] = records
                 if records is None:
@@ -1051,14 +1184,20 @@ def _run_server(html: str, logs_dir: Path, limit_files: int, port: int, no_open:
 
 def main() -> int:
     args = _parse_args()
-    logs_dir = args.logs_dir.expanduser()
-    summaries = _discover_session_summaries(logs_dir, args.limit_files, args.include_tests)
+    logs_dirs = _resolve_logs_dirs(args.logs_dir)
+    if not logs_dirs:
+        print("no log directories found. Pass --logs-dir or set $HIVE_HOME.")
+        return 1
+    print("Searching log directories:")
+    for d in logs_dirs:
+        print(f"  - {d}")
+    summaries = _discover_session_summaries(logs_dirs, args.limit_files, args.include_tests)
     initial = args.session or (summaries[0].execution_id if summaries else "")
     if initial and not any(s.execution_id == initial for s in summaries):
         print(f"session not found: {initial}")
         return 1
     html = _render_html(summaries, initial)
-    _run_server(html, logs_dir, args.limit_files, args.port, args.no_open)
+    _run_server(html, logs_dirs, args.limit_files, args.port, args.no_open)
     return 0
 
 

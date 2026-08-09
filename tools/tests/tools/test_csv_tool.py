@@ -706,9 +706,7 @@ class TestCsvSql:
         ):
             result = csv_tools["csv_sql"](
                 path=str(products_csv),
-                query=(
-                    "WITH electronics AS (SELECT * FROM data WHERE category = 'Electronics') SELECT * FROM electronics"
-                ),
+                query=("WITH electronics AS (SELECT * FROM data WHERE category = 'Electronics') SELECT * FROM electronics"),
             )
         assert result["success"] is True
 

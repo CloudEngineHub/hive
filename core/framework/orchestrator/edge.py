@@ -184,9 +184,7 @@ class EdgeSpec(BaseModel):
             # Log the evaluation for visibility
             # Extract the variable names used in the expression for debugging
             expr_vars = {
-                k: repr(context[k])
-                for k in context
-                if k not in ("output", "buffer", "result", "true", "false") and k in self.condition_expr
+                k: repr(context[k]) for k in context if k not in ("output", "buffer", "result", "true", "false") and k in self.condition_expr
             }
             logger.info(
                 "  Edge %s: condition '%s' → %s  (vars: %s)",
@@ -359,7 +357,7 @@ class GraphSpec(BaseModel):
     # EventLoopNode configuration (from configure_loop)
     loop_config: dict[str, Any] = Field(
         default_factory=dict,
-        description="EventLoopNode configuration (max_iterations, max_tool_calls_per_turn, etc.)",
+        description="EventLoopNode configuration (max_iterations, tool_call_budget, etc.)",
     )
 
     # Conversation mode
@@ -501,10 +499,7 @@ class GraphSpec(BaseModel):
 
         # Suggest at least one terminal node (graphs should have termination points)
         if not self.terminal_nodes:
-            warnings.append(
-                "Graph has no terminal nodes defined in 'terminal_nodes'. "
-                "Consider adding a termination point where execution ends."
-            )
+            warnings.append("Graph has no terminal nodes defined in 'terminal_nodes'. Consider adding a termination point where execution ends.")
 
         # Check edge references
         for edge in self.edges:
@@ -549,9 +544,7 @@ class GraphSpec(BaseModel):
         # Output key overlap on parallel event_loop nodes
         fan_outs = self.detect_fan_out_nodes()
         for source_id, targets in fan_outs.items():
-            event_loop_targets = [
-                t for t in targets if self.get_node(t) and getattr(self.get_node(t), "node_type", "") == "event_loop"
-            ]
+            event_loop_targets = [t for t in targets if self.get_node(t) and getattr(self.get_node(t), "node_type", "") == "event_loop"]
             if len(event_loop_targets) > 1:
                 seen_keys: dict[str, str] = {}
                 for node_id in event_loop_targets:

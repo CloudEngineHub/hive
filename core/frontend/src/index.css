@@ -36,38 +36,67 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: 'Inter Tight', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
+
+/* Density toggle — scales the root font-size so every rem-based
+ * Tailwind class (text, padding, gap, etc.) grows together. Compact is
+ * the visual baseline (matches the previous app-wide size). Spacious
+ * opts in to ~12% more breathing room across the entire UI. Fixed-pixel
+ * widths (e.g. modal max-w-[680px]) stay constant — the text inside
+ * them gets a touch larger; tested layouts can absorb it. */
+:root[data-density="spacious"] {
+  font-size: 18px;
+}
+
+/* Lots of components (notably the sidebar) pin font-size to literal
+ * pixel values via Tailwind arbitrary classes like ``text-[12.5px]``.
+ * Those don't follow the root rem scale, so spacious mode would leave
+ * them stuck at compact sizing. Mirror the ~12.5% bump on the common
+ * pixel sizes so every text surface grows together. */
+:root[data-density="spacious"] .text-\[9px\]      { font-size: 10.125px; }
+:root[data-density="spacious"] .text-\[9\.5px\]   { font-size: 10.6875px; }
+:root[data-density="spacious"] .text-\[10px\]     { font-size: 11.25px; }
+:root[data-density="spacious"] .text-\[10\.5px\]  { font-size: 11.8125px; }
+:root[data-density="spacious"] .text-\[11px\]     { font-size: 12.375px; }
+:root[data-density="spacious"] .text-\[11\.5px\]  { font-size: 12.9375px; }
+:root[data-density="spacious"] .text-\[12px\]     { font-size: 13.5px; }
+:root[data-density="spacious"] .text-\[12\.5px\]  { font-size: 14.0625px; }
+:root[data-density="spacious"] .text-\[13px\]     { font-size: 14.625px; }
+:root[data-density="spacious"] .text-\[13\.5px\]  { font-size: 15.1875px; }
+:root[data-density="spacious"] .text-\[14px\]     { font-size: 15.75px; }
 
 @layer base {
   :root {
-    --background: 40 30% 96%;
-    --foreground: 0 0% 3.9%;
+    --background: 40 28% 95.3%;
+    --foreground: 36 14% 3.7%;
     --card: 0 0% 100%;
-    --card-foreground: 0 0% 3.9%;
+    --card-foreground: 40 7% 14.5%;
     --popover: 0 0% 100%;
-    --popover-foreground: 0 0% 3.9%;
-    --primary: 45 93% 47%;
-    --primary-foreground: 0 0% 2%;
-    --secondary: 40 20% 92%;
-    --secondary-foreground: 0 0% 9%;
-    --muted: 40 20% 92%;
-    --muted-foreground: 0 0% 45.1%;
-    --accent: 40 20% 92%;
-    --accent-foreground: 0 0% 9%;
+    --popover-foreground: 36 14% 3.7%;
+    --primary: 30 73% 41%;
+    --primary-foreground: 0 0% 4.3%;
+    --secondary: 38 22% 92.2%;
+    --secondary-foreground: 40 7% 14.5%;
+    --muted: 37 17% 88.4%;
+    --muted-foreground: 32 8% 44%;
+    --accent: 37 17% 88.4%;
+    --accent-foreground: 40 7% 14.5%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 0 0% 98%;
-    --border: 35 15% 87%;
-    --input: 35 15% 87%;
-    --ring: 45 93% 47%;
+    --border: 37 14% 85.5%;
+    --input: 36 13% 80.8%;
+    --ring: 30 73% 41%;
     --radius: 0.5rem;
 
     /* Sidebar */
-    --sidebar-bg: 40 30% 96%;
-    --sidebar-border: 35 20% 90%;
-    --sidebar-item-hover: 40 20% 93%;
-    --sidebar-active-bg: 45 93% 47% / 0.12;
-    --sidebar-section-text: 0 0% 45%;
-    --sidebar-muted: 0 0% 55%;
+    --sidebar-bg: 40 28% 95.3%;
+    --sidebar-border: 37 14% 85.5%;
+    --sidebar-item-hover: 38 22% 92.2%;
+    --sidebar-active-bg: 30 73% 41% / 0.12;
+    --sidebar-section-text: 32 8% 44%;
+    --sidebar-muted: 32 6% 50%;
 
     /* Status indicators */
     --status-online: 142 71% 45%;
@@ -125,37 +154,37 @@
   }
 
   .dark {
-    --background: 240 6% 6%;
-    --foreground: 0 0% 95%;
-    --card: 240 5% 8%;
-    --card-foreground: 0 0% 95%;
-    --popover: 240 5% 8%;
-    --popover-foreground: 0 0% 95%;
+    --background: 0 0% 4.3%;
+    --foreground: 0 0% 93%;
+    --card: 0 0% 6.7%;
+    --card-foreground: 0 0% 93%;
+    --popover: 0 0% 6.7%;
+    --popover-foreground: 0 0% 93%;
     --primary: 45 93% 47%;
-    --primary-foreground: 0 0% 2%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
+    --primary-foreground: 0 0% 4.3%;
+    --secondary: 0 0% 8.6%;
+    --secondary-foreground: 0 0% 80%;
+    --muted: 0 0% 10.9%;
+    --muted-foreground: 0 0% 54%;
+    --accent: 0 0% 10.9%;
+    --accent-foreground: 0 0% 93%;
     --destructive: 0 62.8% 50.6%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
+    --border: 0 0% 11.8%;
+    --input: 0 0% 16.5%;
     --ring: 45 93% 47%;
 
     /* Sidebar */
-    --sidebar-bg: 240 6% 7%;
-    --sidebar-border: 240 4% 12%;
-    --sidebar-item-hover: 240 5% 11%;
+    --sidebar-bg: 0 0% 4.3%;
+    --sidebar-border: 0 0% 11.8%;
+    --sidebar-item-hover: 0 0% 8.6%;
     --sidebar-active-bg: 45 93% 47% / 0.12;
-    --sidebar-section-text: 240 5% 55%;
-    --sidebar-muted: 240 5% 50%;
+    --sidebar-section-text: 0 0% 54%;
+    --sidebar-muted: 0 0% 45%;
 
     /* Status indicators */
     --status-online: 142 71% 45%;
-    --status-offline: 240 5% 40%;
+    --status-offline: 0 0% 40%;
     --badge-unread: 25 95% 55%;
     --badge-unread-text: 0 0% 100%;
 
@@ -164,48 +193,48 @@
     --node-looping: 38 90% 55%;
     --node-complete: 43 70% 45%;
     --node-pending: 35 15% 28%;
-    --node-pending-bg: 35 10% 12%;
-    --node-pending-border: 35 10% 20%;
+    --node-pending-bg: 0 0% 8%;
+    --node-pending-border: 0 0% 16%;
     --node-error: 0 65% 55%;
 
     /* Agent graph trigger node colors */
-    --trigger-bg: 210 25% 14%;
-    --trigger-border: 210 30% 30%;
-    --trigger-text: 210 30% 65%;
-    --trigger-icon: 210 40% 55%;
+    --trigger-bg: 0 0% 8%;
+    --trigger-border: 0 0% 20%;
+    --trigger-text: 0 0% 60%;
+    --trigger-icon: 0 0% 50%;
 
     /* Draft graph chrome colors */
-    --draft-edge: 220 10% 30%;
-    --draft-edge-arrow: 220 10% 35%;
-    --draft-edge-label: 220 10% 45%;
-    --draft-back-edge: 220 10% 25%;
-    --draft-group-fill: 220 15% 18%;
-    --draft-group-stroke: 220 10% 40%;
-    --draft-chrome-text: 220 10% 50%;
-    --draft-chrome-text-dim: 220 10% 55%;
+    --draft-edge: 0 0% 22%;
+    --draft-edge-arrow: 0 0% 28%;
+    --draft-edge-label: 0 0% 38%;
+    --draft-back-edge: 0 0% 18%;
+    --draft-group-fill: 0 0% 9%;
+    --draft-group-stroke: 0 0% 25%;
+    --draft-chrome-text: 0 0% 45%;
+    --draft-chrome-text-dim: 0 0% 38%;
     --draft-node-text: 0 0% 78%;
     --draft-node-text-hover: 0 0% 92%;
 
     /* Sub-agent mux pane colors */
-    --mux-title-bg: 240 15% 6%;
-    --mux-title-border: 240 10% 15%;
-    --mux-body-bg: 240 20% 4%;
+    --mux-title-bg: 0 0% 5%;
+    --mux-title-border: 0 0% 12%;
+    --mux-body-bg: 0 0% 3.5%;
     --mux-grid-bg: 0 0% 7%;
-    --mux-frame-border: 240 10% 15%;
-    --mux-frame-bg: 240 20% 4%;
+    --mux-frame-border: 0 0% 12%;
+    --mux-frame-bg: 0 0% 3.5%;
     --mux-dim-text: 0 0% 33%;
     --mux-content-text: 0 0% 80%;
     --mux-waiting-text: 0 0% 20%;
-    --mux-overlay-bg: 240 20% 4% / 0.82;
+    --mux-overlay-bg: 0 0% 3.5% / 0.82;
     --mux-finished-check: 142 50% 40%;
 
     /* Trigger status colors */
     --trigger-status-active: 140 40% 50%;
-    --trigger-status-inactive: 210 20% 40%;
-    --trigger-active-bg: 210 30% 18%;
-    --trigger-active-border: 210 50% 50%;
-    --trigger-active-text: 210 40% 75%;
-    --trigger-active-icon: 210 60% 65%;
+    --trigger-status-inactive: 0 0% 35%;
+    --trigger-active-bg: 0 0% 12%;
+    --trigger-active-border: 0 0% 25%;
+    --trigger-active-text: 0 0% 65%;
+    --trigger-active-icon: 0 0% 55%;
   }
 }
 
@@ -216,6 +245,35 @@
 
   body {
     @apply bg-background text-foreground;
+    font-family: 'Inter Tight', ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    line-height: 1.55;
+  }
+
+  ::selection {
+    background: hsl(var(--primary));
+    color: hsl(0 0% 4.3%);
+  }
+
+  /* User chat bubbles have a primary-colored background, so the default
+     accent selection is invisible. Use an inverted selection instead. */
+  .bg-primary ::selection {
+    background: hsl(0 0% 100% / 0.4);
+    color: hsl(0 0% 0%);
+  }
+
+  h1, h2, h3 {
+    font-family: 'Inter Tight', ui-sans-serif, system-ui, sans-serif;
+    font-weight: 500;
+    letter-spacing: -0.028em;
+    line-height: 1.1;
+  }
+
+  code, pre, .mono, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-feature-settings: "calt" 0;
   }
 
   button {
@@ -350,4 +408,51 @@
     background-image: none;
     color: hsl(var(--muted-foreground));
   }
+}
+
+/* Gentle downward bob to draw attention to the "install extension" CTA
+ * (the browser-bridge Connect button) without it being distracting. */
+@keyframes download-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(2px); }
+}
+.animate-download-bob {
+  animation: download-bob 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-download-bob {
+    animation: none;
+  }
+}
+
+/* Marquee for the browser-tab badge: when a tab title is too long for the
+ * cramped header chip, scroll it horizontally like a carousel. The track holds
+ * two copies of the title and shifts by exactly one (-50%) for a seamless loop;
+ * duration is set inline per title length. Honours reduced-motion. */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.animate-marquee {
+  animation: marquee linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-marquee {
+    animation: none;
+  }
+}
+
+/* Chat search highlights — painted on top of already-rendered markdown
+ * via the CSS Custom Highlight API. ChatPanel registers two highlight
+ * names: `hive-search-match` for non-current matches and
+ * `hive-search-current` for the match the user is focused on. */
+::highlight(hive-search-match) {
+  background-color: hsl(var(--primary) / 0.22);
+  color: inherit;
+  border-radius: 2px;
+}
+::highlight(hive-search-current) {
+  background-color: hsl(var(--primary) / 0.55);
+  color: hsl(var(--primary-foreground));
+  border-radius: 2px;
 }

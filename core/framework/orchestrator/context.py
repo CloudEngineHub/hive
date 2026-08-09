@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 # agents need unconditionally.
 _ALWAYS_AVAILABLE_TOOLS: frozenset[str] = frozenset(
     {
-        "read_file",
-        "write_file",
-        "edit_file",
-        "search_files",
+        # File I/O is done via the terminal tools (terminal_exec / terminal_rg
+        # / terminal_glob); the dedicated read/write/edit/search file tools
+        # were removed.
+        "list_directory",
         "set_output",
         "escalate",
     }
@@ -68,8 +68,6 @@ class GraphContext:
     skills_catalog_prompt: str = ""
     protocols_prompt: str = ""
     skill_dirs: list[str] = field(default_factory=list)
-    context_warn_ratio: float | None = None
-    batch_init_nudge: str | None = None
     dynamic_tools_provider: Any = None
     dynamic_prompt_provider: Any = None
     dynamic_memory_provider: Any = None
@@ -146,9 +144,9 @@ def _resolve_available_tools(
 
     Respects ``node_spec.tool_access_policy``:
     - ``"explicit"`` -- only tools whose name appears in ``node_spec.tools``
-                        PLUS framework-default tools (read_file, set_output, etc.).
+                        PLUS framework-default tools (set_output, escalate, etc.).
                         If the list is empty, only defaults are given.
-    - ``"none"``     -- only framework-default tools (read_file, set_output, etc.).
+    - ``"none"``     -- only framework-default tools (set_output, escalate, etc.).
 
     Framework-default tools (``_ALWAYS_AVAILABLE_TOOLS``) are always included
     regardless of policy — agents need file I/O and output/escalate to function.
@@ -225,8 +223,6 @@ def build_node_context(
     skills_catalog_prompt: str = "",
     protocols_prompt: str = "",
     skill_dirs: list[str] | None = None,
-    default_skill_warn_ratio: float | None = None,
-    default_skill_batch_nudge: str | None = None,
     memory_prompt: str = "",
 ) -> NodeContext:
     """Build a canonical `NodeContext` for graph execution."""
@@ -246,9 +242,7 @@ def build_node_context(
     )
 
     resolved_input_data = (
-        _derive_input_data(buffer, node_spec.input_keys)
-        if input_data is None and derive_input_data_from_buffer
-        else dict(input_data or {})
+        _derive_input_data(buffer, node_spec.input_keys) if input_data is None and derive_input_data_from_buffer else dict(input_data or {})
     )
 
     return NodeContext(
@@ -282,8 +276,6 @@ def build_node_context(
         skills_catalog_prompt=skills_catalog_prompt,
         protocols_prompt=protocols_prompt,
         skill_dirs=list(skill_dirs or []),
-        default_skill_warn_ratio=default_skill_warn_ratio,
-        default_skill_batch_nudge=default_skill_batch_nudge,
     )
 
 
@@ -343,9 +335,7 @@ def build_node_context_from_graph_context(
         accounts_data=gc.accounts_data,
         tool_provider_map=gc.tool_provider_map,
         fallback_to_default_accounts_prompt=fallback_to_default_accounts_prompt,
-        identity_prompt=identity_prompt
-        if identity_prompt is not None
-        else getattr(gc.graph, "identity_prompt", "") or "",
+        identity_prompt=identity_prompt if identity_prompt is not None else getattr(gc.graph, "identity_prompt", "") or "",
         narrative=narrative,
         execution_id=gc.execution_id,
         run_id=gc.run_id,
@@ -357,6 +347,4 @@ def build_node_context_from_graph_context(
         skills_catalog_prompt=gc.skills_catalog_prompt,
         protocols_prompt=gc.protocols_prompt,
         skill_dirs=gc.skill_dirs,
-        default_skill_warn_ratio=gc.context_warn_ratio,
-        default_skill_batch_nudge=gc.batch_init_nudge,
     )

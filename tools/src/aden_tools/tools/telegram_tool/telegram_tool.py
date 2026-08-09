@@ -347,8 +347,7 @@ def register_tools(
             return {
                 "error": "Telegram bot token not configured",
                 "help": (
-                    "Set TELEGRAM_BOT_TOKEN environment variable or configure via "
-                    "credential store. Get your token from @BotFather on Telegram."
+                    "Set TELEGRAM_BOT_TOKEN environment variable or configure via credential store. Get your token from @BotFather on Telegram."
                 ),
             }
         return _TelegramClient(token)

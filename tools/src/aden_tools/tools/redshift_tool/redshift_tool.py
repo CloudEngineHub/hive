@@ -69,17 +69,11 @@ def _api_call(
 
     canonical_request = f"POST\n/\n\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
     credential_scope = f"{datestamp}/{region}/{SERVICE}/aws4_request"
-    string_to_sign = (
-        f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n"
-        + hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
-    )
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
     signing_key = _get_signing_key(secret_key, datestamp, region)
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    auth_header = (
-        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
-        f"SignedHeaders={signed_headers_str}, Signature={signature}"
-    )
+    auth_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers_str}, Signature={signature}"
 
     final_headers = {
         "Content-Type": "application/x-amz-json-1.1",

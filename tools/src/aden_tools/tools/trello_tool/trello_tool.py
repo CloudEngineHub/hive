@@ -40,9 +40,7 @@ def register_tools(
         if not api_key or not api_token:
             return {
                 "error": "Trello credentials not configured",
-                "help": (
-                    "Set TRELLO_API_KEY and TRELLO_API_TOKEN environment variables or configure via credential store"
-                ),
+                "help": ("Set TRELLO_API_KEY and TRELLO_API_TOKEN environment variables or configure via credential store"),
             }
         return TrelloClient(api_key, api_token)
 
@@ -53,9 +51,7 @@ def register_tools(
             return {
                 "error": f"limit must be between {limit_min} and {limit_max}",
                 "field": "limit",
-                "help": (
-                    "Reduce the limit or paginate by calling again with a smaller limit to fetch additional results."
-                ),
+                "help": ("Reduce the limit or paginate by calling again with a smaller limit to fetch additional results."),
             }
         return None
 

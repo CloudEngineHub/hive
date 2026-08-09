@@ -1,33 +1,17 @@
 """Queen lifecycle tools for colony management.
 
 These tools give the Queen agent control over colony workers.
-They close over a session-like object that provides ``colony_runtime``,
-allowing late-binding access to the runtime (which may be loaded/unloaded
-dynamically).
+They close over a session-like object, allowing late-binding access to
+the colony runtime (which may be loaded/unloaded dynamically).
 
 Usage::
 
     from framework.tools.queen_lifecycle_tools import register_queen_lifecycle_tools
 
-    # Server path — pass a Session object
     register_queen_lifecycle_tools(
         registry=queen_tool_registry,
         session=session,
         session_id=session.id,
-    )
-
-    # TUI path — wrap bare references in an adapter
-    from framework.tools.queen_lifecycle_tools import WorkerSessionAdapter
-
-    adapter = WorkerSessionAdapter(
-        colony_runtime=runtime,
-        event_bus=event_bus,
-        worker_path=storage_path,
-    )
-    register_queen_lifecycle_tools(
-        registry=queen_tool_registry,
-        session=adapter,
-        session_id=session_id,
     )
 """
 
@@ -36,10 +20,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,38 +33,29 @@ from framework.loader.preload_validation import credential_errors_to_json
 
 if TYPE_CHECKING:
     from framework.host.agent_host import AgentHost
-    from framework.host.colony_runtime import ColonyRuntime
-    from framework.host.event_bus import EventBus
     from framework.loader.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# The queen's stop_worker tool runs as a normal tool call, so it is bound by
+# ``tool_call_timeout_seconds`` (default 60s, see agent_loop/internals/types.py).
+# The old default grace of 60s meant the graceful-report wait *always* hit that
+# ceiling: the tool was declared timed-out, the queen saw an error, retried, and
+# looped (seen in the wild: 37 consecutive stop_worker calls). Cap the grace well
+# under the budget so the tool always returns cleanly, and back it with the
+# authoritative bounded stop so "stopped" is true even if no one reported in time.
+_DEFAULT_STOP_GRACE_SEC = 12.0
+_MAX_STOP_GRACE_SEC = 25.0
 
-# Open-the-floor message returned by ``start_incubating_colony`` on
-# approval.  The same kinds of prompts (concurrency, schedule, result
-# tracking, failure handling, credentials) live ongoingly inside
-# ``_queen_tools_incubating`` so the queen sees them every turn — this
-# constant is the single-shot version that lands as the tool result.
-# Phrasing intentionally invites the queen's judgement; do NOT turn this
-# into a hard checklist.
-_INCUBATING_APPROVAL_GUIDANCE = (
-    "Approved to incubate colony '{colony_name}'.\n\n"
-    "Your phase has flipped to INCUBATING. Before you call create_colony, "
-    "you'll need operational details that are easy to lose in a "
-    "planning conversation. Take a moment to figure out what's still "
-    "ambiguous for THIS colony — for example: how many worker processes "
-    "should run in parallel (e.g. 1 for a digest, 5 for a fan-out), what "
-    "schedule fits (cron, interval), what should the worker write into "
-    "progress tracking(progress.db) so the user "
-    "can review results later, how to handle partial failures, what "
-    "credentials or MCP servers the worker needs that you haven't "
-    "discussed. You don't "
-    "need to cover every example — only the items that actually matter "
-    "for this colony, and only the ones the user hasn't already implied. "
-    "Use ask_user (batch several questions into one call when you have "
-    "multiple gaps) to fill the real ones. "
-    "If, while sorting these out, you decide the spec isn't ready, call "
-    "cancel_incubation and we go back to INDEPENDENT."
+
+# Matcher/manifest helpers moved to framework.tools.tool_tiers so the worker
+# tiering path shares them. Re-exported here because existing tests and call
+# sites import them from this module.
+from framework.tools.tool_tiers import (  # noqa: E402  (re-export)
+    _first_line,
+    _match_names,
+    _match_searchable_tools,
+    build_search_tools,
 )
 
 
@@ -100,32 +75,50 @@ def _render_credentials_block(provider: Any) -> str:
     return result or ""
 
 
-@dataclass
-class WorkerSessionAdapter:
-    """Adapter for TUI compatibility.
+# Same shape as the colony id validators in routes_colonies / routes_sessions —
+# lowercase alphanumeric and underscores only.
+_COLONY_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
-    Wraps bare colony_runtime + event_bus + storage_path into a
-    session-like object that queen lifecycle tools can use.
+
+QUEEN_PHASES: frozenset[str] = frozenset({"independent", "colony"})
+
+# Legacy phase names. Read paths (meta.json on disk, request bodies from
+# older clients) normalise these via :func:`normalize_legacy_phase`.
+# ``incubating`` was an intermediate state in the old start_incubating_colony
+# → create_colony flow; the new flow forks via the frontend popup, so any
+# pre-fork session that was persisted in incubating phase is treated as
+# independent on resume.
+_LEGACY_PHASE_ALIASES: dict[str, str] = {
+    "working": "colony",
+    "reviewing": "colony",
+    "incubating": "independent",
+}
+
+
+def normalize_legacy_phase(phase: str | None) -> str | None:
+    """Translate legacy phase strings to their current equivalents.
+
+    Used on read paths (meta.json, request bodies) so persisted sessions
+    written before the WORKING/REVIEWING merge still load. Pass-through
+    for current names and ``None``.
     """
-
-    colony_runtime: Any  # ColonyRuntime
-    event_bus: Any  # EventBus
-    worker_path: Path | None = None
-
-
-QUEEN_PHASES: frozenset[str] = frozenset({"independent", "incubating", "working", "reviewing"})
+    if phase is None:
+        return None
+    return _LEGACY_PHASE_ALIASES.get(phase, phase)
 
 
 @dataclass
 class QueenPhaseState:
     """Mutable state container for queen operating phase.
 
-    Four phases: independent, incubating, working, reviewing.
+    Two phases: independent, colony.
     INDEPENDENT: queen acts as a standalone agent with MCP tools, no colony workers.
-    INCUBATING: queen has been approved by the incubating_evaluator to fork
-        a colony — focused tool surface for drafting the spec.
-    WORKING: colony workers are running autonomously.
-    REVIEWING: workers have completed, queen reviews results.
+        Calls ``suggest_colony`` when the user wants persistent / recurring /
+        parallel work; the frontend drives the actual fork via POST
+        /api/sessions.
+    COLONY: the colony has been forked. Workers may be running, finished, or
+        somewhere in between; the queen monitors, intervenes, summarises,
+        and fans out follow-up runs as needed.
 
     Shared between the dynamic_tools_provider callback and tool handlers
     that trigger phase transitions.
@@ -133,26 +126,22 @@ class QueenPhaseState:
 
     phase: str = "independent"  # one of QUEEN_PHASES
     independent_tools: list = field(default_factory=list)  # list[Tool]
-    incubating_tools: list = field(default_factory=list)  # list[Tool]
-    working_tools: list = field(default_factory=list)  # list[Tool]
-    reviewing_tools: list = field(default_factory=list)  # list[Tool]
+    colony_tools: list = field(default_factory=list)  # list[Tool]
     inject_notification: Any = None  # async (str) -> None
     event_bus: Any = None  # EventBus — for emitting QUEEN_PHASE_CHANGED events
+
+    # Path to the queen session's meta.json. When set, every phase
+    # transition merges {"phase": <new>} into it so cold-resume always
+    # has a canonical answer without inferring from events.jsonl or
+    # other indirect signals.
+    meta_path: Path | None = None
 
     # Agent path — set after colony bootstrap so the frontend can query credentials
     agent_path: str | None = None
 
     # Phase-specific prompts (set by queen_orchestrator after construction)
     prompt_independent: str = ""
-    prompt_incubating: str = ""
-    prompt_working: str = ""
-    prompt_reviewing: str = ""
-
-    # Last-set incubation context, populated by start_incubating_colony when
-    # the evaluator approves. Read by get_current_prompt() to interpolate the
-    # colony name into the incubating role prompt so the queen sees the same
-    # name across turns without having to remember it from the tool result.
-    incubating_colony_name: str | None = None
+    prompt_colony: str = ""
 
     # Default skill operational protocols — appended to every phase prompt
     protocols_prompt: str = ""
@@ -178,13 +167,13 @@ class QueenPhaseState:
     queen_identity_prompt: str = ""
 
     # Cached recall blocks — populated async by recall_selector after each turn.
+    # Delivered to the queen as a <system-reminder> riding the conversation
+    # (see queen_orchestrator's recall injection), NOT via the system prompt:
+    # anything that changes per turn in the system prompt sits before the
+    # whole message history in the request and would invalidate the history
+    # prefix cache on every change.
     _cached_global_recall_block: str = ""
     _cached_queen_recall_block: str = ""
-    # Cached dynamic system-prompt suffix — frozen at user-turn boundaries so
-    # AgentLoop iterations within a single turn send a byte-stable prompt and
-    # Anthropic's prompt cache keeps the static block warm. Rebuilt by
-    # refresh_dynamic_suffix() on CLIENT_INPUT_RECEIVED and on phase change.
-    _cached_dynamic_suffix: str = ""
     # Memory directories.
     global_memory_dir: Path | None = None
     queen_memory_dir: Path | None = None
@@ -199,112 +188,224 @@ class QueenPhaseState:
     # ``ToolRegistry._mcp_server_tools``. Names outside this set (lifecycle,
     # ``ask_user``) always pass through the filter.
     mcp_tool_names_all: set = field(default_factory=set)
-    # Memoized output of the filter applied to ``independent_tools``.
-    # Recomputed only when ``enabled_mcp_tools`` or ``independent_tools``
-    # changes, so ``get_current_tools()`` in the independent phase returns
-    # a byte-stable list between saves and the LLM prompt cache stays warm.
+    # Memoized output of the allowlist filter applied to ``independent_tools``
+    # (membership: every tool the queen MAY use). Recomputed only when
+    # ``enabled_mcp_tools`` / ``independent_tools`` / ``loaded_tool_names``
+    # change. The searchable manifest is rendered from this set.
     _filtered_independent_tools: list = field(default_factory=list)
 
-    async def switch_to_working(self, source: str = "tool") -> None:
-        """Switch to working phase — colony workers are running.
+    # ----- Always-enabled / searchable split (schema presentation) --------
+    # Empty ``always_enabled_names`` disables the split: every allowed tool is
+    # eager, preserving older boot/test paths.
+    always_enabled_names: set = field(default_factory=set)
+    # Searchable tool names loaded via ``search_tools``; order is persisted for
+    # cache-stable eager schemas across turns/resumes.
+    loaded_tool_names: list[str] = field(default_factory=list)
+    # Memoized eager sublist returned to the LLM in independent phase.
+    _eager_independent_tools: list = field(default_factory=list)
+
+    async def switch_to_colony(self, source: str = "tool") -> None:
+        """Switch to colony phase — the colony has been forked.
+
+        Workers may be live or finished; the colony phase covers both states
+        with a single tool surface and prompt. Replaces the prior
+        ``switch_to_working`` / ``switch_to_reviewing`` split.
 
         Args:
             source: Who triggered the switch — "tool", "frontend", or "auto".
         """
-        if self.phase == "working":
+        if self.phase == "colony":
             return
-        self.phase = "working"
-        tool_names = [t.name for t in self.working_tools]
-        logger.info("Queen phase → working (source=%s, tools: %s)", source, tool_names)
+        self.phase = "colony"
+        self.persist_phase()
+        tool_names = [t.name for t in self.colony_tools]
+        logger.info("Queen phase → colony (source=%s, tools: %s)", source, tool_names)
         await self._emit_phase_event()
         if self.inject_notification and source != "tool":
             await self.inject_notification(
-                "[PHASE CHANGE] Switched to WORKING phase. "
-                "Colony workers are running. Available tools: " + ", ".join(tool_names) + "."
+                "[PHASE CHANGE] Switched to COLONY phase. "
+                "The colony is live; monitor, intervene, and review as needed. "
+                "Available tools: " + ", ".join(tool_names) + "."
             )
 
+    def _passes_allowlist(self, name: str) -> bool:
+        """Membership gate: may the queen use this tool at all?
+
+        Single source of truth for the allowlist, shared by both phases.
+        Precedence (checked BEFORE the allowlist): always-enabled tools and
+        non-MCP tools (lifecycle / synthetic / ``ask_user``) always pass — a
+        stale or restrictive sidecar can never disable them. Otherwise an MCP
+        tool passes iff the allowlist is unset (allow-all) or names it.
+        """
+        if name in self.always_enabled_names or name not in self.mcp_tool_names_all:
+            return True
+        if self.enabled_mcp_tools is None:
+            return True
+        return name in self.enabled_mcp_tools
+
+    def _is_eager(self, name: str) -> bool:
+        """Schema-presentation gate: full schema up front vs searchable manifest.
+
+        Eager: always-enabled, non-MCP (lifecycle/synthetic), or already loaded
+        via ``search_tools`` this session. Everything else allowed is
+        searchable. When ``always_enabled_names`` is empty the split is
+        disabled and every allowed tool is eager — backward-compatible and
+        fail-open, so a boot-time expansion failure never hides tools.
+        """
+        if not self.always_enabled_names:
+            return True
+        return name in self.always_enabled_names or name not in self.mcp_tool_names_all or name in self.loaded_tool_names
+
     def rebuild_independent_filter(self) -> None:
-        """Recompute the memoized independent-phase tool list.
+        """Recompute the memoized independent-phase tool lists.
 
         Called once at queen boot (after ``independent_tools``,
-        ``mcp_tool_names_all`` and ``enabled_mcp_tools`` are all populated)
-        and again from the tools-PATCH handler whenever the allowlist
-        changes. Keeping the result memoized means the independent-phase
-        branch of ``get_current_tools()`` returns the same Python list
-        object across turns, so the LLM prompt cache stays warm until
-        the user explicitly edits their allowlist.
+        ``mcp_tool_names_all``, ``enabled_mcp_tools``, ``always_enabled_names``
+        and ``loaded_tool_names`` are populated), from the tools-PATCH handler
+        when the allowlist changes, and from ``promote_searched_tools`` when a
+        search loads a tool. Memoizing means the independent-phase branch of
+        ``get_current_tools()`` returns the same Python list object across
+        turns, so the LLM prompt cache stays warm until something changes.
         """
-        if self.enabled_mcp_tools is None:
-            self._filtered_independent_tools = list(self.independent_tools)
-            return
-        allowed = set(self.enabled_mcp_tools)
-        # If ``mcp_tool_names_all`` is empty, every tool falls through the
-        # "not in mcp_tool_names_all" branch below and the allowlist is
-        # silently ignored. That's a fail-open bug (the symptom: a
-        # role-restricted queen sees every MCP tool). Log a warning so the
-        # upstream cause is visible next time it happens.
-        if not self.mcp_tool_names_all:
+        # If ``mcp_tool_names_all`` is empty while an allowlist is set, every
+        # MCP tool falls through ``_passes_allowlist``'s "not MCP" branch and
+        # the allowlist is silently ignored — a fail-open bug (symptom: a
+        # role-restricted queen sees every MCP tool). Warn so the upstream
+        # cause (boot didn't populate ``mcp_tool_names_all``) is visible.
+        if self.enabled_mcp_tools is not None and not self.mcp_tool_names_all:
             logger.warning(
                 "rebuild_independent_filter: mcp_tool_names_all is empty but "
                 "allowlist has %d entries — allowlist cannot be applied. "
                 "Check that queen boot populated phase_state.mcp_tool_names_all.",
-                len(allowed),
+                len(self.enabled_mcp_tools),
             )
-        self._filtered_independent_tools = [
-            t for t in self.independent_tools if t.name not in self.mcp_tool_names_all or t.name in allowed
-        ]
+        self._filtered_independent_tools = [t for t in self.independent_tools if self._passes_allowlist(t.name)]
+        self._eager_independent_tools = [t for t in self._filtered_independent_tools if self._is_eager(t.name)]
         logger.info(
-            "rebuild_independent_filter: allowlist=%d, mcp_names=%d, independent=%d -> filtered=%d",
-            len(allowed),
+            "rebuild_independent_filter: allowlist=%s, always_enabled=%d, loaded=%d, mcp_names=%d, independent=%d -> allowed=%d, eager=%d",
+            "none" if self.enabled_mcp_tools is None else len(self.enabled_mcp_tools),
+            len(self.always_enabled_names),
+            len(self.loaded_tool_names),
             len(self.mcp_tool_names_all),
             len(self.independent_tools),
             len(self._filtered_independent_tools),
+            len(self._eager_independent_tools),
         )
 
-    def get_current_tools(self) -> list:
-        """Return tools for the current phase."""
-        if self.phase == "working":
-            return list(self.working_tools)
-        if self.phase == "reviewing":
-            return list(self.reviewing_tools)
-        if self.phase == "incubating":
-            return list(self.incubating_tools)
-        # Default / "independent" — DM mode with full MCP tools, gated by
-        # the per-queen allowlist. Return the memoized list directly so the
-        # JSON sent to the LLM is byte-identical turn-to-turn.
+    def _filter_mcp_tools_for_phase(self, tools: list) -> list:
+        """Apply the allowlist membership gate (used for colony-phase tools)."""
+        return [t for t in tools if self._passes_allowlist(t.name)]
+
+    def _filtered_tools_for_current_phase(self) -> list:
+        """The allowlist-filtered tool set (eager + searchable) for this phase."""
+        if self.phase == "colony":
+            return self._filter_mcp_tools_for_phase(self.colony_tools)
         if not self._filtered_independent_tools and self.independent_tools:
-            # Safety net: first-call in tests or code paths that skipped
-            # the explicit boot-time rebuild.
+            # Safety net: first call in tests / paths that skipped boot rebuild.
             self.rebuild_independent_filter()
         return self._filtered_independent_tools
+
+    def get_current_tools(self) -> list:
+        """Return the EAGER (callable) tools for the current phase.
+
+        Searchable tools are deliberately excluded — they reach the LLM only
+        as one-line entries in the prompt manifest (see
+        ``render_searchable_manifest``) until ``search_tools`` loads them.
+        """
+        if self.phase == "colony":
+            return [t for t in self._filter_mcp_tools_for_phase(self.colony_tools) if self._is_eager(t.name)]
+        # Independent: return the memoized eager list directly so the JSON
+        # sent to the LLM is byte-identical turn-to-turn.
+        if not self._eager_independent_tools and self.independent_tools:
+            self.rebuild_independent_filter()
+        return self._eager_independent_tools
+
+    def get_searchable_tools(self) -> list:
+        """Tools the queen MAY use but that are not loaded — manifest source."""
+        return [t for t in self._filtered_tools_for_current_phase() if not self._is_eager(t.name)]
+
+    def unregistered_allowlisted_names(self) -> set[str]:
+        """Allowlisted tool names that no live MCP server registered this session.
+
+        These are "configured but unavailable" — distinct from "no such tool".
+        A tool lands here when its MCP server failed to register at boot, so its
+        name never enters ``mcp_tool_names_all`` even though the per-queen
+        allowlist still grants it. Drives the honest ``search_tools`` message so
+        the agent doesn't conclude an allowlisted tool doesn't exist. Returns an
+        empty set in allow-all mode (``enabled_mcp_tools is None``), where an
+        unregistered name can't be told apart from a typo.
+        """
+        if not self.enabled_mcp_tools:
+            return set()
+        return {n for n in self.enabled_mcp_tools if n not in self.mcp_tool_names_all}
+
+    def promote_searched_tools(self, names: list[str]) -> list[str]:
+        """Move searched tool names into the loaded (eager) set.
+
+        Appends each new name (preserving order for cache-stable prompts),
+        persists the updated set to meta.json, and rebuilds the memoized eager
+        list so the next turn sees the tools as callable. Returns the names
+        that were newly loaded (already-loaded names are skipped).
+        """
+        newly: list[str] = []
+        for name in names:
+            if name not in self.loaded_tool_names:
+                self.loaded_tool_names.append(name)
+                newly.append(name)
+        if newly:
+            self.persist_loaded_tools()
+            self.rebuild_independent_filter()
+        return newly
+
+    def restore_loaded_tools(self, persisted: list[str], registered_names: set[str]) -> None:
+        """Heal-on-read: adopt previously-searched tools that are still valid.
+
+        Called once at queen boot, AFTER ``always_enabled_names``,
+        ``enabled_mcp_tools`` and ``mcp_tool_names_all`` are populated and
+        BEFORE ``rebuild_independent_filter``. Drops any persisted name that is
+        no longer registered (server uninstalled / tool removed) or no longer
+        allowed (allowlist tightened) — fail-safe, same spirit as the bypass.
+        """
+        self.loaded_tool_names = [n for n in persisted if n in registered_names and self._passes_allowlist(n)]
+
+    def render_skills_catalog(self) -> str:
+        """Render the phase-filtered skills catalog (the ``<available_skills>``
+        block with its own "cat the SKILL.md / follow it" header), or ``""``.
+
+        Sourced from the live ``skills_manager`` when present so per-phase
+        ``visibility`` filtering applies, else the cached catalog. Delivered to
+        the queen as a ``<system-reminder>`` (see ``SkillsCatalogReminderSource``)
+        rather than baked into the static prompt — so it rides the conversation
+        near the latest turn and refreshes when colony skills are written.
+        """
+        if self.skills_manager is not None:
+            try:
+                return self.skills_manager.skills_catalog_prompt_for_phase(self.phase) or ""
+            except Exception:
+                return self.skills_catalog_prompt or ""
+        return self.skills_catalog_prompt or ""
 
     def get_static_prompt(self) -> str:
         """Return the stable portion of the system prompt for the current phase.
 
-        Includes identity, phase-role prompt, connected-integrations block,
-        skills catalog, and default skill protocols. These change only on
-        phase transition, queen identity selection, or when the user adds/
-        removes an integration — rare events. Designed to be byte-stable
-        across AgentLoop iterations within a single user turn so that
-        Anthropic's prompt cache keeps this block warm.
+        Includes identity, phase-role prompt, connected-integrations block, and
+        default skill protocols. These change only on phase transition, queen
+        identity selection, or when the user adds/removes an integration — rare
+        events. Designed to be byte-stable across AgentLoop iterations within a
+        single user turn so that Anthropic's prompt cache keeps this block warm.
 
-        The dynamic tail (recall + timestamp) is returned separately by
-        ``get_dynamic_suffix()``; the LLM wrapper emits them as two system
-        content blocks with a cache breakpoint between them.
+        Three surfaces deliberately do NOT live here — they are delivered as
+        ``<system-reminder>`` blocks, so they ride the conversation near the
+        latest turn and refresh on change without touching the cached prefix:
+          * the skills catalog (``render_skills_catalog`` →
+            ``SkillsCatalogReminderSource``)
+          * the searchable-tools manifest (``get_searchable_tools`` →
+            ``SearchableToolsReminderSource``)
+          * recalled memories (``render_recall_block`` →
+            queen_orchestrator's recall injection)
         """
-        if self.phase == "working":
-            base = self.prompt_working
-        elif self.phase == "reviewing":
-            base = self.prompt_reviewing
-        elif self.phase == "incubating":
-            # Interpolate the active incubation context so the queen sees the
-            # same colony_name on every turn, not just the first tool result.
-            base = self.prompt_incubating
-            if self.incubating_colony_name:
-                base = base.replace(
-                    "{colony_name}",
-                    self.incubating_colony_name,
-                )
+        if self.phase == "colony":
+            base = self.prompt_colony
         else:
             base = self.prompt_independent
 
@@ -315,61 +416,38 @@ class QueenPhaseState:
         credentials_block = _render_credentials_block(self.credentials_prompt_provider)
         if credentials_block:
             parts.append(credentials_block)
-        catalog_prompt = self.skills_catalog_prompt
-        if self.skills_manager is not None:
-            try:
-                catalog_prompt = self.skills_manager.skills_catalog_prompt_for_phase(self.phase)
-            except Exception:
-                catalog_prompt = self.skills_catalog_prompt
-        if catalog_prompt:
-            parts.append(catalog_prompt)
         if self.protocols_prompt:
             parts.append(self.protocols_prompt)
         return "\n\n".join(parts)
 
-    def refresh_dynamic_suffix(self) -> str:
-        """Rebuild and cache the dynamic system-prompt suffix.
+    def render_recall_block(self) -> str:
+        """Join the cached recall blocks into one deliverable block, or ``""``.
 
-        The suffix contains recall blocks only. Called from the
-        CLIENT_INPUT_RECEIVED subscriber so the suffix is byte-stable across
-        every AgentLoop iteration within a single user turn.
-
-        Timestamps used to live here too; they were moved into the
-        conversation itself as a ``[YYYY-MM-DD HH:MM TZ]`` prefix on each
-        injected event (see ``drain_injection_queue``) so they ride on
-        byte-stable conversation history instead of busting the
-        per-turn system-prompt cache tail.
+        Recall used to ride the system prompt as a per-turn dynamic suffix;
+        that block sits before the entire message history in the request, so
+        every recall refresh invalidated the cached history prefix. It is now
+        injected into the conversation as a ``<system-reminder>`` (see
+        queen_orchestrator's recall injection), which appends near the tail
+        and leaves the cached prefix untouched. Timestamps moved out for the
+        same reason — they ride each injected event as a
+        ``[YYYY-MM-DD HH:MM TZ]`` prefix (see ``drain_injection_queue``).
         """
         parts: list[str] = []
         if self._cached_global_recall_block:
             parts.append(self._cached_global_recall_block)
         if self._cached_queen_recall_block:
             parts.append(self._cached_queen_recall_block)
-        self._cached_dynamic_suffix = "\n\n".join(parts)
-        return self._cached_dynamic_suffix
-
-    def get_dynamic_suffix(self) -> str:
-        """Return the cached dynamic system-prompt suffix.
-
-        Lazily populates on first call so callers don't have to know about
-        the refresh lifecycle. Subsequent calls return the cached string
-        until ``refresh_dynamic_suffix()`` is invoked again.
-        """
-        if not self._cached_dynamic_suffix:
-            self.refresh_dynamic_suffix()
-        return self._cached_dynamic_suffix
+        return "\n\n".join(parts)
 
     def get_current_prompt(self) -> str:
-        """Return the concatenated system prompt (static + dynamic).
+        """Return the current system prompt.
 
-        Retained for backward compatibility and for callers that want one
-        string (conversation persistence, debug dumps). The AgentLoop sends
-        the two pieces separately to the LLM so the cache can break between
-        them — see ``get_static_prompt()`` / ``get_dynamic_suffix()``.
+        Retained for backward compatibility (conversation persistence, debug
+        dumps, the identity hook's initial prompt). Since recall moved into
+        the conversation, this is just the static prompt — byte-stable
+        within a phase so the provider's prompt cache stays warm.
         """
-        static = self.get_static_prompt()
-        dynamic = self.get_dynamic_suffix()
-        return f"{static}\n\n{dynamic}" if dynamic else static
+        return self.get_static_prompt()
 
     async def _emit_phase_event(self) -> None:
         """Publish a QUEEN_PHASE_CHANGED event so the frontend updates the tag."""
@@ -385,25 +463,40 @@ class QueenPhaseState:
                 )
             )
 
-    async def switch_to_reviewing(self, source: str = "tool") -> None:
-        """Switch to reviewing phase — colony workers have finished, queen summarises.
-
-        Args:
-            source: Who triggered the switch — "tool", "frontend", or "auto".
-        """
-        if self.phase == "reviewing":
+    def _persist_meta(self, updates: dict[str, Any]) -> None:
+        """Merge session-scoped runtime state into meta.json."""
+        if self.meta_path is None:
             return
-        self.phase = "reviewing"
-        tool_names = [t.name for t in self.reviewing_tools]
-        logger.info("Queen phase → reviewing (source=%s, tools: %s)", source, tool_names)
-        await self._emit_phase_event()
-        if self.inject_notification and source != "tool":
-            await self.inject_notification(
-                "[PHASE CHANGE] Switched to REVIEWING phase. "
-                "Workers have finished. Summarise results, answer follow-ups, "
-                "and help the user decide next steps. "
-                "Available tools: " + ", ".join(tool_names) + "."
-            )
+        try:
+            existing: dict = {}
+            if self.meta_path.exists():
+                try:
+                    existing = json.loads(self.meta_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    existing = {}
+            if all(existing.get(k) == v for k, v in updates.items()):
+                return
+            existing.update(updates)
+            self.meta_path.write_text(json.dumps(existing), encoding="utf-8")
+        except OSError:
+            pass
+
+    def persist_phase(self) -> None:
+        """Merge the current phase into meta.json on disk."""
+        self._persist_meta({"phase": self.phase})
+
+    def persist_loaded_tools(self) -> None:
+        """Merge the searched-and-loaded tool names into meta.json."""
+        self._persist_meta({"loaded_tools": list(self.loaded_tool_names)})
+
+    def persist_crm_setup(self) -> None:
+        """Mark this session as a CRM setup / configuration conversation.
+
+        One-way: the label arrives once, on the create call the desktop's CRM
+        doors make, and a resume sends no body at all — so the on-disk copy is
+        what keeps a setup conversation identifiable across a restart.
+        """
+        self._persist_meta({"crm_setup": True})
 
     async def switch_to_independent(self, source: str = "tool") -> None:
         """Switch to independent phase — queen acts as standalone agent.
@@ -414,8 +507,7 @@ class QueenPhaseState:
         if self.phase == "independent":
             return
         self.phase = "independent"
-        # Clear stale incubation context so a future incubation starts fresh.
-        self.incubating_colony_name = None
+        self.persist_phase()
         tool_names = [t.name for t in self.independent_tools]
         logger.info("Queen phase → independent (source=%s, tools: %s)", source, tool_names)
         await self._emit_phase_event()
@@ -425,75 +517,6 @@ class QueenPhaseState:
                 "You are the agent — execute the task directly. "
                 "Available tools: " + ", ".join(tool_names) + "."
             )
-
-    async def switch_to_incubating(
-        self,
-        *,
-        colony_name: str,
-        source: str = "tool",
-    ) -> None:
-        """Switch to incubating phase — queen drafts the colony spec.
-
-        Caller must already have validated colony_name. Stores the active
-        colony_name on self so get_current_prompt() can interpolate it on
-        every turn (the queen otherwise loses the colony_name after the
-        first tool result rolls past in the conversation history).
-
-        Args:
-            colony_name: Validated colony slug (lowercase alphanumeric + _).
-            source: "tool", "frontend", or "auto".
-        """
-        if self.phase == "incubating":
-            # Allow re-statement even when already incubating.
-            self.incubating_colony_name = colony_name
-            return
-        self.phase = "incubating"
-        self.incubating_colony_name = colony_name
-        tool_names = [t.name for t in self.incubating_tools]
-        logger.info(
-            "Queen phase → incubating (source=%s, colony=%s, tools: %s)",
-            source,
-            colony_name,
-            tool_names,
-        )
-        await self._emit_phase_event()
-        if self.inject_notification and source != "tool":
-            await self.inject_notification(
-                "[PHASE CHANGE] Switched to INCUBATING phase for colony "
-                f"'{colony_name}'. Available tools: " + ", ".join(tool_names) + "."
-            )
-
-
-def build_worker_profile(runtime: Any, agent_path: Path | str | None = None) -> str:
-    """Build a worker capability profile from the runtime's spec and goal."""
-    goal = runtime._goal if hasattr(runtime, "_goal") else runtime.goal
-
-    lines = ["\n\n# Worker Profile"]
-    colony_id = getattr(runtime, "colony_id", None) or ""
-    if colony_id:
-        lines.append(f"Agent: {colony_id}")
-    if agent_path:
-        lines.append(f"Path: {agent_path}")
-    lines.append(f"Goal: {goal.name}")
-    if goal.description:
-        lines.append(f"Description: {goal.description}")
-
-    if goal.success_criteria:
-        lines.append("\n## Success Criteria")
-        for sc in goal.success_criteria:
-            lines.append(f"- {sc.description}")
-
-    if goal.constraints:
-        lines.append("\n## Constraints")
-        for c in goal.constraints:
-            lines.append(f"- {c.description}")
-
-    spec = getattr(runtime, "_agent_spec", None)
-    if spec and hasattr(spec, "tools") and spec.tools:
-        lines.append(f"\n## Worker Tools\n{', '.join(sorted(spec.tools))}")
-
-    lines.append("\nStatus at session start: idle (not started).")
-    return "\n".join(lines)
 
 
 def _read_agent_triggers_json(agent_path: Path) -> list[dict]:
@@ -531,6 +554,9 @@ def _save_trigger_to_agent(session: Any, trigger_id: str, tdef: Any) -> None:
             "trigger_type": tdef.trigger_type,
             "trigger_config": tdef.trigger_config,
             "task": tdef.task or "",
+            "enabled": bool(getattr(tdef, "enabled", False)),
+            "last_fired_at": getattr(tdef, "last_fired_at", None),
+            "next_due_at": getattr(tdef, "next_due_at", None),
         }
     )
     _write_agent_triggers_json(agent_path, triggers)
@@ -550,27 +576,32 @@ def _remove_trigger_from_agent(session: Any, trigger_id: str) -> None:
 
 
 async def _persist_active_triggers(session: Any, session_id: str) -> None:
-    """Persist the set of active trigger IDs (and their tasks) to SessionState."""
-    runtime = getattr(session, "colony_runtime", None)
-    if runtime is None:
+    """Sync each trigger's ``active`` flag (and task) in the colony triggers.json.
+
+    The colony's ``triggers.json`` is the single source of truth for both
+    trigger definitions and their active status — there is no separate
+    session-state store. ``session_id`` is accepted for signature
+    compatibility but unused.
+    """
+    agent_path = getattr(session, "worker_path", None)
+    if agent_path is None:
         return
-    store = getattr(runtime, "_session_store", None)
-    if store is None:
+    triggers = _read_agent_triggers_json(agent_path)
+    if not triggers:
         return
+    active_ids = set(getattr(session, "active_trigger_ids", set()) or set())
+    available = getattr(session, "available_triggers", {}) or {}
+    for entry in triggers:
+        tid = entry.get("id", "")
+        entry["enabled"] = tid in active_ids
+        # Keep the persisted task in sync with any in-session override.
+        tdef = available.get(tid)
+        if tdef is not None and getattr(tdef, "task", None):
+            entry["task"] = tdef.task
     try:
-        state = await store.read_state(session_id)
-        if state is None:
-            return
-        active_ids = list(getattr(session, "active_trigger_ids", set()))
-        state.active_triggers = active_ids
-        # Persist per-trigger task overrides
-        available = getattr(session, "available_triggers", {})
-        state.trigger_tasks = {
-            tid: available[tid].task for tid in active_ids if tid in available and available[tid].task
-        }
-        await store.write_state(session_id, state)
-    except Exception:
-        logger.warning("Failed to persist active triggers for session %s", session_id, exc_info=True)
+        _write_agent_triggers_json(agent_path, triggers)
+    except OSError:
+        logger.warning("Failed to persist active triggers to %s", agent_path, exc_info=True)
 
 
 async def _emit_trigger_fired(session: Any, trigger_id: str, trigger_type: str) -> None:
@@ -595,8 +626,6 @@ async def _emit_trigger_fired(session: Any, trigger_id: str, trigger_type: str) 
     bus = getattr(session, "event_bus", None)
     if bus is None:
         return
-
-    from framework.host.event_bus import AgentEvent, EventType
 
     # Pull the task/description off the trigger definition so the chat
     # banner can render something human-readable without a second fetch.
@@ -624,6 +653,135 @@ async def _emit_trigger_fired(session: Any, trigger_id: str, trigger_type: str) 
         await bus.publish(AgentEvent(type=EventType.TRIGGER_FIRED, stream_id="queen", data=data))
     except Exception:
         logger.warning("Failed to publish TRIGGER_FIRED for '%s'", trigger_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Missed-trigger handshake
+#
+# Triggers don't fire while a colony's session is closed. On next load
+# ``session_manager`` calls ``compute_missed`` (in
+# ``framework.host.triggers``) to summarise the gap and emits a
+# ``MISSED_TRIGGERS`` event. The UI's modal lets the user choose what
+# to do for each missed trigger, then POSTs the decision map to
+# ``/api/sessions/{id}/colony/resolve_missed`` which delegates here.
+# ---------------------------------------------------------------------------
+
+
+_MISSED_TRIGGER_DECISIONS = {"fire_latest", "skip", "reschedule"}
+
+
+def _next_due_from(tdef: Any, anchor: datetime) -> str | None:
+    """Compute the next future fire time for a trigger anchored at
+    ``anchor``. Returns None if the schedule can't produce one
+    (invalid config, webhook trigger, etc.)."""
+    cfg = getattr(tdef, "trigger_config", {}) or {}
+    cron_expr = cfg.get("cron")
+    interval = cfg.get("interval_minutes")
+    if cron_expr:
+        try:
+            from croniter import croniter
+
+            return croniter(cron_expr, anchor).get_next(datetime).astimezone(UTC).isoformat()
+        except Exception:
+            return None
+    if interval:
+        try:
+            return (anchor + timedelta(minutes=float(interval))).astimezone(UTC).isoformat()
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def _inject_catch_up(session: Any, trigger_id: str, tdef: Any) -> None:
+    """Inject a one-shot catch-up ``TriggerEvent`` into the queen.
+
+    The payload carries ``catch_up=True`` so the queen knows the fire
+    was the user's explicit answer to a missed-trigger handshake and
+    can compress workload for a single catch-up rather than running
+    every missed tick.
+    """
+    from framework.agent_loop.agent_loop import TriggerEvent
+
+    executor = getattr(session, "queen_executor", None)
+    if executor is None:
+        return
+    queen_node = getattr(executor, "node_registry", {}).get("queen")
+    if queen_node is None:
+        return
+    event = TriggerEvent(
+        trigger_type=tdef.trigger_type,
+        source_id=trigger_id,
+        payload={
+            "task": getattr(tdef, "task", "") or "",
+            "trigger_config": getattr(tdef, "trigger_config", {}) or {},
+            "catch_up": True,
+        },
+    )
+    await queen_node.inject_trigger(event)
+
+
+async def resolve_missed(
+    session: Any,
+    decisions: dict[str, str],
+) -> dict[str, str]:
+    """Apply the user's missed-trigger handshake decisions.
+
+    ``decisions`` maps ``trigger_id`` → ``"fire_latest" | "skip" | "reschedule"``.
+
+    - **fire_latest** — inject one catch-up trigger event; stamp
+      ``last_fired_at = now`` so subsequent missed-math sees no gap.
+    - **skip** — stamp ``last_fired_at = now`` without firing.
+    - **reschedule** — stamp ``last_fired_at = now`` and recompute
+      ``next_due_at`` from now. No fire.
+
+    Returns a per-trigger result map (``"fired"``, ``"skipped"``,
+    ``"rescheduled"``, ``"unknown_trigger"``, or
+    ``"invalid_decision:<value>"``).
+    """
+    available = getattr(session, "available_triggers", {}) or {}
+    results: dict[str, str] = {}
+    now = datetime.now(tz=UTC)
+
+    for tid, decision in decisions.items():
+        if decision not in _MISSED_TRIGGER_DECISIONS:
+            results[tid] = f"invalid_decision:{decision}"
+            continue
+        tdef = available.get(tid)
+        if tdef is None:
+            results[tid] = "unknown_trigger"
+            continue
+
+        next_due = _next_due_from(tdef, now)
+        tdef.last_fired_at = now.isoformat()
+        tdef.next_due_at = next_due
+        try:
+            _save_trigger_to_agent(session, tid, tdef)
+        except Exception:
+            logger.warning(
+                "Failed to persist trigger '%s' after %s",
+                tid,
+                decision,
+                exc_info=True,
+            )
+
+        if decision == "fire_latest":
+            await _inject_catch_up(session, tid, tdef)
+            try:
+                await _emit_trigger_fired(session, tid, tdef.trigger_type)
+            except Exception:
+                logger.warning(
+                    "Failed to emit TRIGGER_FIRED for catch-up '%s'",
+                    tid,
+                    exc_info=True,
+                )
+            results[tid] = "fired"
+        elif decision == "skip":
+            results[tid] = "skipped"
+        else:  # reschedule
+            results[tid] = "rescheduled"
+
+    return results
+
 
 
 async def _start_trigger_timer(session: Any, trigger_id: str, tdef: Any) -> None:
@@ -682,8 +840,8 @@ async def _start_trigger_timer(session: Any, trigger_id: str, tdef: Any) -> None
                         _next_delay = float(interval_minutes) * 60 if interval_minutes else 60.0
                     fire_times[trigger_id] = time.monotonic() + _next_delay
 
-                # Gate on a graph being loaded
-                if getattr(session, "colony_runtime", None) is None:
+                # Gate on a colony being bound to this session
+                if getattr(session, "colony_id", None) is None:
                     continue
 
                 # Fire into queen node
@@ -704,6 +862,30 @@ async def _start_trigger_timer(session: Any, trigger_id: str, tdef: Any) -> None
                 )
                 await queen_node.inject_trigger(event)
                 await _emit_trigger_fired(session, trigger_id, "timer")
+
+                # Persist last_fired_at + next_due_at so the activation
+                # missed-triggers handshake can reconstruct which ticks
+                # would have fired during a deactivation gap. Done after
+                # the fire (not before) so a crash mid-fire leaves the
+                # previous timestamp intact.
+                fire_dt = datetime.now(tz=UTC)
+                tdef.last_fired_at = fire_dt.isoformat()
+                if cron_expr:
+                    try:
+                        _peek_next = croniter(cron_expr, fire_dt).get_next(datetime)
+                        tdef.next_due_at = _peek_next.isoformat()
+                    except Exception:
+                        tdef.next_due_at = None
+                elif interval_minutes:
+                    tdef.next_due_at = (fire_dt + timedelta(minutes=float(interval_minutes))).isoformat()
+                try:
+                    _save_trigger_to_agent(session, trigger_id, tdef)
+                except Exception:
+                    logger.warning(
+                        "Failed to persist trigger fire timestamps for '%s'",
+                        trigger_id,
+                        exc_info=True,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -730,8 +912,8 @@ async def _start_trigger_webhook(session: Any, trigger_id: str, tdef: Any) -> No
             return
         if data.get("method", "").upper() not in methods:
             return
-        # Gate on a graph being loaded
-        if getattr(session, "colony_runtime", None) is None:
+        # Gate on a colony being bound to this session
+        if getattr(session, "colony_id", None) is None:
             return
         executor = getattr(session, "queen_executor", None)
         if executor is None:
@@ -779,36 +961,10 @@ async def _start_trigger_webhook(session: Any, trigger_id: str, tdef: Any) -> No
         server.is_running = True
 
 
-def _update_meta_json(session_manager, manager_session_id, updates: dict) -> None:
-    """Merge updates into the queen session's meta.json."""
-    if session_manager is None or not manager_session_id:
-        return
-    srv_session = session_manager.get_session(manager_session_id)
-    if not srv_session:
-        return
-    from framework.config import QUEENS_DIR
-
-    storage_sid = getattr(srv_session, "queen_resume_from", None) or srv_session.id
-    queen_name = getattr(srv_session, "queen_name", "default")
-    meta_path = QUEENS_DIR / queen_name / "sessions" / storage_sid / "meta.json"
-    try:
-        existing = {}
-        if meta_path.exists():
-            existing = json.loads(meta_path.read_text(encoding="utf-8"))
-        existing.update(updates)
-        meta_path.write_text(json.dumps(existing), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def register_queen_lifecycle_tools(
     registry: ToolRegistry,
     session: Any = None,
     session_id: str | None = None,
-    # Legacy params — used by TUI when not passing a session object
-    colony_runtime: ColonyRuntime | None = None,
-    event_bus: EventBus | None = None,
-    storage_path: Path | None = None,
     # Server context — enables load_built_agent tool
     session_manager: Any = None,
     manager_session_id: str | None = None,
@@ -818,14 +974,11 @@ def register_queen_lifecycle_tools(
     """Register queen lifecycle tools.
 
     Args:
-        session: A Session or WorkerSessionAdapter with ``colony_runtime``
-            attribute. The tools read ``session.colony_runtime`` on each
-            call, supporting late-binding.
+        session: Session-like object with a ``colony_runtime`` attribute.
+            The tools read ``session.colony_runtime`` on each call,
+            supporting late-binding.
         session_id: Shared session ID so the colony uses the same session
             scope as the queen and judge.
-        colony_runtime: (Legacy) Direct runtime reference. If ``session``
-            is not provided, a WorkerSessionAdapter is created from
-            colony_runtime + event_bus + storage_path.
         session_manager: (Server only) The SessionManager instance, needed
             for ``load_built_agent`` to hot-load a colony.
         manager_session_id: (Server only) The session's ID in the manager.
@@ -834,15 +987,8 @@ def register_queen_lifecycle_tools(
 
     Returns the number of tools registered.
     """
-    # Build session adapter from legacy params if needed
     if session is None:
-        if colony_runtime is None:
-            raise ValueError("Either session or colony_runtime must be provided")
-        session = WorkerSessionAdapter(
-            colony_runtime=colony_runtime,
-            event_bus=event_bus,
-            worker_path=storage_path,
-        )
+        raise ValueError("session must be provided")
 
     from framework.llm.provider import Tool
 
@@ -852,11 +998,45 @@ def register_queen_lifecycle_tools(
         """Get current colony runtime from session (late-binding)."""
         return getattr(session, "colony_runtime", None)
 
+    async def _publish_trigger_activated(trigger_id: str, trigger_type: str, trigger_config: dict, tdef: Any) -> None:
+        bus = getattr(session, "event_bus", None)
+        if not bus:
+            return
+        runner = getattr(session, "runner", None)
+        graph_entry = runner.graph.entry_node if runner else None
+        await bus.publish(
+            AgentEvent(
+                type=EventType.TRIGGER_ACTIVATED,
+                stream_id="queen",
+                data={
+                    "trigger_id": trigger_id,
+                    "trigger_type": trigger_type,
+                    "trigger_config": trigger_config,
+                    "name": tdef.description or trigger_id,
+                    **({"entry_node": graph_entry} if graph_entry else {}),
+                },
+            )
+        )
+
+    # --- search_tools ----------------------------------------------------
+    # On-demand loader for the searchable tool tier. The queen boots with a
+    # small always-enabled toolset; everything else it is allowed to use is
+    # searchable (name + one-line summary in the <searchable_tools> prompt
+    # manifest) and must be loaded here before it can be called. Loads persist
+    # to meta.json so a resumed session keeps them without re-searching.
+    # Registered only when a phase_state is available (the searchable split
+    # lives there); paths without one keep the full tool surface.
+    if phase_state is not None:
+        _search_tools_tool, _search_tools_handler = build_search_tools(phase_state)
+        registry.register("search_tools", _search_tools_tool, lambda inputs: _search_tools_handler(**inputs))
+        tools_registered += 1
+
+
     # ``start_worker`` was removed in the Phase 4 unification — its
     # bare-bones spawn duplicated ``run_agent_with_input`` (which has
     # credential preflight, concurrency guard, and phase tracking on
     # top). The shared preflight timeout below is used by both
-    # ``run_agent_with_input`` and ``run_parallel_workers``.
+    # ``run_agent_with_input`` and ``run_worker``.
     _START_PREFLIGHT_TIMEOUT = 15  # seconds
 
     async def _preflight_credentials(
@@ -867,7 +1047,7 @@ def register_queen_lifecycle_tools(
         """Compute tools whose credentials are missing and resync MCP servers.
 
         Shared between ``run_agent_with_input`` (single spawn) and
-        ``run_parallel_workers`` (batch spawn). Returns the set of
+        ``run_worker`` (batch spawn). Returns the set of
         tool names whose credentials failed validation; the caller
         filters these out of the spawn's tool lists.
 
@@ -926,29 +1106,138 @@ def register_queen_lifecycle_tools(
 
     # --- stop_worker -----------------------------------------------------------
 
-    async def stop_worker(*, reason: str = "Stopped by queen") -> str:
-        """Stop all active workers in the session.
+    async def stop_worker(
+        *,
+        reason: str = "Stopped by queen",
+        grace_seconds: float = _DEFAULT_STOP_GRACE_SEC,
+    ) -> str:
+        """Stop all active colony workers, giving them a brief window to report.
 
-        Stops workers on BOTH the unified ColonyRuntime (``session.colony``
-        — where ``run_agent_with_input`` and ``run_parallel_workers``
-        spawn) AND the legacy ``session.colony_runtime`` (loaded
-        AgentHost — still tracks timers and any legacy triggers). A
-        previous version only stopped the legacy runtime, which meant
-        workers spawned via the new path kept running silently after
-        the queen called this tool.
+        Each live worker first receives a ``[STOP REQUESTED]`` inject asking it
+        to call ``report_to_parent`` with whatever partial progress it has. We
+        block for up to ``grace_seconds`` collecting those reports, then run the
+        authoritative hard stop (``colony.stop_workers``) which guarantees every
+        worker — live laggards AND queued ones — ends terminal, concurrently and
+        each on its own timeout.
+
+        ``grace_seconds`` is clamped to ``[0, _MAX_STOP_GRACE_SEC]``: this tool is
+        bound by the 60s tool-call budget, and a longer wait would time the whole
+        tool out and make the queen think the stop failed (then retry, and loop).
+        ``0`` skips the report wait and hard-stops immediately.
+
+        The collected reports are returned so the queen can summarise what
+        happened in the same turn.
         """
-        stopped_unified = 0
-        errors: list[str] = []
-
-        # 1. Stop everything on the unified ColonyRuntime. This is
-        # where run_agent_with_input and run_parallel_workers live.
         colony = getattr(session, "colony", None)
+        legacy = _get_runtime()
+
+        if colony is None and legacy is None:
+            return json.dumps({"error": "No runtime on this session."})
+
+        reports: list[dict[str, Any]] = []
+        live_ids: list[str] = []
+        queued_ids: list[str] = []
+        errors: list[str] = []
+        playbooks_stopped: list[str] = []
+
         if colony is not None:
+            # Cancel any running playbook convergence loops FIRST. Otherwise the
+            # loop just re-dispatches fresh workers for every still-pending row
+            # the moment we stop the current batch, and the queen's "all workers
+            # stopped" report is false — the job keeps going. Done before the
+            # worker snapshot so no new worker can slip into `live_ids` behind us.
             try:
-                # Count live workers BEFORE stopping so we can report
-                # accurately — stop_all_workers clears the dict.
-                stopped_unified = sum(1 for w in colony.list_workers() if w.status.value in ("pending", "running"))
-                await colony.stop_all_workers()
+                from framework.tools.playbook_tools import stop_playbooks_for_colony
+
+                playbooks_stopped = await stop_playbooks_for_colony(colony)
+            except Exception as e:
+                errors.append(f"stop_playbooks: {e}")
+                logger.warning(
+                    "stop_worker: failed to cancel running playbooks",
+                    exc_info=True,
+                )
+
+            try:
+                # Snapshot live worker ids BEFORE injecting — wait_for_worker_reports
+                # / stop_all_workers mutate the registry, so we need a stable list
+                # to report on.
+                snapshot = colony.list_workers()
+                # Queued workers haven't started their loop, so there's nothing to
+                # report — and leaving them would let them run the moment capacity
+                # frees (including capacity this very stop frees). Hard-stop them
+                # now rather than feeding them into the grace wait below, where
+                # they'd never report and would pin it open for the full window.
+                queued_ids = [info.id for info in snapshot if info.status.value == "queued"]
+                live_ids = [info.id for info in snapshot if info.status.value in ("pending", "running")]
+
+                # Suppress the orchestrator's duplicate [WORKER_REPORT] inject for
+                # every worker we're stopping — queued ones have nothing to report,
+                # and live ones' reports are returned synchronously below. The
+                # actual stop of the queued workers is handled by the single
+                # `colony.stop_workers()` call at the end (bounded + concurrent).
+                if queued_ids or live_ids:
+                    claimed = getattr(colony, "_suppress_report_inject_for", None)
+                    if claimed is None:
+                        claimed = set()
+                        try:
+                            colony._suppress_report_inject_for = claimed
+                        except AttributeError:
+                            claimed = None
+                    if claimed is not None:
+                        claimed.update(queued_ids)
+                        claimed.update(live_ids)
+
+                # Clamp the grace window under the tool-call budget (see the
+                # module constants) so this tool always returns cleanly instead
+                # of timing out and triggering a retry loop.
+                grace = min(max(0.0, grace_seconds), _MAX_STOP_GRACE_SEC)
+
+                if live_ids and grace > 0:
+                    # Give live workers a brief chance to report partial progress
+                    # before the hard stop. Best-effort — the guaranteed stop is
+                    # the stop_workers() call below, so a slow/missed report never
+                    # leaves a worker running.
+                    stop_msg = (
+                        f"[STOP REQUESTED] {reason}. Call report_to_parent "
+                        "immediately with your latest progress, decisions, "
+                        "and partial findings. You have "
+                        f"~{grace:.0f}s before a hard stop — anything not "
+                        "reported by then will be lost."
+                    )
+                    for wid in live_ids:
+                        worker = colony.get_worker(wid)
+                        if worker is None or not worker.is_active:
+                            continue
+                        # Worker may have just filed a report on its own;
+                        # don't nudge a finished worker into emitting a
+                        # redundant turn.
+                        if getattr(worker, "_explicit_report", None) is not None:
+                            continue
+                        try:
+                            await colony.send_to_worker(wid, stop_msg)
+                        except Exception:
+                            logger.warning(
+                                "stop_worker: stop-inject failed for %s",
+                                wid,
+                                exc_info=True,
+                            )
+
+                    # Blocks until each id reports OR the deadline hits; on
+                    # timeout the helper force-stops the laggard and synthesises a
+                    # ``status="timeout"`` entry, so every id appears in the list.
+                    reports = await colony.wait_for_worker_reports(live_ids, timeout=grace)
+
+                # Authoritative hard stop for EVERYTHING non-persistent — queued
+                # workers, any live laggard that ignored the grace inject, and
+                # anything spawned in the gap. Concurrent + per-worker bounded, and
+                # it spares the persistent overseer (the queen herself). Replaces
+                # the old grace=0 `stop_all_workers()` path (which cleared the
+                # registry and would have stopped the queen too).
+                stop_summary = await colony.stop_workers()
+                if stop_summary.get("timed_out"):
+                    errors.append(
+                        f"force-stopped (unresponsive): {stop_summary['timed_out']}"
+                    )
             except Exception as e:
                 errors.append(f"unified: {e}")
                 logger.warning(
@@ -956,119 +1245,103 @@ def register_queen_lifecycle_tools(
                     exc_info=True,
                 )
 
-        # 2. Stop the legacy runtime too (timers, old-path workers).
-        legacy = _get_runtime()
+        # Workers themselves live on the unified ColonyRuntime above; the
+        # queen's own AgentHost runtime is kept only for timer-based triggers,
+        # so this branch is just "pause the cron timers".
+        timers_paused = False
         if legacy is not None:
             try:
-                legacy_workers = legacy.list_workers()
-                _ = len(legacy_workers) if isinstance(legacy_workers, list) else 0
-            except Exception as e:
-                errors.append(f"legacy: {e}")
-                logger.warning(
-                    "stop_worker: failed to stop legacy runtime workers",
-                    exc_info=True,
-                )
-
-        if colony is None and legacy is None:
-            return json.dumps({"error": "No runtime on this session."})
-
-        cancelled: list[str] = []
-        cancelling: list[str] = []
-
-        # 3. Stop legacy runtime executions with per-stream cancellation so a
-        # still-alive task keeps the worker in "cancelling" instead of being
-        # reported as fully stopped too early.
-        if legacy is not None:
-            try:
-                for graph_id in legacy.list_graphs():
-                    reg = legacy.get_graph_registration(graph_id)
-                    if reg is None:
-                        continue
-
-                    for _ep_id, stream in reg.streams.items():
-                        for executor in stream._active_executors.values():
-                            for node in executor.node_registry.values():
-                                if hasattr(node, "signal_shutdown"):
-                                    node.signal_shutdown()
-                                if hasattr(node, "cancel_current_turn"):
-                                    node.cancel_current_turn()
-
-                        for exec_id in list(stream.active_execution_ids):
-                            try:
-                                outcome = await stream.cancel_execution(exec_id, reason=reason)
-                                if outcome == "cancelled":
-                                    cancelled.append(exec_id)
-                                elif outcome == "cancelling":
-                                    cancelling.append(exec_id)
-                            except Exception as e:
-                                errors.append(f"legacy-cancel:{exec_id}: {e}")
-                                logger.warning("Failed to cancel %s: %s", exec_id, e)
-
                 legacy.pause_timers()
+                timers_paused = True
             except Exception as e:
-                errors.append(f"legacy-runtime: {e}")
+                errors.append(f"pause_timers: {e}")
                 logger.warning(
-                    "stop_worker: failed to inspect legacy runtime executions",
+                    "stop_worker: pause_timers failed",
                     exc_info=True,
                 )
 
-        total_stopped = stopped_unified + len(cancelled)
+        total_workers_stopped = len(live_ids) + len(queued_ids)
         logger.info(
-            "stop_worker: status=%s (unified=%d, cancelled=%d, cancelling=%d). reason=%s",
-            "cancelling" if cancelling else "stopped" if total_stopped else "no_active_executions",
-            stopped_unified,
-            len(cancelled),
-            len(cancelling),
+            "stop_worker: stopped %d worker(s) (%d queued), cancelled %d "
+            "playbook(s), %d report(s) collected. reason=%s",
+            total_workers_stopped,
+            len(queued_ids),
+            len(playbooks_stopped),
+            len(reports),
             reason,
         )
 
         return json.dumps(
             {
-                "status": ("cancelling" if cancelling else "stopped" if total_stopped else "no_active_executions"),
-                "workers_stopped": total_stopped,
-                "unified_stopped": stopped_unified,
-                "legacy_stopped": len(cancelled),
-                "cancelled": cancelled,
-                "cancelling": cancelling,
-                "timers_paused": legacy is not None,
+                # "stopped" whenever we actually halted something — workers (live
+                # or queued) OR a playbook loop that would otherwise keep dispatching.
+                "status": "stopped" if (total_workers_stopped or playbooks_stopped) else "no_active_workers",
+                "workers_stopped": total_workers_stopped,
+                "queued_stopped": len(queued_ids),
+                "playbooks_stopped": playbooks_stopped,
+                "reports": reports,
+                "timers_paused": timers_paused,
                 "reason": reason,
                 "errors": errors if errors else None,
             }
         )
 
-    def _stop_result_allows_phase_transition(stop_result: str) -> tuple[dict, bool]:
-        result = json.loads(stop_result)
-        return result, result.get("status") != "cancelling"
-
     _stop_tool = Tool(
         name="stop_worker",
         description=(
-            "Cancel all active colony workers and pause timers. Workers stop gracefully. No parameters needed."
+            "Halt ALL colony work and pause timers. Use this whenever the user "
+            "asks to pause, stop, or halt — it is the honest 'stop everything'. "
+            "It first cancels any running playbook convergence loops (so they "
+            "can't re-dispatch fresh workers), then cancels every active worker "
+            "— including queued ones waiting for capacity. Each live worker "
+            "first receives a [STOP REQUESTED] inject asking it to call "
+            "report_to_parent with its latest progress; workers that do not "
+            "report within `grace_seconds` are force-stopped. This is reliable "
+            "and fast — it always returns within seconds, so call it ONCE and "
+            "report the result; do not retry it in a loop. The collected reports "
+            "plus the list of cancelled playbooks are returned in the tool "
+            "result, so report what ACTUALLY stopped from that result — do not "
+            "claim everything is stopped without it. Leave `grace_seconds` "
+            "unset for a short reporting window; pass 0 for an immediate hard "
+            "stop.\n"
+            "To halt one specific run_playbook run while leaving others going, "
+            "use stop_playbook(run_id=...) instead."
         ),
-        parameters={"type": "object", "properties": {}},
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why the workers are being stopped. Surfaced to "
+                        "each worker in the stop inject so its final "
+                        "report_to_parent call can reflect the cause."
+                    ),
+                },
+                "grace_seconds": {
+                    "type": "number",
+                    "description": (
+                        "Seconds to wait for workers to file a "
+                        "report_to_parent before force-stopping. Clamped to "
+                        "[0, 25]; leave unset for a short window, or 0 for an "
+                        "immediate hard stop."
+                    ),
+                },
+            },
+            "required": [],
+        },
     )
-    registry.register("stop_worker", _stop_tool, lambda inputs: stop_worker())
+    registry.register(
+        "stop_worker",
+        _stop_tool,
+        lambda inputs: stop_worker(**inputs),
+    )
     tools_registered += 1
 
-    # --- run_parallel_workers --------------------------------------------------
+    # --- run_worker --------------------------------------------------
     #
-    # Fire-and-forget fan-out tool. Spawns one Worker per task spec via
-    # ``colony.spawn_batch`` and returns IMMEDIATELY with the worker ids
-    # and schedule info. The tool no longer blocks on
-    # ``wait_for_worker_reports`` — workers run in the background and
-    # each emits a ``SUBAGENT_REPORT`` event when it terminates.
-    # ``queen_orchestrator._on_worker_report`` subscribes to that event
-    # and injects a ``[WORKER_REPORT]`` user turn into the queen's
-    # conversation, so the queen sees each result as a normal inbound
-    # message and can react without being blocked by the spawn call.
-    #
-    # Soft + hard timeouts are enforced by
-    # ``ColonyRuntime.watch_batch_timeouts``: at soft-timeout, every
-    # still-active worker that hasn't already filed an explicit report
-    # receives a SOFT TIMEOUT inject telling it to call report_to_parent
-    # now; at hard-timeout, any remaining worker is force-stopped
-    # (and its SUBAGENT_REPORT still fires — explicit reports set right
-    # before the stop are preserved).
+    # Fire-and-forget fan-out. Workers report later via SUBAGENT_REPORT, and
+    # ColonyRuntime.watch_batch_timeouts owns soft/hard timeout enforcement.
 
     _RUN_PARALLEL_DEFAULT_TIMEOUT = 600.0  # soft timeout (10 min)
     _RUN_PARALLEL_HARD_TIMEOUT_CAP = 3600.0  # absolute safety-net cap (1 hour)
@@ -1084,25 +1357,39 @@ def register_queen_lifecycle_tools(
         """Read the unified ColonyRuntime (Phase 2 wiring) from session."""
         return getattr(session, "colony", None)
 
-    async def run_parallel_workers(
+    async def run_worker(
         *,
-        tasks: list[dict],
+        tasks: list[dict] | None = None,
         timeout: float | None = None,
-        hard_timeout: float | None = None,
+        max_iterations: int | None = None,
+        tool_call_lifetime_budget: int | None = None,
+        resume_worker_ids: list[str] | None = None,
+        guidance: str | None = None,
     ) -> str:
-        """Spawn N parallel workers and return immediately.
+        """Spawn N parallel workers — OR resume stopped workers — and return immediately.
 
-        Each task is a dict ``{"task": str, "data": dict | None}``.
-        Workers run in the background; each one emits a ``SUBAGENT_REPORT``
-        when it finishes, which the queen sees as a ``[WORKER_REPORT]``
-        user turn. The queen stays unblocked for other work.
+        Spawn mode (default): pass ``tasks``, a list of
+        ``{"task": str, "data": dict | None}``. Workers run in the
+        background; each emits a ``SUBAGENT_REPORT`` the queen sees as a
+        ``[WORKER_REPORT]`` user turn. The queen stays unblocked.
+
+        Resume mode: pass ``resume_worker_ids`` (a list of worker_ids of
+        workers that stopped before reporting — e.g. timed-out or
+        force-stopped). Each is reloaded from its saved conversation and
+        continues from where it left off, then reports via
+        ``report_to_parent``. Pass ``guidance`` to inject one steering
+        message into every resumed worker before it continues. Pass
+        ``max_iterations`` to extend the iteration ceiling (a worker that
+        stopped near its limit needs headroom to finish). ``tasks`` and
+        ``resume_worker_ids`` are mutually exclusive.
 
         ``timeout`` is a **soft** deadline (default 600s). When it
         expires, each still-active worker without an explicit report
         gets a SOFT TIMEOUT inject telling it to call ``report_to_parent``
-        now. Workers ignoring the warning are force-stopped at the
-        ``hard_timeout`` (default: derived from ``timeout``, capped at
-        3600s).
+        now. Workers ignoring the warning are force-stopped at a hard
+        deadline derived from ``timeout`` (``max(timeout × 4,
+        timeout + 600)``, capped at 3600s) — the derivation is not
+        agent-tunable.
         """
         colony = _get_unified_colony()
         if colony is None:
@@ -1116,62 +1403,25 @@ def register_queen_lifecycle_tools(
                 }
             )
 
-        if not isinstance(tasks, list) or not tasks:
+        # Spawn vs resume are mutually exclusive. Validate the chosen mode
+        # up front so the queen gets a clear error instead of a confusing
+        # downstream failure.
+        _resume_mode = resume_worker_ids is not None
+        if _resume_mode and tasks:
+            return json.dumps({"error": "Pass either 'tasks' (spawn) or 'resume_worker_ids' (resume), not both."})
+        if _resume_mode:
+            if not isinstance(resume_worker_ids, list) or not resume_worker_ids:
+                return json.dumps({"error": "resume_worker_ids must be a non-empty list of worker_id strings"})
+        elif not isinstance(tasks, list) or not tasks:
             return json.dumps({"error": "tasks must be a non-empty list of {task, data?} dicts"})
 
-        # Hard ceiling on a single fan-out call. A runaway queen requesting
-        # thousands of parallel workers would starve memory and drown the
-        # event loop; reject early with a clear error instead.
-        # Laptop-safe default (8); override via HIVE_RUN_PARALLEL_HARD_CAP.
-        _RUN_PARALLEL_HARD_CAP = 8
-        _cap_env = os.environ.get("HIVE_RUN_PARALLEL_HARD_CAP")
-        if _cap_env:
-            try:
-                _parsed = int(_cap_env)
-                if _parsed > 0:
-                    _RUN_PARALLEL_HARD_CAP = _parsed
-            except ValueError:
-                logger.warning(
-                    "Invalid HIVE_RUN_PARALLEL_HARD_CAP=%r; using default %d",
-                    _cap_env,
-                    _RUN_PARALLEL_HARD_CAP,
-                )
-        if len(tasks) > _RUN_PARALLEL_HARD_CAP:
-            return json.dumps(
-                {
-                    "error": (
-                        f"run_parallel_workers received {len(tasks)} tasks, "
-                        f"hard cap is {_RUN_PARALLEL_HARD_CAP}. Split the work "
-                        "into sequential batches or tighten the task list."
-                    )
-                }
-            )
-
-        # Global concurrency enforcement against ColonyConfig.max_concurrent_workers.
-        # The config field exists but was never checked anywhere — tracking
-        # it here so recursive fan-outs can't silently exceed the budget.
-        colony_cfg = getattr(colony, "_config", None) or getattr(colony, "config", None)
-        max_concurrent = getattr(colony_cfg, "max_concurrent_workers", None)
-        if max_concurrent and max_concurrent > 0:
-            active = 0
-            try:
-                workers = getattr(colony, "_workers", {}) or {}
-                for w in workers.values():
-                    handle = getattr(w, "_task_handle", None)
-                    if handle is not None and not handle.done():
-                        active += 1
-            except Exception:
-                active = 0
-            if active + len(tasks) > max_concurrent:
-                return json.dumps(
-                    {
-                        "error": (
-                            f"run_parallel_workers would exceed max_concurrent_workers "
-                            f"({active} active + {len(tasks)} new > {max_concurrent}). "
-                            "Wait for existing workers to finish or reduce batch size."
-                        )
-                    }
-                )
+        # Concurrency cap is enforced INSIDE the colony scheduler now,
+        # not here. spawn_batch admits all N tasks; whatever exceeds
+        # ``colony.max_concurrent_workers`` lands in the pending queue
+        # and starts as running peers terminate. The queen sees the
+        # split via ``running_now`` / ``queued`` in the immediate
+        # return below, and via ``batch_remaining`` (which counts both
+        # queued and running) on each [WORKER_REPORT].
 
         # Credential preflight — mirrors the one run_agent_with_input
         # performs. Without this, missing credentials (e.g. stale
@@ -1181,12 +1431,9 @@ def register_queen_lifecycle_tools(
         # every spawn via tools_override.
         legacy_for_preflight = _get_runtime()
         unavailable_tools_parallel: set[str] = set()
-        tools_override_parallel: list[Any] | None = None
         if legacy_for_preflight is not None:
             try:
-                unavailable_tools_parallel = await _preflight_credentials(
-                    legacy_for_preflight, tool_label="run_parallel_workers"
-                )
+                unavailable_tools_parallel = await _preflight_credentials(legacy_for_preflight, tool_label="run_worker")
             except CredentialError as e:
                 # Structured credential failure: publish the
                 # CREDENTIALS_REQUIRED event so the frontend's modal
@@ -1205,81 +1452,210 @@ def register_queen_lifecycle_tools(
                     )
                 return json.dumps(error_payload)
 
-            # Always filter queen-lifecycle tools + any tools with missing
-            # credentials. Without the queen-only strip the spawned worker
-            # inherits run_parallel_workers / create_colony / switch_to_*,
-            # which lets it recurse or flip the parent queen's phase.
-            from framework.server.routes_execution import _resolve_queen_only_tools
+        # Always strip queen-lifecycle tools (run_worker,
+        # switch_to_*) — without it the spawned worker could recurse or
+        # flip the parent queen's phase. This applies whether or not
+        # legacy preflight ran.
+        from framework.server.routes_execution import _resolve_queen_only_tools
 
-            queen_only = _resolve_queen_only_tools()
-            colony_tools = list(getattr(colony, "_tools", []) or [])
-            before = len(colony_tools)
-            tools_override_parallel = [
-                t
-                for t in colony_tools
-                if getattr(t, "name", None) not in queen_only
-                and getattr(t, "name", None) not in unavailable_tools_parallel
-            ]
-            dropped = before - len(tools_override_parallel)
-            if dropped:
-                logger.info(
-                    "run_parallel_workers: stripped %d queen/unavailable tool(s) from spawn_tools",
-                    dropped,
-                )
+        queen_only = _resolve_queen_only_tools()
 
-        # Colony progress tracker wiring: if the session's loaded
-        # worker points at a colony directory that has a progress.db,
-        # inject db_path + colony_id into every per-task ``data``
-        # dict so each spawned worker sees them in its first user
-        # message and can claim rows from the queue. ColonyRuntime.
-        # spawn() detects db_path in input_data and pre-activates
-        # hive.colony-progress-tracker into the catalog prompt.
-        _colony_db_path: str | None = None
-        _colony_id: str | None = None
-        _worker_path = getattr(session, "worker_path", None)
-        if _worker_path:
-            from pathlib import Path as _Path
+        # Strict bound: workers may only see tools the SPAWNING QUEEN
+        # currently has in her phase. Without this, workers get the
+        # entire colony pipeline's tool set (which can be a superset
+        # of what the queen herself can call), and the queen would be
+        # delegating capabilities she doesn't own. Read her current
+        # available_tools off the queen loop — same path
+        # ``fork_session_into_colony`` uses to snapshot the worker
+        # template at colony-creation time. None means "queen ctx not
+        # available, fall back to no scope filter" so legacy tests +
+        # cold-start sessions still work.
+        queen_tool_names: set[str] | None = None
+        try:
+            queen_executor = getattr(session, "queen_executor", None)
+            node_registry = getattr(queen_executor, "node_registry", None)
+            queen_loop = node_registry.get("queen") if isinstance(node_registry, dict) else None
+            queen_ctx = getattr(queen_loop, "_last_ctx", None)
+            if queen_ctx is not None:
+                queen_tool_names = {getattr(t, "name", None) for t in (queen_ctx.available_tools or []) if getattr(t, "name", None)}
+        except Exception:
+            logger.debug(
+                "run_worker: failed to read queen available_tools; falling back to full colony tool set",
+                exc_info=True,
+            )
+            queen_tool_names = None
 
-            _wp = _Path(_worker_path)
-            _pdb = _wp / "data" / "progress.db"
-            if _pdb.exists():
-                _colony_db_path = str(_pdb.resolve())
-                _colony_id = _wp.name
-
-        # Phase 2: enqueue each task into progress.db BEFORE building
-        # spawn specs so every parallel worker has a pre-assigned row
-        # to claim. Without this the queue stays empty and each
-        # worker's claim UPDATE affects zero rows, silently falling
-        # back to executing from its spawn message.
-        _enqueued_task_ids: list[str | None] = [None] * len(tasks)
-        if _colony_db_path:
-            from pathlib import Path as _PathP
-
-            from framework.host.progress_db import (
-                enqueue_task as _enqueue_task_fn,
+        colony_tools = list(getattr(colony, "_tools", []) or [])
+        before = len(colony_tools)
+        tools_override_parallel: list[Any] = [
+            t
+            for t in colony_tools
+            if getattr(t, "name", None) not in queen_only
+            and getattr(t, "name", None) not in unavailable_tools_parallel
+            and (queen_tool_names is None or getattr(t, "name", None) in queen_tool_names)
+        ]
+        dropped = before - len(tools_override_parallel)
+        if dropped:
+            logger.info(
+                "run_worker: stripped %d tool(s) from spawn_tools (queen-only / unavailable-credential / outside queen scope; queen scope size=%s)",
+                dropped,
+                len(queen_tool_names) if queen_tool_names is not None else "n/a",
             )
 
-            _pdb_path_obj = _PathP(_colony_db_path)
-            for _i, _spec in enumerate(tasks):
-                if not isinstance(_spec, dict):
-                    continue
-                _task_text_pre = str(_spec.get("task", "")).strip()
-                if not _task_text_pre:
+        # ── Resume mode ──────────────────────────────────────────────
+        # Reload stopped/historical workers from their saved state and
+        # continue them, instead of spawning fresh. Shares the credential
+        # preflight + queen-scoped tool filtering above (so a resumed
+        # worker runs with the queen's CURRENT tool scope), but skips the
+        # spawn-only task normalization / tracker-registry gate — the
+        # worker already coordinated through the tracker on its first run.
+        if _resume_mode:
+            import uuid as _uuid
+            from datetime import UTC as _UTC, datetime as _dt
+
+            resume_batch_id = _dt.now(_UTC).strftime("rsw_%Y%m%dT%H%M%SZ_") + _uuid.uuid4().hex[:8]
+            ids = [str(w).strip() for w in resume_worker_ids]
+            results: list[dict[str, Any]] = []
+            resumed_ids: list[str] = []
+            for idx, wid in enumerate(ids):
+                if not wid:
+                    results.append({"worker_id": wid, "status": "error", "error": "empty worker_id"})
                     continue
                 try:
-                    _enqueued_task_ids[_i] = await asyncio.to_thread(
-                        _enqueue_task_fn,
-                        _pdb_path_obj,
-                        _task_text_pre,
-                        source="run_parallel_workers",
+                    await colony.resume_worker(
+                        wid,
+                        tools_override=tools_override_parallel,
+                        guidance=guidance,
+                        max_iterations=max_iterations,
+                        tool_call_lifetime_budget=tool_call_lifetime_budget,
+                        batch_id=resume_batch_id,
+                        batch_index=idx + 1,
+                        batch_size=len(ids),
                     )
-                except Exception as _enqueue_exc:
-                    logger.warning(
-                        "run_parallel_workers: failed to enqueue tasks[%d] "
-                        "(spawn proceeding without pinned task_id): %s",
-                        _i,
-                        _enqueue_exc,
-                    )
+                except (ValueError, RuntimeError) as e:
+                    results.append({"worker_id": wid, "status": "error", "error": str(e)})
+                    continue
+                except Exception as e:  # noqa: BLE001 — surface unexpected failures per-id
+                    logger.warning("run_worker resume failed for %s: %s", wid, e, exc_info=True)
+                    results.append({"worker_id": wid, "status": "error", "error": f"resume failed: {e}"})
+                    continue
+                resumed_ids.append(wid)
+                w = colony._workers.get(wid) if hasattr(colony, "_workers") else None
+                results.append(
+                    {
+                        "worker_id": wid,
+                        "status": "resumed",
+                        "initial_status": ("queued" if (w is not None and getattr(w, "is_queued", False)) else "running"),
+                        "output_file": (getattr(w, "output_file", "") or "") if w is not None else "",
+                    }
+                )
+
+            if resumed_ids:
+                # Workers are live again — move the queen into the colony phase.
+                if phase_state is not None:
+                    try:
+                        await phase_state.switch_to_colony()
+                    except Exception as exc:
+                        logger.warning("run_worker (resume): phase transition failed (non-fatal): %s", exc)
+                _resume_soft = timeout if timeout is not None else _RUN_PARALLEL_DEFAULT_TIMEOUT
+                _resume_hard = _compute_hard_timeout(_resume_soft)
+                if _resume_hard <= _resume_soft:
+                    _resume_hard = _resume_soft + 60.0
+                try:
+                    colony.watch_batch_timeouts(resumed_ids, soft_timeout=_resume_soft, hard_timeout=_resume_hard)
+                except Exception as exc:
+                    logger.warning("run_worker (resume): failed to schedule timeout watcher (non-fatal): %s", exc)
+
+            return json.dumps(
+                {
+                    "status": "resumed",
+                    "batch_id": resume_batch_id,
+                    "resumed_count": len(resumed_ids),
+                    "requested_count": len(ids),
+                    "workers": results,
+                    "message": (
+                        f"Resumed {len(resumed_ids)} of {len(ids)} worker(s). Each resumed worker "
+                        "continues from its saved conversation and emits a fresh [WORKER_REPORT] "
+                        "when it terminates. Workers that could not be resumed are listed with an "
+                        "'error' status (e.g. still active, no saved state, or unknown id)."
+                    ),
+                }
+            )
+
+        # Resolve the ColonyBinding for this run. The queen's own exec
+        # context carries the binding once ``fork_session_into_colony``
+        # has stamped it, so the preflight registry check below targets
+        # the same tracker.db the queen wrote her DDL to. ``session``
+        # and ``colony`` are checked as fallbacks for the few code paths
+        # (mostly tests) that drive the queen without going through fork.
+        from framework.host.colony_binding import ColonyBinding, current_binding
+        from framework.host.tracker_db import ensure_tracker_db as _ensure_tracker_db
+
+        _binding: ColonyBinding | None = current_binding()
+        if _binding is None:
+            _name = getattr(session, "colony_id", None) or getattr(colony, "colony_id", None)
+            if _name:
+                _binding = ColonyBinding.for_name(str(_name))
+        # Make sure the DB exists. The fork flow already does this, but
+        # tests that build the binding by hand may not.
+        if _binding is not None:
+            try:
+                await asyncio.to_thread(_ensure_tracker_db, _binding.dir)
+            except Exception as exc:
+                logger.warning(
+                    "run_worker: ensure_tracker_db failed: %s",
+                    exc,
+                )
+        # Hard prerequisite: parallel workers must coordinate via the
+        # tracker. Refuse to spawn unless at least one table is
+        # registered for worker writes. Without it workers have no
+        # shared primitive for claiming work and the queen has no way
+        # to validate progress mid-batch — markdown files and prose
+        # reports cannot replace it.
+        if _binding is None:
+            return json.dumps(
+                {
+                    "error": (
+                        "run_worker: no colony binding in the "
+                        "execution context. Workers cannot be coordinated "
+                        "without one — this queen has not created a colony."
+                    ),
+                }
+            )
+        try:
+            import sqlite3 as _sqlite3
+
+            _con = _sqlite3.connect(str(_binding.tracker_db))
+            try:
+                _row = _con.execute("SELECT COUNT(*) FROM _tracker_registry").fetchone()
+                _reg_count = int(_row[0]) if _row else 0
+            finally:
+                _con.close()
+        except Exception as exc:
+            # Fail closed: if we can't read the registry, treat it as
+            # empty so the queen gets the same actionable error rather
+            # than discovering the problem one-per-worker at upsert time.
+            logger.warning(
+                "run_worker: tracker registry check failed; treating as unregistered: %s",
+                exc,
+            )
+            _reg_count = 0
+        if _reg_count == 0:
+            return json.dumps(
+                {
+                    "error": (
+                        "No tables registered for worker writes. Before "
+                        "calling run_worker: (1) model the work as "
+                        "a row-shape table with "
+                        "tracker_sql('CREATE TABLE <name> (...)'), (2) "
+                        "register it with tracker_register_writable("
+                        "table='<name>', write_columns=[...], "
+                        "key_columns=[...]). Workers need a shared tracker "
+                        "to coordinate — markdown files and prose reports "
+                        "cannot replace it."
+                    ),
+                }
+            )
 
         # Normalise: each entry must have a non-empty "task" string.
         normalised: list[dict] = []
@@ -1290,165 +1666,246 @@ def register_queen_lifecycle_tools(
             if not task_text:
                 return json.dumps({"error": f"tasks[{i}].task is empty"})
             spec_data = spec.get("data") if isinstance(spec.get("data"), dict) else {}
-            if _colony_db_path:
-                spec_data = {
-                    **spec_data,
-                    "db_path": _colony_db_path,
-                    "colony_id": _colony_id,
-                }
-                if _enqueued_task_ids[i]:
-                    spec_data["task_id"] = _enqueued_task_ids[i]
-            normalised.append(
-                {
-                    "task": task_text,
-                    "data": spec_data or None,
-                }
-            )
+            spec_data = {**spec_data, "binding": _binding.to_dict()}
+            entry: dict[str, Any] = {
+                "task": task_text,
+                "data": spec_data,
+            }
+            if spec.get("profile_name"):
+                entry["profile_name"] = str(spec["profile_name"])
+            if isinstance(spec.get("goal"), str) and spec["goal"].strip():
+                entry["goal"] = spec["goal"].strip()
+            # Tool-tiering preload: exact names to promote into the worker's
+            # eager set at spawn (validated against the pool downstream).
+            _preload = spec.get("preload_tools")
+            if isinstance(_preload, list):
+                _preload_clean = [str(n).strip() for n in _preload if isinstance(n, str) and str(n).strip()]
+                if _preload_clean:
+                    entry["preload_tools"] = _preload_clean
+            # Per-task budget / timeout overrides were removed from the
+            # public schema: heterogeneous batches are almost always a
+            # smell, and agents that genuinely need different limits per
+            # worker should run two batches. Any keys still present on
+            # ``spec`` from legacy callers are silently dropped here.
+            normalised.append(entry)
 
-        if _colony_db_path:
-            _pinned = sum(1 for tid in _enqueued_task_ids if tid)
-            logger.info(
-                "run_parallel_workers: attached progress_db context to %d spawn(s) (colony_id=%s, %d pinned task_ids)",
-                len(normalised),
-                _colony_id,
-                _pinned,
-            )
+        logger.info(
+            "run_worker: attached binding to %d spawn(s) (colony=%s)",
+            len(normalised),
+            _binding.name,
+        )
 
-        # Publish a colony template entry per task BEFORE spawning so
-        # the entries' template ids can be threaded into the spawn data
-        # (workers' ctx.picked_up_from references them). This mirrors the
-        # plan §5d "auto-populated by run_parallel_workers" behavior.
-        # Preserve the task text in spec["data"] before any template-store
-        # mutation. Once spec["data"] is non-empty, spawn()'s
-        # ``input_data or {"task": task}`` fallback no longer fires, so the
-        # task description would otherwise vanish from the worker's first
-        # user message. Hoisted out of the try below so a non-fatal template
-        # failure cannot drop task text from the spawn payload.
+        # Preserve the task text in spec["data"]. Once spec["data"] is
+        # non-empty, spawn()'s ``input_data or {"task": task}`` fallback no
+        # longer fires, so the task description would otherwise vanish from
+        # the worker's first user message.
         for spec in normalised:
             spec["data"] = dict(spec.get("data") or {})
             spec["data"].setdefault("task", spec["task"])
 
-        _template_ids: list[int | None] = [None] * len(normalised)
-        try:
-            from framework.tasks import TaskListRole, get_task_store
-            from framework.tasks.scoping import colony_task_list_id
+        # Batch-level budget overrides: only include fields the queen
+        # explicitly passed (None = leave the framework default alone).
+        batch_loop_overrides: dict[str, Any] = {}
+        if isinstance(max_iterations, int):
+            batch_loop_overrides["max_iterations"] = max_iterations
+        if isinstance(tool_call_lifetime_budget, int):
+            batch_loop_overrides["tool_call_lifetime_budget"] = tool_call_lifetime_budget
 
-            _task_store = get_task_store()
-            _template_list_id = colony_task_list_id(_colony_id or "primary")
-            await _task_store.ensure_task_list(_template_list_id, role=TaskListRole.TEMPLATE)
-            for i, spec in enumerate(normalised):
-                rec = await _task_store.create_task(
-                    _template_list_id,
-                    subject=spec["task"][:200],
-                    description=spec["task"],
-                )
-                _template_ids[i] = rec.id
-                # Thread the template id into the worker's spawn data so
-                # ColonyRuntime.spawn populates ctx.picked_up_from correctly.
-                spec["data"]["__template_task_id"] = rec.id
-        except Exception:
-            logger.warning(
-                "run_parallel_workers: colony template publish failed (non-fatal)",
-                exc_info=True,
-            )
+        # Mint the batch_id here so we can return it in the immediate
+        # response — the queen uses it to correlate the [WORKER_REPORT]s
+        # she'll receive against this specific spawn call.
+        import uuid as _uuid
+        from datetime import UTC as _UTC, datetime as _dt
 
+        batch_id = _dt.now(_UTC).strftime("rpw_%Y%m%dT%H%M%SZ_") + _uuid.uuid4().hex[:8]
         try:
             worker_ids = await colony.spawn_batch(
                 normalised,
                 tools_override=tools_override_parallel,
+                loop_config_overrides=batch_loop_overrides or None,
+                batch_id=batch_id,
             )
         except Exception as e:
             return json.dumps({"error": f"spawn_batch failed: {e}"})
 
-        # Stamp `assigned_session` on each template entry post-spawn so the
-        # UI's colony-overview panel can render the assigned-session chip.
-        try:
-            from framework.tasks.events import emit_colony_template_assignment
-            from framework.tasks.scoping import session_task_list_id
-
-            for tid, wid in zip(_template_ids, worker_ids, strict=False):
-                if tid is None:
-                    continue
-                _assigned = session_task_list_id(wid, wid)
-                await _task_store.update_task(
-                    _template_list_id,
-                    tid,
-                    metadata_patch={
-                        "assigned_session": _assigned,
-                        "assigned_worker_id": wid,
-                    },
-                )
-                await emit_colony_template_assignment(
-                    colony_id=_colony_id or "primary",
-                    task_id=tid,
-                    assigned_session=_assigned,
-                    assigned_worker_id=wid,
-                )
-        except Exception:
-            logger.debug("run_parallel_workers: failed to stamp template assignments", exc_info=True)
-
-        # Phase transition — workers are now live, queen is in "working"
-        # phase. Worker-finish auto-transitions back to "reviewing" once
-        # every worker has reported (see queen_orchestrator._on_worker_report).
+        # Phase transition — workers are now live, queen is in "colony"
+        # phase. Colony phase covers both live and finished states, so no
+        # follow-up transition is needed when workers report.
+        # switch_to_colony persists phase to meta.json itself; no external
+        # _update_meta_json call needed.
         if phase_state is not None:
             try:
-                await phase_state.switch_to_working()
-                _update_meta_json(session_manager, manager_session_id, {"phase": "working"})
+                await phase_state.switch_to_colony()
             except Exception as exc:
                 logger.warning(
-                    "run_parallel_workers: phase transition to 'working' failed (non-fatal): %s",
+                    "run_worker: phase transition to 'colony' failed (non-fatal): %s",
                     exc,
                 )
 
         # Soft + hard timeout watcher runs in the background. At soft,
         # it injects a "wrap up" message to every still-active worker
-        # without an explicit report; at hard, it force-stops the stragglers.
-        soft_timeout = timeout if timeout is not None else _RUN_PARALLEL_DEFAULT_TIMEOUT
-        hard_timeout_effective = hard_timeout if hard_timeout is not None else _compute_hard_timeout(soft_timeout)
-        if hard_timeout_effective <= soft_timeout:
-            hard_timeout_effective = soft_timeout + 60.0  # enforce at least a 60s grace
+        # without an explicit report; at hard, it force-stops the
+        # stragglers. ``hard`` is always derived from ``soft`` — the
+        # agent no longer tunes it directly (the derivation handles
+        # ~99% of cases and one fewer knob trims the tool surface).
+        batch_soft = timeout if timeout is not None else _RUN_PARALLEL_DEFAULT_TIMEOUT
+        batch_hard = _compute_hard_timeout(batch_soft)
+        if batch_hard <= batch_soft:
+            batch_hard = batch_soft + 60.0  # enforce at least a 60s grace
         try:
             colony.watch_batch_timeouts(
                 worker_ids,
-                soft_timeout=soft_timeout,
-                hard_timeout=hard_timeout_effective,
+                soft_timeout=batch_soft,
+                hard_timeout=batch_hard,
             )
         except Exception as exc:
             logger.warning(
-                "run_parallel_workers: failed to schedule timeout watcher (non-fatal): %s",
+                "run_worker: failed to schedule timeout watcher (non-fatal): %s",
                 exc,
             )
+        soft_timeout = batch_soft
+        hard_timeout_effective = batch_hard
+
+        # Per-worker breadcrumbs the queen needs at spawn time to
+        # correlate later reports: worker_id, the task slice each was
+        # given (preview), the initial state (running vs queued), and
+        # the on-disk transcript path she can read if (and only if) the
+        # user asks for live progress on a specific worker.
+        workers_breadcrumbs: list[dict[str, Any]] = []
+        running_now = 0
+        queued = 0
+        for i, wid in enumerate(worker_ids):
+            spec = normalised[i] if i < len(normalised) else {}
+            task_text = str(spec.get("task", ""))
+            preview = task_text.strip().replace("\n", " ")
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+            output_file = ""
+            initial_status = "running"
+            try:
+                w = colony._workers.get(wid) if hasattr(colony, "_workers") else None
+                if w is not None:
+                    output_file = getattr(w, "output_file", "") or ""
+                    if getattr(w, "is_queued", False):
+                        initial_status = "queued"
+                        queued += 1
+                    else:
+                        running_now += 1
+            except Exception:
+                running_now += 1
+            workers_breadcrumbs.append(
+                {
+                    "worker_id": wid,
+                    "task_index": i + 1,
+                    "task_preview": preview,
+                    "output_file": output_file,
+                    "initial_status": initial_status,
+                }
+            )
+
+        # Read the colony's effective concurrency cap so the message
+        # text can reflect what the queen is actually working with.
+        try:
+            _max_concurrent = int(colony._config.max_concurrent_workers)
+        except Exception:
+            _max_concurrent = 0
 
         return json.dumps(
             {
                 "status": "started",
+                "batch_id": batch_id,
                 "worker_count": len(worker_ids),
                 "worker_ids": worker_ids,
+                "workers": workers_breadcrumbs,
+                "running_now": running_now,
+                "queued": queued,
+                "max_concurrent_workers": _max_concurrent,
                 "soft_timeout_seconds": soft_timeout,
                 "hard_timeout_seconds": hard_timeout_effective,
                 "message": (
-                    "Workers running in the background. Each will report via "
-                    "[WORKER_REPORT] as it finishes. Reply to the user naturally "
-                    "in the meantime; you do not need to poll."
+                    f"Dispatched {len(worker_ids)} workers — {running_now} "
+                    f"running now, {queued} queued (colony cap: "
+                    f"{_max_concurrent}). Each emits one structured "
+                    "[WORKER_REPORT] user turn when it terminates, "
+                    "including queued workers; reports carry "
+                    "<batch_remaining>N</batch_remaining> covering BOTH "
+                    "still-running AND still-queued peers in this batch. "
+                    "Validate the tracker only AFTER you see "
+                    "<batch_remaining>0</batch_remaining> in a report — "
+                    "until then more results are still coming. Three rules:\n"
+                    "  1. Don't poll: do NOT call get_worker_status just "
+                    "to fill silence. Wait for [WORKER_REPORT].\n"
+                    "  2. Don't fabricate: never predict, summarise, or "
+                    "guess worker results before the report arrives. If "
+                    "the user asks before reports land, say workers are "
+                    "still running — give status, not a guess.\n"
+                    "  3. Don't peek: only inspect a worker's output_file "
+                    "when the user explicitly asks for live progress on "
+                    "a specific worker; you can check the tracker "
+                    "for overall progress"
                 ),
             }
         )
 
     _run_parallel_tool = Tool(
-        name="run_parallel_workers",
+        name="run_worker",
         description=(
+            "Lower-level fan-out — PREFER run_playbook for row-shaped work. "
+            "For N units of the same job over a tracker table, run_playbook "
+            "converges the table deterministically (one worker per undone unit "
+            "— usually a CHUNK of 5-10 rows — with retry / dead-letter / "
+            "resume) instead of making you re-coordinate each report. Reach "
+            "for run_worker only for one-off heterogeneous tasks that don't "
+            "fit a table, or when each report genuinely needs your judgment.\n\n"
+            "BATCH SIMILAR UNITS — 5-10 PER WORKER. Every worker pays a fixed "
+            "orientation tax before its first useful action: fresh context, "
+            "system prompt, skill reads — roughly 2-3k tokens. One-small-unit-"
+            "per-worker multiplies that tax by N for nothing (measured live: "
+            "a 68-worker one-lead-each batch spent ~200-300k tokens on "
+            "orientation alone). Give each worker a slice of 5-10 similar "
+            "units and a timeout that covers the whole slice; reserve "
+            "one-unit workers for units that are individually large. Tell "
+            "the worker to process its slice as consecutive tool calls, "
+            "recording each unit as it goes — it does not need a turn per "
+            "unit, so the default turn budget fits a slice.\n\n"
             "Fan out a batch of tasks to parallel workers and RETURN "
             "IMMEDIATELY. Workers run in the background; each one reports "
             "back to you as a [WORKER_REPORT] user turn when it finishes, "
             "so you stay unblocked and can chat with the user, kick off "
             "more work, or do anything else in the meantime.\n\n"
-            "CRITICAL: each worker is a FRESH process with NO memory of "
-            "your conversation. Every task string must be FULLY "
-            "self-contained — include the API endpoint, the exact "
-            "parameters, the expected output format, and any "
-            "constraints. Workers cannot ask the user follow-up "
-            "questions and cannot see your chat history. Write each "
-            "task as if handing it to a stranger.\n\n"
+            "FACTOR SHARED CONTEXT INTO A SKILL FIRST. Each worker is a "
+            "fresh process with no memory of your conversation, but that "
+            "does NOT mean you should duplicate the same protocol prose "
+            "across N task strings. If 90% of every task string is the "
+            "same — schema, output format, quality bar, tools to use — "
+            "stop and call ``write_skill`` once with that common ground. "
+            "Workers spawned afterwards see the new skill in their "
+            "``<available_skills>`` catalog and activate it on demand. "
+            "Reference the skill BY NAME in the task string (e.g. 'Follow "
+            "the <skill-name> protocol to extract rows X, Y, Z') so each "
+            "worker reads it once and the task strings only carry the "
+            "per-worker DIFFERENCES (which 5 companies, which row IDs, "
+            "which date range). Don't spend N× tokens saying the "
+            "same thing.\n\n"
+            "Per-task strings still need to be self-contained for the "
+            "*differences*: include row keys, IDs, URLs, anything unique "
+            "to that worker's slice. Workers cannot ask the user follow-up "
+            "questions and cannot see your chat history.\n\n"
+            "NON-OVERLAPPING SLICES. Workers run concurrently, cannot "
+            "coordinate, and cannot see each other. Two tasks that touch "
+            "the same tracker rows, files, or records will double-write "
+            "or collide. Partition the work cleanly — each row/file/record "
+            "should be owned by exactly one worker.\n\n"
+            "Browser tasks: each worker gets its OWN Chrome tab group, "
+            "isolated from the queen's tabs and from every other worker, "
+            "but within the SAME Chrome profile — so workers share "
+            "cookies and logged-in sessions with the queen (a site the "
+            "queen is logged into is also authenticated for workers). "
+            "Each browser worker should start "
+            " with `hive-browser open`/`hive-browser navigate`; auth carries over "
+            "from the shared profile. Live per-worker tab activity is "
+            "visible to the queen via get_worker_status "
+            "(focus='full' → 'worker_browsers').\n\n"
             "Each worker runs in isolation with its own AgentLoop and "
             "reports back via the report_to_parent tool. The tool "
             "returns a JSON object with status='started' and the list "
@@ -1460,10 +1917,14 @@ def register_queen_lifecycle_tools(
             "TIMEOUT — 'timeout' is a SOFT deadline (default 600s). "
             "When it expires, every still-active worker that hasn't "
             "reported gets a [SOFT TIMEOUT] message telling it to "
-            "call report_to_parent now. It has until 'hard_timeout' "
-            "(default derived from timeout, capped at 3600s) to "
-            "wrap up before being force-stopped. Explicit reports "
-            "filed during the warning window ARE preserved."
+            "call report_to_parent now. The hard cutoff (when "
+            "stragglers are force-stopped) is derived from 'timeout' "
+            "automatically and is not agent-tunable. Explicit reports "
+            "filed during the warning window ARE preserved.\n\n"
+            "HETEROGENEOUS BATCHES — if some workers need different "
+            "iteration / timeout budgets than others, run two batches "
+            "rather than mixing. The interface intentionally exposes "
+            "only batch-level knobs."
         ),
         parameters={
             "type": "object",
@@ -1474,7 +1935,9 @@ def register_queen_lifecycle_tools(
                         "List of task specs to fan out. Each spec is "
                         '{"task": "<description>", "data": {<optional structured input>}}. '
                         "The 'task' string becomes the worker's initial "
-                        "user message. 'data' is merged into the worker's "
+                        "user message — keep it tight and per-worker UNIQUE "
+                        "(don't duplicate the shared protocol). "
+                        "'data' is merged into the worker's "
                         "AgentContext.input_data so structured fields are "
                         "available to the worker's first turn."
                     ),
@@ -1489,10 +1952,47 @@ def register_queen_lifecycle_tools(
                                 "type": "object",
                                 "description": "Optional structured input fields.",
                             },
+                            "goal": {
+                                "type": "string",
+                                "description": (
+                                    "One sentence, in plain end-user language, "
+                                    "describing what this worker is doing (e.g. "
+                                    "'Checking 20 Instagram profiles to see who "
+                                    "accepts DMs'). Shown in the UI as the "
+                                    "worker's title — ALWAYS provide it; a "
+                                    "non-technical user should understand it. "
+                                    "Not shown to the worker."
+                                ),
+                            },
+                            "preload_tools": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Exact tool names to pre-load into this "
+                                    "worker's eager toolset at spawn (skips its "
+                                    "search_tools round-trip). Use when you KNOW "
+                                    "the task needs tools that are searchable "
+                                    "for workers (e.g. sender or hubspot tools). "
+                                    "Unknown names are ignored."
+                                ),
+                            },
                         },
                         "required": ["task"],
                     },
                     "minItems": 1,
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": (
+                        "Cap on each worker's AgentLoop iterations of useful "
+                        "work. After this is exhausted the framework grants "
+                        "an additional grace iteration (configured separately) "
+                        "where dispatch is restricted to report_to_parent / "
+                        "tracker_upsert / task_update so the worker can wrap "
+                        "up. Worker default: 3 (work) + 1 (grace) = 4 total."
+                    ),
                 },
                 "timeout": {
                     "type": "number",
@@ -1502,216 +2002,232 @@ def register_queen_lifecycle_tools(
                         "Default 600 (10 minutes)."
                     ),
                 },
-                "hard_timeout": {
-                    "type": "number",
+                "tool_call_lifetime_budget": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2000,
                     "description": (
-                        "Absolute cutoff in seconds. Workers still active "
-                        "at this point are force-stopped. Defaults to "
-                        "max(timeout × 4, timeout + 600), capped at 3600s."
+                        "Cap on each worker's CUMULATIVE tool calls across ALL its "
+                        "turns (distinct from max_iterations, which counts turns, and "
+                        "from the per-turn pacing budget). When a worker reaches this "
+                        "total it is forced into the grace wind-down — a stop reminder "
+                        "is injected and dispatch is restricted to report_to_parent / "
+                        "tracker_upsert / task_update so it reports back instead of "
+                        "running unbounded. Worker default: 150. Lower it (e.g. 20) to "
+                        "keep tool-heavy workers on a tight leash; on resume it also "
+                        "RAISES the ceiling for a worker that already exhausted its "
+                        "budget (the count persists across resumes). OMIT this to let "
+                        "the colony's adaptive budget manage the fan-out: successful "
+                        "workers' consumption sets the colony norm and outlier workers "
+                        "are wound down early. Passing an explicit value PINS those "
+                        "workers to it — they are neither clamped by nor counted "
+                        "toward the adaptive norm."
+                    ),
+                },
+                "resume_worker_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "RESUME mode (mutually exclusive with 'tasks'). worker_ids "
+                        "of workers that stopped before reporting (e.g. timed-out or "
+                        "force-stopped) — you have these from the original run_worker "
+                        "return and the stopped/timeout [WORKER_REPORT]s. Each is "
+                        "reloaded from its saved conversation and continues from where "
+                        "it left off, then reports via report_to_parent. Pass "
+                        "'max_iterations' to give a worker that stopped near its limit "
+                        "room to finish, and 'guidance' to steer it before it resumes."
+                    ),
+                    "minItems": 1,
+                },
+                "guidance": {
+                    "type": "string",
+                    "description": (
+                        "RESUME mode only: a single steering instruction injected as a "
+                        "user turn into every resumed worker before it continues (e.g. "
+                        "'you got stuck on the login step — try the API instead'). "
+                        "Ignored when spawning fresh workers via 'tasks'."
                     ),
                 },
             },
-            "required": ["tasks"],
         },
     )
     registry.register(
-        "run_parallel_workers",
+        "run_worker",
         _run_parallel_tool,
-        lambda inputs: run_parallel_workers(**inputs),
+        lambda inputs: run_worker(**inputs),
     )
     tools_registered += 1
 
-    # --- create_colony ---------------------------------------------------------
+    # --- write_skill ----------------------------------------------------------
     #
-    # Forks the current queen session into a colony. The queen passes
-    # the skill content INLINE as tool arguments (skill_name,
-    # skill_description, skill_body, and optional skill_files for
-    # supporting scripts/references). The tool materializes the skill
-    # folder under ``~/.hive/colonies/{colony_name}/skills/{name}/``
-    # itself — colony-scoped (surfaced as ``colony_ui`` to that
-    # colony's workers, invisible to every other colony on the
-    # machine) — then forks.
-    #
-    # Why inline instead of a pre-authored folder path: earlier versions
-    # required the queen to write SKILL.md with her own write_file tool
-    # before calling create_colony. That leaked the harness's
-    # read-before-write invariant onto a queen-owned artifact — if a
-    # skill of the same name already existed the queen hit a generic
-    # "refusing to overwrite" error and didn't know how to recover. By
-    # inlining the content we make colony creation a single atomic
-    # operation with domain-level semantics: the queen owns her skill
-    # namespace inside the colony, so calling create_colony with an
-    # existing name simply replaces the old skill (her latest content
-    # wins).
-    #
-    # Why colony-scoped instead of user-scoped: an earlier version
-    # materialized the folder at ``~/.hive/skills/{name}/``. That made
-    # every colony on the machine see every colony-specific skill via
-    # user-scope discovery — a worker in colony A could be offered
-    # colony B's hyper-specific skill during selection. Writing into
-    # the colony's own project dir kills that leak while still keeping
-    # re-runs idempotent.
+    # Author colony-scoped skills so later workers can share protocol without
+    # repeating it in every task string.
 
-    import re as _re
-
-    _COLONY_NAME_RE = _re.compile(r"^[a-z0-9_]+$")
-
-    def _validate_triggers(raw: Any) -> tuple[list[dict] | None, str | None]:
-        """Validate and normalize the ``triggers`` argument for create_colony.
-
-        Mirrors the per-type validation that ``set_trigger`` applied when it
-        buffered drafts during incubation. Returns (normalized_list, error).
-        On success error is None. Empty / missing input yields ([], None).
-        """
-        if raw is None:
-            return [], None
-        if not isinstance(raw, list):
-            return None, "triggers must be an array"
-        normalized: list[dict] = []
-        seen_ids: set[str] = set()
-        for idx, entry in enumerate(raw):
-            if not isinstance(entry, dict):
-                return None, f"triggers[{idx}] must be an object"
-            tid = (entry.get("id") or "").strip() if isinstance(entry.get("id"), str) else ""
-            if not tid:
-                return None, f"triggers[{idx}] missing non-empty 'id'"
-            if tid in seen_ids:
-                return None, f"triggers[{idx}] duplicate id '{tid}'"
-            seen_ids.add(tid)
-            t_type = entry.get("trigger_type")
-            if t_type not in ("timer", "webhook"):
-                return None, f"triggers[{idx}] trigger_type must be 'timer' or 'webhook' (got {t_type!r})"
-            t_config = entry.get("trigger_config") or {}
-            if not isinstance(t_config, dict):
-                return None, f"triggers[{idx}] trigger_config must be an object"
-            task_str = entry.get("task")
-            if not isinstance(task_str, str) or not task_str.strip():
-                return None, (
-                    f"triggers[{idx}] ('{tid}') needs a non-empty 'task' "
-                    "— what the worker should do when this trigger fires"
-                )
-            if t_type == "timer":
-                cron_expr = t_config.get("cron")
-                interval = t_config.get("interval_minutes")
-                if cron_expr:
-                    try:
-                        from croniter import croniter
-
-                        if not croniter.is_valid(cron_expr):
-                            return None, f"triggers[{idx}] ('{tid}') invalid cron expression: {cron_expr}"
-                    except ImportError:
-                        return None, (
-                            f"triggers[{idx}] ('{tid}') croniter package not installed — "
-                            "cannot validate cron expression."
-                        )
-                elif interval is not None:
-                    if not isinstance(interval, (int, float)) or interval <= 0:
-                        return None, f"triggers[{idx}] ('{tid}') interval_minutes must be > 0, got {interval}"
-                else:
-                    return None, (
-                        f"triggers[{idx}] ('{tid}') timer trigger needs 'cron' or 'interval_minutes' in trigger_config."
-                    )
-            else:  # webhook
-                path = (t_config.get("path") or "").strip() if isinstance(t_config.get("path"), str) else ""
-                if not path or not path.startswith("/"):
-                    return None, (
-                        f"triggers[{idx}] ('{tid}') webhook trigger requires 'path' "
-                        "starting with '/' in trigger_config (e.g. '/hooks/github')."
-                    )
-            normalized.append(
-                {
-                    "id": tid,
-                    "trigger_type": t_type,
-                    "trigger_config": t_config,
-                    "task": task_str.strip(),
-                    "name": (
-                        entry.get("name") if isinstance(entry.get("name"), str) and entry.get("name").strip() else tid
-                    ),
-                }
-            )
-        return normalized, None
-
-    async def create_colony(
+    async def write_skill_tool(
         *,
-        colony_name: str,
-        task: str,
-        skill_name: str,
-        skill_description: str,
-        skill_body: str,
+        skill_name: str | None = None,
+        skill_description: str | None = None,
+        skill_body: str | None = None,
         skill_files: list[dict] | None = None,
-        tasks: list[dict] | None = None,
-        concurrency_hint: int | None = None,
-        triggers: list[dict] | None = None,
-        worker_profiles: list[dict] | None = None,
+        source_path: str | None = None,
     ) -> str:
-        """Create a colony and materialize its skill folder in one atomic call.
+        """Write or replace a colony-scoped skill.
 
-        The queen passes skill content inline: ``skill_name``,
-        ``skill_description``, ``skill_body``, and optional
-        ``skill_files`` (supporting scripts/references). The tool
-        writes ``~/.hive/colonies/{colony_name}/skills/{skill_name}/``
-        (colony-scoped, only this colony's workers see it), then forks
-        the queen session into that colony directory and stores the
-        task in ``worker.json``. NOTHING RUNS after fork.
+        Two modes:
 
-        If a skill of the same name already exists inside this colony,
-        it is overwritten — the queen owns her skill namespace inside
-        the colony, and calling create_colony with an existing name
-        means "my latest content wins."
+        - **Inline** (default): pass ``skill_name`` + ``skill_description``
+          + ``skill_body``, with optional ``skill_files``. The skill is
+          materialized from those arguments.
+        - **Copy from source**: pass ``source_path`` pointing at an
+          existing skill's root directory (the one that contains
+          ``SKILL.md``). The tool reads ``SKILL.md`` + every other file
+          in that directory and writes them all into the colony scope.
+          ``skill_name`` may be supplied to rename the skill on copy;
+          the other inline params are rejected in this mode to keep
+          the contract unambiguous (use inline mode if you want to
+          edit content).
 
-        When *tasks* is provided, each entry is seeded into the
-        colony's ``progress.db`` task queue in a single transaction.
-        Workers then claim rows from the queue using the
-        ``hive.colony-progress-tracker`` default skill. Each task dict
-        accepts: ``goal`` (required), optional ``steps``,
-        ``sop_items``, ``priority``, ``payload``, ``parent_task_id``.
+        Either way the skill lands at
+        ``~/.hive/colonies/{colony_id}/skills/{skill_name}/`` and is
+        immediately visible in the ``<available_skills>`` catalog of
+        subsequently-spawned workers, who can activate it on demand.
+        Replaces an existing skill of the same name in place — the
+        queen owns her colony-scoped skill namespace.
         """
         if session is None:
             return json.dumps({"error": "No session bound to this tool registry."})
 
-        cn = (colony_name or "").strip()
-        if not _COLONY_NAME_RE.match(cn):
-            return json.dumps(
-                {"error": ("colony_name must be lowercase alphanumeric with underscores (e.g. 'honeycomb_research').")}
-            )
-
-        # Validate triggers up front so a bad cron / webhook path fails fast,
-        # before we materialize the skill folder or fork the session.
-        validated_triggers, trig_err = _validate_triggers(triggers)
-        if trig_err is not None:
+        # Resolve colony_id from session (preferred) or live runtime.
+        colony_id_resolved = getattr(session, "colony_id", None) or getattr(_get_unified_colony() or _get_runtime(), "colony_id", None)
+        if not colony_id_resolved:
             return json.dumps(
                 {
-                    "error": trig_err,
-                    "hint": (
-                        "Each trigger needs id, trigger_type ('timer' or "
-                        "'webhook'), trigger_config, and task. Timer: "
-                        "{cron: '...'} or {interval_minutes: N}. Webhook: "
-                        "{path: '/hooks/...'}."
-                    ),
+                    "error": (
+                        "write_skill: no colony bound to this session. "
+                        "This tool only works once the colony has been "
+                        "forked (via the Create Colony popup) and you're "
+                        "operating inside it."
+                    )
                 }
             )
 
-        # Pre-create the colony dir so the skill can be materialized
-        # INSIDE it (project scope, colony-local). fork_session_into_colony
-        # keys "is_new" off worker.json rather than the dir itself, so
-        # pre-creating here does not wrongly flag fresh colonies as "old".
         from framework.config import COLONIES_DIR
+        from framework.skills.parser import parse_skill_md
+        from framework.skills.skill_writer import build_draft, write_skill
 
-        colony_dir = COLONIES_DIR / cn
+        # ---- Mode selection: source_path vs. inline -----------------
+        # In copy mode we read the SKILL.md + auxiliary files off disk
+        # and short-circuit the inline-required fields. Aux files are
+        # walked recursively; binaries (anything that can't be decoded
+        # as UTF-8) trigger an explicit error rather than silent loss.
+        if source_path is not None:
+            if any(v is not None for v in (skill_description, skill_body, skill_files)):
+                return json.dumps(
+                    {
+                        "error": (
+                            "write_skill: source_path mode does not accept "
+                            "skill_description / skill_body / skill_files. "
+                            "Pass only source_path (and optionally skill_name "
+                            "to rename). Use inline mode if you need to edit "
+                            "content."
+                        )
+                    }
+                )
+
+            from pathlib import Path as _Path
+
+            src = _Path(source_path).expanduser()
+            if not src.exists():
+                return json.dumps({"error": f"source_path '{source_path}' does not exist"})
+            # Accept either the skill root dir or its SKILL.md directly.
+            if src.is_file() and src.name == "SKILL.md":
+                src = src.parent
+            if not src.is_dir():
+                return json.dumps({"error": (f"source_path '{source_path}' must be a skill root directory (containing SKILL.md)")})
+            skill_md = src / "SKILL.md"
+            if not skill_md.is_file():
+                return json.dumps({"error": f"source_path '{source_path}' has no SKILL.md"})
+
+            parsed = parse_skill_md(skill_md, source_scope="user")
+            if parsed is None:
+                return json.dumps(
+                    {
+                        "error": (
+                            f"failed to parse SKILL.md at '{skill_md}' — check the frontmatter is valid YAML and has a non-empty 'description' field"
+                        )
+                    }
+                )
+
+            resolved_name = skill_name or parsed.name
+            resolved_description = parsed.description
+            resolved_body = parsed.body
+
+            # Walk auxiliary files. Skip SKILL.md (handled via body) and
+            # anything outside the source dir. Hidden files (e.g. .DS_Store)
+            # are skipped to avoid copying OS cruft.
+            sourced_files: list[dict] = []
+            binary_files: list[str] = []
+            try:
+                src_resolved = src.resolve()
+                skill_md_resolved = skill_md.resolve()
+                for f in sorted(src.rglob("*")):
+                    if not f.is_file():
+                        continue
+                    if f.resolve() == skill_md_resolved:
+                        continue
+                    # Refuse symlinks that escape the source dir.
+                    try:
+                        f.resolve().relative_to(src_resolved)
+                    except ValueError:
+                        continue
+                    rel = f.relative_to(src).as_posix()
+                    if any(part.startswith(".") for part in _Path(rel).parts):
+                        continue
+                    try:
+                        content = f.read_text(encoding="utf-8")
+                    except UnicodeDecodeError:
+                        binary_files.append(rel)
+                        continue
+                    except OSError as e:
+                        return json.dumps({"error": f"failed to read '{rel}' under source_path: {e}"})
+                    sourced_files.append({"path": rel, "content": content})
+            except OSError as e:
+                return json.dumps({"error": f"failed to walk source_path: {e}"})
+
+            if binary_files:
+                return json.dumps(
+                    {
+                        "error": (
+                            "write_skill: source skill contains non-UTF8 "
+                            "files which the skill writer can't carry: "
+                            f"{binary_files}. Remove or replace them in the "
+                            "source, or copy by hand."
+                        )
+                    }
+                )
+
+            skill_name = resolved_name
+            skill_description = resolved_description
+            skill_body = resolved_body
+            skill_files = sourced_files
+
+        else:
+            if not skill_name or not skill_description or not skill_body:
+                return json.dumps(
+                    {
+                        "error": (
+                            "write_skill: inline mode requires skill_name, "
+                            "skill_description, and skill_body. Or pass "
+                            "source_path to copy an existing skill folder."
+                        )
+                    }
+                )
+
+        colony_dir = COLONIES_DIR / colony_id_resolved
         try:
             colony_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            return json.dumps({"error": f"failed to create colony dir {colony_dir}: {e}"})
-
-        # Validate + write via the shared authoring module so the HTTP
-        # routes and this tool stay in lockstep.
-        from framework.skills.authoring import build_draft, write_skill
-        from framework.skills.overrides import (
-            OverrideEntry,
-            Provenance,
-            SkillOverrideStore,
-            utc_now,
-        )
+            return json.dumps({"error": f"failed to create colony dir: {e}"})
 
         draft, draft_err = build_draft(
             skill_name=skill_name,
@@ -1726,356 +2242,125 @@ def register_queen_lifecycle_tools(
                     "hint": (
                         "Provide skill_name (lowercase [a-z0-9-], ≤64 chars), "
                         "skill_description (single line, 1–1024 chars), and "
-                        "skill_body (the operational procedure the colony "
-                        "worker needs to run unattended: API endpoints, "
-                        "auth, gotchas, example requests, pre-baked "
-                        "queries). Use skill_files for optional "
-                        "scripts/references."
+                        "skill_body (the operational procedure: schema columns, "
+                        "tool conventions, output format, quality bar, gotchas). "
+                        "Use skill_files for optional scripts/references. Or "
+                        "pass source_path to copy an existing skill folder."
                     ),
                 }
             )
 
-        installed_skill, write_err, skill_replaced = write_skill(
+        installed, write_err, replaced = write_skill(
             draft,
             target_root=colony_dir / "skills",
             replace_existing=True,
         )
-        if write_err is not None or installed_skill is None:
-            return json.dumps(
-                {
-                    "error": write_err or "failed to write skill folder",
-                }
-            )
+        if write_err is not None or installed is None:
+            return json.dumps({"error": write_err or "failed to write skill folder"})
 
-        # Seed the colony's override ledger from the queen's current
-        # state so the colony inherits everything she had enabled (preset
-        # capability packs, toggled-off framework defaults, etc.) at fork
-        # time. The colony then owns its own copy — later queen edits
-        # don't retroactively alter this colony's skill surface.
-        # On top of the seed we upsert the newly-written skill with
-        # QUEEN_CREATED provenance so the UI renders + edits it properly.
-        try:
-            from framework.config import QUEENS_DIR
-
-            overrides_path = colony_dir / "skills_overrides.json"
-            queen_id = getattr(session, "queen_name", None) or "unknown"
-            colony_store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{cn}")
-
-            queen_overrides_path = QUEENS_DIR / queen_id / "skills_overrides.json"
-            if queen_overrides_path.exists():
-                queen_store = SkillOverrideStore.load(queen_overrides_path, scope_label=f"queen:{queen_id}")
-                # Shallow clone: queen's explicit toggles + master switch
-                # become the colony's starting state. Tombstones propagate
-                # so a queen-deleted UI skill doesn't resurrect here.
-                colony_store.all_defaults_disabled = queen_store.all_defaults_disabled
-                for sname, entry in queen_store.overrides.items():
-                    # Don't overwrite an entry the colony already set
-                    # (rare on fresh fork; matters if this is a re-fork).
-                    if sname in colony_store.overrides:
-                        continue
-                    colony_store.upsert(sname, entry.clone())
-                for sname in queen_store.deleted_ui_skills:
-                    colony_store.deleted_ui_skills.add(sname)
-
-            colony_store.upsert(
-                draft.name,
-                OverrideEntry(
-                    enabled=True,
-                    provenance=Provenance.QUEEN_CREATED,
-                    created_at=utc_now(),
-                    created_by=f"queen:{queen_id}",
-                ),
-            )
-            colony_store.save()
-        except Exception:
-            # Registration is best-effort; discovery still surfaces the
-            # skill as project-scope even if the ledger fails to update.
-            logger.warning("create_colony: override registration failed", exc_info=True)
-
-        logger.info(
-            "create_colony: materialized skill at %s (replaced=%s)",
-            installed_skill,
-            skill_replaced,
-        )
-
-        # Fork the queen session into the colony directory. The fork
-        # copies conversations + writes worker.json + metadata.json.
-        # NO worker runs after this call. The new colony's worker
-        # picks up its colony-scoped ``skills/`` directory (where we
-        # just wrote the skill) on first run via the ``colony_ui``
-        # extra scope, plus the usual user-scope ~/.hive/skills/.
-        try:
-            from framework.server.routes_execution import fork_session_into_colony
-        except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"fork_session_into_colony import failed: {e}",
-                    "skill_installed": str(installed_skill),
-                }
-            )
-
-        try:
-            fork_result = await fork_session_into_colony(
-                session=session,
-                colony_name=cn,
-                task=(task or "").strip(),
-                tasks=tasks if isinstance(tasks, list) else None,
-                concurrency_hint=(
-                    concurrency_hint if isinstance(concurrency_hint, int) and concurrency_hint > 0 else None
-                ),
-                worker_profiles=worker_profiles if isinstance(worker_profiles, list) else None,
-            )
-        except Exception as e:
-            logger.exception("create_colony: fork failed after installing skill")
-            return json.dumps(
-                {
-                    "error": f"colony fork failed: {e}",
-                    "skill_installed": str(installed_skill),
-                    "hint": (
-                        "The skill was installed but the fork failed. "
-                        "You can retry create_colony — re-installing "
-                        "the skill is idempotent."
-                    ),
-                }
-            )
-
-        # Emit COLONY_CREATED so the frontend can render a system
-        # message in the queen DM with a link to the new colony.
-        # Without this the queen's text response is the only signal
-        # the user gets, and there's no clickable navigation.
-        bus = getattr(session, "event_bus", None)
-        if bus is not None:
+        # Force a synchronous catalog reload so the next ``run_worker``
+        # in the same turn sees the new skill. The hot-reload watcher would
+        # eventually pick it up (1s debounce), but workers spawned in the same
+        # tick as ``write_skill`` race the watcher and end up with a stale
+        # ``<available_skills>`` snapshot. Reloading here also refreshes
+        # ``skill_dirs`` (the worker's Tier-3 read allowlist) so the new
+        # SKILL.md is readable as well as discoverable.
+        runtime = _get_runtime() or _get_unified_colony()
+        if runtime is not None and hasattr(runtime, "reload_skills"):
             try:
-                await bus.publish(
-                    AgentEvent(
-                        type=EventType.COLONY_CREATED,
-                        stream_id="queen",
-                        data={
-                            "colony_name": fork_result.get("colony_name", cn),
-                            "colony_path": fork_result.get("colony_path"),
-                            "queen_session_id": fork_result.get("queen_session_id"),
-                            "is_new": fork_result.get("is_new", True),
-                            "skill_installed": str(installed_skill),
-                            "skill_name": installed_skill.name if installed_skill else None,
-                            "skill_replaced": skill_replaced,
-                            "task": (task or "").strip(),
-                            # "in_progress" means the inherited
-                            # transcript is still being compacted in
-                            # the background; opening the colony will
-                            # block on that until it finishes. "skipped"
-                            # means no compaction was needed.
-                            "compaction_status": fork_result.get("compaction_status", "skipped"),
-                        },
-                    )
-                )
+                await runtime.reload_skills()
             except Exception:
-                logger.warning(
-                    "create_colony: failed to publish COLONY_CREATED event",
-                    exc_info=True,
-                )
-
-        # Write triggers.json from the validated arg so the colony's
-        # timers/webhooks auto-start when session_manager loads the colony.
-        # Runs regardless of phase — if a colony is re-created with the
-        # same name the triggers list is the authoritative new schedule.
-        if validated_triggers:
-            triggers_path = colony_dir / "triggers.json"
-            try:
-                triggers_path.write_text(
-                    json.dumps(validated_triggers, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                logger.info(
-                    "create_colony: wrote %d trigger(s) to %s",
-                    len(validated_triggers),
-                    triggers_path,
-                )
-            except OSError:
-                logger.warning(
-                    "create_colony: failed to write triggers.json",
-                    exc_info=True,
-                )
-
-        # When the queen forked from INCUBATING phase, the chat is over by
-        # design: the colony spec is committed and there's nothing left to
-        # discuss in this DM.  Auto-lock the session immediately (same
-        # mechanism the user-click path uses) and switch the queen back to
-        # INDEPENDENT so her closing message renders normally.  The
-        # colony_spawned check on /chat will reject the user's NEXT message
-        # with the "compact and start a new session" UX.
-        phase_state = getattr(session, "phase_state", None)
-        if phase_state is not None and phase_state.phase == "incubating":
-            try:
-                from framework.server.routes_execution import (
-                    persist_colony_spawn_lock,
-                )
-
-                persist_colony_spawn_lock(session, fork_result.get("colony_name", cn))
-            except OSError:
-                logger.warning(
-                    "create_colony: failed to persist colony-spawned lock",
-                    exc_info=True,
-                )
-            except Exception:
-                logger.warning(
-                    "create_colony: persist_colony_spawn_lock raised",
-                    exc_info=True,
-                )
-            try:
-                await phase_state.switch_to_independent(source="tool")
-            except Exception:
-                logger.warning(
-                    "create_colony: failed to switch phase back to independent",
-                    exc_info=True,
+                logger.exception(
+                    "write_skill: catalog reload after write failed; workers spawned this turn may not see '%s' until the hot-reload watcher fires",
+                    draft.name,
                 )
 
         return json.dumps(
             {
-                "status": "created",
-                "colony_name": fork_result.get("colony_name", cn),
-                "colony_path": fork_result.get("colony_path"),
-                "queen_session_id": fork_result.get("queen_session_id"),
-                "is_new": fork_result.get("is_new", True),
-                "skill_installed": str(installed_skill),
-                "skill_name": installed_skill.name if installed_skill else None,
-                "skill_replaced": skill_replaced,
-                "db_path": fork_result.get("db_path"),
-                "tasks_seeded": len(fork_result.get("task_ids") or []),
-                # Transcript compaction runs in the background; opening
-                # the colony blocks on this marker until it finishes.
-                "compaction_status": fork_result.get("compaction_status", "skipped"),
+                "success": True,
+                "colony_id": colony_id_resolved,
+                "skill_name": draft.name,
+                "skill_path": str(installed),
+                "replaced": replaced,
+                "source_path": source_path,
+                "files_copied": len(skill_files or []),
+                "message": (
+                    f"Skill '{draft.name}' is ready. Workers spawned "
+                    f"after this call see it in their <available_skills> "
+                    f"catalog and can activate it on demand — reference "
+                    f"it BY NAME in the task string (e.g. 'follow the "
+                    f"{draft.name} protocol') instead of repeating the "
+                    f"protocol prose."
+                ),
             }
         )
 
-    _create_colony_tool = Tool(
-        name="create_colony",
+    _write_skill_tool = Tool(
+        name="write_skill",
         description=(
-            "Fork this session into a persistent colony for work "
-            "that needs to run HEADLESS, RECURRING, or IN PARALLEL "
-            "to the current chat. Typical triggers: 'run this every "
-            "morning / on a cron', 'keep monitoring X and alert me', "
-            "'fire this off in the background so I can keep working "
-            "here', 'spin up a dedicated agent for this job'. The "
-            "criterion is operational — the work needs to keep "
-            "running (or needs to survive this conversation ending). "
-            "Do NOT use this just because you learned something "
-            "reusable; if the user wants results right now in this "
-            "chat, use run_parallel_workers instead.\n\n"
-            "ATOMIC CALL: you pass the skill content INLINE as "
-            "arguments (skill_name, skill_description, skill_body, "
-            "optional skill_files). The tool writes the folder at "
-            "~/.hive/colonies/{colony_name}/skills/{skill_name}/ "
-            "— scoped to THIS colony only; no other "
-            "colony on the machine can see it. Do NOT write the folder "
-            "yourself with write_file; folders hand-authored at "
-            "~/.hive/skills/ are user-scoped and LEAK to every colony. "
-            "If a skill of the same name already exists under this "
-            "colony, it is replaced by your latest content (you own "
-            "your skill namespace inside the colony).\n\n"
-            "NOTHING RUNS AFTER FORK. This tool is file-system only: "
-            "it writes the skill folder, copies the queen session "
-            "into a new colony directory, and stores the task in "
-            "worker.json. No worker is started. The user navigates to "
-            "the new colony when they're ready (or wires up a "
-            "trigger); at that point the worker reads the task from "
-            "worker.json and the skill from "
-            "~/.hive/colonies/{colony_name}/skills/, and "
-            "starts informed instead of clueless.\n\n"
-            "WHY THE SKILL IS REQUIRED: a fresh worker running "
-            "unattended has zero memory of your chat with the user. "
-            "Whatever you figured out during this session — API auth "
-            "flow, pagination, data shapes, gotchas, rate limits — "
-            "must live in the skill, or the worker will repeat your "
-            "discovery work every run.\n\n"
-            "WHAT TO PUT IN THE SKILL BODY: the operational protocol "
-            "the colony worker needs to do this work on its own. "
-            "Include API endpoints with example requests, the exact "
-            "auth flow, response shapes you observed, gotchas you hit "
-            "(rate limits, pagination quirks, edge cases), "
-            "conventions you settled on, and pre-baked "
-            "queries/commands. Write it as if onboarding a new "
-            "engineer who has never seen this system. Realistic "
-            "target: 300–2000 chars of body. See your "
-            "writing-hive-skills default skill for the spec."
+            "Write or replace a colony-scoped skill. Use this BEFORE "
+            "fanning out parallel workers when the per-task protocol is "
+            "the same across all workers (schema, output format, tool "
+            "conventions, quality bar). Writing the protocol ONCE into a "
+            "skill — then pointing each worker at it BY NAME in the task "
+            "string — is dramatically cheaper than duplicating the same "
+            "prose across N task strings, and keeps the protocol "
+            "consistent. Workers see the skill in their "
+            "<available_skills> catalog and activate it on demand.\n\n"
+            "TWO MODES:\n"
+            "  - Inline: pass skill_name + skill_description + skill_body "
+            "(and optional skill_files). Authors a fresh skill from "
+            "arguments.\n"
+            "  - Copy: pass source_path pointing at an existing skill "
+            "root directory (the one containing SKILL.md). The tool "
+            "reads SKILL.md plus every other file in that directory and "
+            "writes them into the colony scope verbatim. Optionally pass "
+            "skill_name to rename on copy. The other inline params are "
+            "REJECTED in this mode — use inline mode if you need to "
+            "edit content.\n\n"
+            "Skill is colony-scoped: only THIS colony's workers see it. "
+            "Replacing an existing skill of the same name is fine — "
+            "your latest content wins. Workers spawned AFTER this call "
+            "pick it up; existing workers do not.\n\n"
+            "Skill body should read like a self-contained operating "
+            "procedure: what the worker is doing, the exact tools/schema "
+            "to use, the output format, what 'done' looks like. Skip "
+            "the per-worker specifics — those go in the task string."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "colony_name": {
-                    "type": "string",
-                    "description": (
-                        "Lowercase alphanumeric+underscore name for the new colony (e.g. 'honeycomb_research')."
-                    ),
-                },
-                "task": {
-                    "type": "string",
-                    "description": (
-                        "FULL self-contained task description, baked "
-                        "into worker.json for the colony's first run. "
-                        "Nothing executes when create_colony returns — "
-                        "the task is stored, not run. The user starts "
-                        "the worker later from the new colony page. At "
-                        "that point the worker has zero memory of your "
-                        "chat, so this task string must contain "
-                        "everything: every requirement, constraint, "
-                        "and detail. Write it as if handing the work "
-                        "to a stranger who has never seen the user's "
-                        "request."
-                    ),
-                },
                 "skill_name": {
                     "type": "string",
                     "description": (
-                        "Identifier for the skill folder. Lowercase "
-                        "[a-z0-9-], no leading/trailing/consecutive "
-                        "hyphens, ≤64 chars. Becomes the directory "
-                        "under ~/.hive/colonies/<colony_name>/.hive/"
-                        "skills/ and the frontmatter 'name' field. "
-                        "Example: 'honeycomb-api-protocol'. Reusing "
-                        "an existing name within this colony replaces "
-                        "that skill."
+                        "Lowercase, hyphen-separated, ≤64 chars (e.g. "
+                        "'competitor-research-protocol'). Required in "
+                        "inline mode; optional in source_path mode "
+                        "(renames the skill on copy — defaults to the "
+                        "source's frontmatter name)."
                     ),
                 },
                 "skill_description": {
                     "type": "string",
                     "description": (
-                        "One-line summary of when the skill applies, "
-                        "1–1024 chars, no newlines. Becomes the "
-                        "frontmatter 'description' field that drives "
-                        "skill discovery. Example: 'How to query the "
-                        "HoneyComb staging API for ticker, pool, and "
-                        "trade data. Covers auth, pagination, pool "
-                        "detail shape. Use when fetching market "
-                        "data.'"
+                        "One-line summary of what this skill teaches a "
+                        "worker. Surfaced in the worker's skill catalog. "
+                        "Required in inline mode; rejected in "
+                        "source_path mode (description comes from the "
+                        "source SKILL.md frontmatter)."
                     ),
                 },
                 "skill_body": {
                     "type": "string",
                     "description": (
                         "Markdown body of SKILL.md — the operational "
-                        "procedure the colony worker needs to run "
-                        "unattended. API endpoints with example "
-                        "requests, auth flow, response shapes, "
-                        "gotchas, pre-baked queries/commands. "
-                        "300–2000 chars is the realistic target. Do "
-                        "NOT include the '---' frontmatter markers; "
-                        "the tool wraps your body with frontmatter "
-                        "built from skill_name and skill_description."
+                        "procedure the worker needs to run unattended. "
+                        "Required in inline mode; rejected in "
+                        "source_path mode."
                     ),
                 },
                 "skill_files": {
                     "type": "array",
-                    "description": (
-                        "Optional supporting files for the skill "
-                        "folder (e.g. scripts/, references/, "
-                        "assets/). Each entry is {path, content}: "
-                        "'path' is a RELATIVE path inside the skill "
-                        "folder (no leading slash, no '..', not "
-                        "SKILL.md); 'content' is the file text. Use "
-                        "this when the worker needs a runnable "
-                        "script, a long reference document, or a "
-                        "fixture alongside SKILL.md."
-                    ),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -2084,162 +2369,35 @@ def register_queen_lifecycle_tools(
                         },
                         "required": ["path", "content"],
                     },
-                },
-                "tasks": {
-                    "type": "array",
                     "description": (
-                        "Optional pre-seeded task queue for the colony. "
-                        "When the colony is a fan-out of many similar "
-                        "units of work (e.g. 'process record #1234', "
-                        "'scrape profile X'), pass them here as an "
-                        "array and workers will claim rows atomically "
-                        "from the SQLite queue using the "
-                        "hive.colony-progress-tracker skill. Each task "
-                        "needs a 'goal' string; optionally include "
-                        "'steps' (ordered subtasks), 'sop_items' "
-                        "(required checklist gates), 'priority' "
-                        "(higher runs first), and 'payload' "
-                        "(task-specific parameters). Can be hundreds "
-                        "or thousands of entries — the bulk insert "
-                        "runs in a single transaction."
+                        "Optional supporting files (scripts, JSON refs, "
+                        "etc.). Each entry is {path, content} where "
+                        "path is relative to the skill root. Inline "
+                        "mode only; rejected in source_path mode (the "
+                        "tool walks the source dir and copies aux files "
+                        "automatically)."
                     ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "goal": {"type": "string"},
-                            "priority": {"type": "integer"},
-                            "payload": {},
-                            "steps": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": {"type": "string"},
-                                        "detail": {"type": "string"},
-                                    },
-                                    "required": ["title"],
-                                },
-                            },
-                            "sop_items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "key": {"type": "string"},
-                                        "description": {"type": "string"},
-                                        "required": {"type": "boolean"},
-                                    },
-                                    "required": ["key", "description"],
-                                },
-                            },
-                        },
-                        "required": ["goal"],
-                    },
                 },
-                "concurrency_hint": {
-                    "type": "integer",
+                "source_path": {
+                    "type": "string",
                     "description": (
-                        "Optional advisory cap: how many worker processes "
-                        "should typically run in parallel for this colony "
-                        "(e.g. 1 for a single-fire 'send digest' job, 5 "
-                        "for a fan-out that processes records). Baked "
-                        "into worker.json as ``concurrency_hint`` for the "
-                        "future colony queen to consult when planning "
-                        "fan-outs. Not enforced — the queue itself is "
-                        "atomic, this is just guidance. Omit if unsure."
+                        "Absolute or '~'-prefixed path to an existing "
+                        "skill's root directory (the one that contains "
+                        "SKILL.md). When set, the tool copies the entire "
+                        "skill folder — SKILL.md + every other UTF-8 "
+                        "file — into the colony scope. Use this to lift "
+                        "a framework default skill, user-scoped skill, "
+                        "or another colony's skill into THIS colony so "
+                        "the queen can pilot/customize it locally."
                     ),
-                    "minimum": 1,
-                },
-                "triggers": {
-                    "type": "array",
-                    "description": (
-                        "Optional schedule for the colony — written to "
-                        "{colony_dir}/triggers.json and auto-started on "
-                        "first colony load. Use this when the user wants "
-                        "the colony to fire on a cron, every N minutes, "
-                        "or on an incoming webhook; omit for colonies "
-                        "that run once when the user clicks start. Each "
-                        "entry: id (unique string), trigger_type "
-                        "('timer' or 'webhook'), trigger_config (timer: "
-                        "{cron: '0 9 * * *'} or {interval_minutes: N}; "
-                        "webhook: {path: '/hooks/...'}), task (what the "
-                        "worker should do when this trigger fires — "
-                        "required, separate from the colony-wide task "
-                        "because a trigger's task is one-shot per fire). "
-                        "Validated up front — a bad cron, missing task, "
-                        "or malformed webhook path fails the call before "
-                        "anything is written. Scheduling lives on the "
-                        "colony, not on the queen session."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "trigger_type": {
-                                "type": "string",
-                                "enum": ["timer", "webhook"],
-                            },
-                            "trigger_config": {"type": "object"},
-                            "task": {"type": "string"},
-                            "name": {"type": "string"},
-                        },
-                        "required": ["id", "trigger_type", "trigger_config", "task"],
-                    },
-                },
-                "worker_profiles": {
-                    "type": "array",
-                    "description": (
-                        "Optional roster of worker profiles. Use this "
-                        "when the colony needs to operate multiple "
-                        "authorized accounts of the same vendor (two "
-                        "Slack workspaces, two Gmail accounts) — each "
-                        "profile pins its own credential alias so workers "
-                        "spawned under that profile call Slack/Gmail/etc. "
-                        "as the right account by default. If omitted, the "
-                        "colony has a single implicit 'default' profile "
-                        "that uses each provider's primary account. Each "
-                        "entry: name (lowercase id, unique within the "
-                        "colony), integrations (provider id → account "
-                        "alias, e.g. {'slack': 'work'}), optional task "
-                        "(per-profile task override), optional skill_name "
-                        "(if the profile uses a different skill than the "
-                        "colony default), optional concurrency_hint, "
-                        "prompt_override, tool_filter."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "task": {"type": "string"},
-                            "skill_name": {"type": "string"},
-                            "integrations": {
-                                "type": "object",
-                                "additionalProperties": {"type": "string"},
-                            },
-                            "concurrency_hint": {"type": "integer", "minimum": 1},
-                            "prompt_override": {"type": "string"},
-                            "tool_filter": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["name"],
-                    },
                 },
             },
-            "required": [
-                "colony_name",
-                "task",
-                "skill_name",
-                "skill_description",
-                "skill_body",
-            ],
         },
     )
     registry.register(
-        "create_colony",
-        _create_colony_tool,
-        lambda inputs: create_colony(**inputs),
+        "write_skill",
+        _write_skill_tool,
+        lambda inputs: write_skill_tool(**inputs),
     )
     tools_registered += 1
 
@@ -2247,7 +2405,7 @@ def register_queen_lifecycle_tools(
 
     async def update_worker_profile(
         *,
-        colony_name: str,
+        colony_id: str,
         profile_name: str,
         integrations: dict[str, str] | None = None,
         task: str | None = None,
@@ -2255,6 +2413,7 @@ def register_queen_lifecycle_tools(
         concurrency_hint: int | None = None,
         prompt_override: str | None = None,
         tool_filter: list[str] | None = None,
+        browser_profile: str | None = None,
     ) -> str:
         """Insert or update a single worker profile on an existing colony.
 
@@ -2263,6 +2422,13 @@ def register_queen_lifecycle_tools(
         profile after the colony was already created. Existing siblings
         are preserved. Pass only the fields you want to change; ``None``
         means "don't touch", and an empty dict/list means "clear".
+
+        ``browser_profile`` binds this profile's browser tools to a specific
+        Chrome profile, named by the label that profile's Hive extension
+        advertises (see ``list_browser_profiles`` for the connected labels).
+        Empty string clears it back to the default browser. Workers on this
+        profile then drive that Chrome window's tabs — letting one colony run
+        several Chrome profiles / logged-in accounts at once.
         """
         from framework.host.worker_profiles import (
             WorkerProfile,
@@ -2271,9 +2437,9 @@ def register_queen_lifecycle_tools(
             validate_profile_name,
         )
 
-        cn = (colony_name or "").strip()
+        cn = (colony_id or "").strip()
         if not _COLONY_NAME_RE.match(cn):
-            return json.dumps({"error": "colony_name must be lowercase alphanumeric with underscores."})
+            return json.dumps({"error": "colony_id must be lowercase alphanumeric with underscores."})
         err = validate_profile_name(profile_name)
         if err is not None:
             return json.dumps({"error": err})
@@ -2287,6 +2453,7 @@ def register_queen_lifecycle_tools(
             concurrency_hint=existing.concurrency_hint if existing else None,
             prompt_override=existing.prompt_override if existing else None,
             tool_filter=list(existing.tool_filter) if (existing and existing.tool_filter) else None,
+            browser_profile=existing.browser_profile if existing else "",
         )
         if integrations is not None:
             merged.integrations = {str(k): str(v) for k, v in integrations.items() if str(k) and str(v)}
@@ -2295,13 +2462,13 @@ def register_queen_lifecycle_tools(
         if skill_name is not None:
             merged.skill_name = skill_name
         if concurrency_hint is not None:
-            merged.concurrency_hint = (
-                concurrency_hint if isinstance(concurrency_hint, int) and concurrency_hint > 0 else None
-            )
+            merged.concurrency_hint = concurrency_hint if isinstance(concurrency_hint, int) and concurrency_hint > 0 else None
         if prompt_override is not None:
             merged.prompt_override = prompt_override or None
         if tool_filter is not None:
             merged.tool_filter = list(tool_filter) if tool_filter else None
+        if browser_profile is not None:
+            merged.browser_profile = browser_profile.strip()
 
         try:
             saved = upsert_worker_profile(cn, merged)
@@ -2311,7 +2478,7 @@ def register_queen_lifecycle_tools(
         return json.dumps(
             {
                 "ok": True,
-                "colony_name": cn,
+                "colony_id": cn,
                 "profile_name": profile_name,
                 "worker_profiles": [p.to_dict() for p in saved],
             }
@@ -2322,14 +2489,16 @@ def register_queen_lifecycle_tools(
         description=(
             "Insert or update one worker profile on an existing colony. "
             "Use this to swap a profile's account alias (e.g. 'switch "
-            "slack-work to use alias work-2') or to add a profile after "
-            "create_colony. Existing siblings are preserved. Pass only "
-            "the fields you want to change."
+            "slack-work to use alias work-2'), bind it to a specific Chrome "
+            "profile via browser_profile (a connected label from "
+            "list_browser_profiles), or add a profile after the colony was "
+            "forked. Existing siblings are preserved. Pass only the fields you "
+            "want to change."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "colony_name": {"type": "string"},
+                "colony_id": {"type": "string"},
                 "profile_name": {"type": "string"},
                 "integrations": {
                     "type": "object",
@@ -2340,8 +2509,15 @@ def register_queen_lifecycle_tools(
                 "concurrency_hint": {"type": "integer", "minimum": 1},
                 "prompt_override": {"type": "string"},
                 "tool_filter": {"type": "array", "items": {"type": "string"}},
+                "browser_profile": {
+                    "type": "string",
+                    "description": (
+                        "Chrome profile label this profile's browser tools "
+                        "target (from list_browser_profiles). Empty clears it."
+                    ),
+                },
             },
-            "required": ["colony_name", "profile_name"],
+            "required": ["colony_id", "profile_name"],
         },
     )
     registry.register(
@@ -2351,497 +2527,97 @@ def register_queen_lifecycle_tools(
     )
     tools_registered += 1
 
-    # --- start_incubating_colony -------------------------------------------------
+    # --- list_browser_profiles ---------------------------------------------------
 
-    async def start_incubating_colony(
-        *,
-        colony_name: str,
-    ) -> str:
-        """Gate the queen behind a one-shot readiness evaluator.
+    async def list_browser_profiles() -> str:
+        """List the Chrome profiles whose Hive extension is connected.
 
-        Reads the queen's recent conversation off disk and asks
-        :func:`incubating_evaluator.evaluate` whether the spec is
-        settled enough to fork.  On approval, flips the queen's phase
-        to ``incubating`` so a focused tool surface (``create_colony``,
-        ``cancel_incubation``, read-only file tools) takes over.  On
-        rejection, returns the verdict for the queen to self-correct
-        on her next turn — the rejection is queen-only by design (no
-        SSE event, no user-facing message).
+        Each entry's ``label`` is exactly what you pass as ``browser_profile``
+        to ``update_worker_profile`` to bind a worker profile to that Chrome
+        window. Labels are set by the user in each profile's extension side
+        panel (auto-generated as a 3-word id until renamed). Discover real
+        labels here before binding — a label that isn't connected makes the
+        worker's browser tools fail fast rather than silently using another
+        account.
         """
-        if session is None:
-            return json.dumps({"error": "No session bound to this tool registry."})
+        import os
 
-        cn = (colony_name or "").strip()
-        if not _COLONY_NAME_RE.match(cn):
-            return json.dumps(
-                {"error": ("colony_name must be lowercase alphanumeric with underscores (e.g. 'morning_hn_digest').")}
-            )
-
-        phase_state = getattr(session, "phase_state", None)
-        if phase_state is None:
-            return json.dumps({"error": "phase_state is not initialised on this session."})
-
-        # Block re-entry from working/reviewing — those phases mean a colony
-        # is already running, the queen should NOT be drafting another spec
-        # on top.  Independent → incubating is the only legal entry path.
-        if phase_state.phase not in ("independent", "incubating"):
-            return json.dumps(
-                {
-                    "error": (
-                        f"start_incubating_colony is not available in phase "
-                        f"'{phase_state.phase}' — finish or stop the current "
-                        "colony's workers first."
-                    )
-                }
-            )
-
-        # Read the queen's conversation parts straight from disk.  Same
-        # pattern as handle_compact_and_fork — avoids needing access to
-        # the live NodeConversation, which is local to the agent loop.
-        from framework.agent_loop.conversation import Message
-        from framework.agents.queen import incubating_evaluator
-        from framework.storage.conversation_store import FileConversationStore
-
-        queen_dir = getattr(session, "queen_dir", None)
-        messages: list = []
-        if queen_dir is not None and (queen_dir / "conversations").exists():
+        # The bridge serves /profiles on its status port (WS port + 1); it also
+        # binds the legacy 9230 during the migration window. Try both.
+        bridge_port = int(os.environ.get("HIVE_BRIDGE_PORT", "14829"))
+        for status_port in (bridge_port + 1, 9230):
             try:
-                store = FileConversationStore(queen_dir / "conversations")
-                raw_parts = await store.read_parts()
-                for part in raw_parts:
-                    try:
-                        messages.append(Message.from_storage_dict(part))
-                    except (KeyError, TypeError):
-                        # Skip malformed parts; the evaluator can still work
-                        # off whatever messages it gets.
-                        continue
-            except Exception:
-                logger.warning(
-                    "start_incubating_colony: failed to read queen conversation",
-                    exc_info=True,
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", status_port), timeout=0.5
                 )
-
-        llm = getattr(session, "llm", None)
-        if llm is None:
-            return json.dumps(
+                writer.write(b"GET /profiles HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(65536), timeout=0.5)
+                writer.close()
+            except Exception:
+                continue
+            if b"\r\n\r\n" not in raw:
+                continue
+            try:
+                data = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+            except Exception:
+                continue
+            profiles = [
                 {
-                    "error": (
-                        "session has no LLM — cannot run readiness "
-                        "evaluator. Retry once the session has fully "
-                        "initialised."
-                    )
+                    "label": p.get("label"),
+                    "is_default": bool(p.get("is_default")),
+                    "starred": bool(p.get("starred")),
+                    "version": p.get("version"),
+                    "protocol_version": p.get("protocol_version"),
                 }
-            )
-
-        verdict = await incubating_evaluator.evaluate(
-            llm=llm,
-            messages=messages,
-            colony_name=cn,
-        )
-
-        if not verdict.get("ready"):
-            # Queen-only silent rejection — no SSE, no user message.
-            # The queen reads the reasons in her tool result and decides
-            # what to do next (ask the user, refine scope, drop the idea).
-            return json.dumps(
-                {
-                    "status": "not_ready",
-                    "colony_name": cn,
-                    "reasons": verdict.get("reasons", []),
-                    "missing_prerequisites": verdict.get("missing_prerequisites", []),
-                }
-            )
-
-        # Approved — flip phase.  switch_to_incubating publishes
-        # QUEEN_PHASE_CHANGED so the frontend badge updates and stores
-        # the colony_name for the role prompt to interpolate.
-        await phase_state.switch_to_incubating(
-            colony_name=cn,
-            source="tool",
-        )
-
+                for p in (data.get("profiles") or [])
+            ]
+            out: dict = {"ok": True, "profiles": profiles}
+            if not profiles:
+                out["hint"] = (
+                    "No Chrome profiles are connected. In each Chrome profile, install/enable the "
+                    "Hive Browser Bridge extension and set its label in the side panel, then retry."
+                )
+            return json.dumps(out)
         return json.dumps(
             {
-                "status": "incubating",
-                "colony_name": cn,
-                "guidance": _INCUBATING_APPROVAL_GUIDANCE.format(colony_name=cn),
+                "ok": False,
+                "error": "browser bridge not reachable",
+                "hint": "Is the Hive app running? The browser bridge serves /profiles on 127.0.0.1.",
+                "profiles": [],
             }
         )
 
-    _start_incubating_colony_tool = Tool(
-        name="start_incubating_colony",
+    _list_browser_profiles_tool = Tool(
+        name="list_browser_profiles",
         description=(
-            "Ask to fork this session into a persistent colony for "
-            "HEADLESS / RECURRING / BACKGROUND work that needs to "
-            "outlive this chat. This tool does NOT fork on its own — "
-            "it spawns a one-shot evaluator that reads the recent "
-            "conversation and decides whether the spec is settled "
-            "enough to proceed.\n\n"
-            "On APPROVAL, your phase flips to INCUBATING and a focused "
-            "tool surface unlocks (create_colony, cancel_incubation, "
-            "read-only file tools). The full coding toolkit goes away "
-            "on purpose so you can concentrate on writing a tight task "
-            "+ SKILL.md.\n\n"
-            "On REJECTION, you stay in INDEPENDENT and the verdict's "
-            "``missing_prerequisites`` lists what's still ambiguous in "
-            "queen-actionable form. Resolve those with the user (ask "
-            "in plain prose or via ask_user) and call this tool again "
-            "when the spec is settled. The rejection is queen-only — "
-            "the user does NOT see it, so frame your follow-up "
-            "naturally without referencing 'the evaluator'.\n\n"
-            "DO NOT call this for one-shot work that the user wants "
-            "results for right now in this chat — do that work yourself "
-            "with your independent toolkit instead."
+            "List the Chrome profiles whose Hive extension is currently connected, each with the "
+            "label to pass as browser_profile in update_worker_profile. Call this before binding "
+            "workers to browser profiles so you bind to real, connected labels."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "colony_name": {
-                    "type": "string",
-                    "description": (
-                        "Lowercase alphanumeric+underscore name for the "
-                        "proposed colony (e.g. 'morning_hn_digest', "
-                        "'inbox_monitor')."
-                    ),
-                },
-            },
-            "required": ["colony_name"],
-        },
+        parameters={"type": "object", "properties": {}},
     )
     registry.register(
-        "start_incubating_colony",
-        _start_incubating_colony_tool,
-        lambda inputs: start_incubating_colony(**inputs),
+        "list_browser_profiles",
+        _list_browser_profiles_tool,
+        lambda inputs: list_browser_profiles(**inputs),
     )
     tools_registered += 1
 
-    # --- cancel_incubation -------------------------------------------------------
+    # NOTE: session splitting is no longer a standalone tool. It is now the
+    # ``new_session`` arg on ``task_create`` (wired in queen_orchestrator
+    # via ``fork_queen_session_for_split``) — the queen forks a fresh
+    # session only when laying out a plan for big, unrelated work, and the
+    # new plan is seeded straight into that session.
 
-    async def cancel_incubation() -> str:
-        """Bail out of incubating mode and return to independent.
-
-        Use when the spec turns out to not be ready after all (user
-        changed their mind, the work is one-shot, more than a couple of
-        details still need to be worked out). Harmless no-op if not
-        currently in incubating.
-        """
-        if session is None:
-            return json.dumps({"error": "No session bound to this tool registry."})
-
-        phase_state = getattr(session, "phase_state", None)
-        if phase_state is None:
-            return json.dumps({"error": "phase_state is not initialised on this session."})
-
-        if phase_state.phase != "incubating":
-            return json.dumps(
-                {
-                    "status": "noop",
-                    "reason": f"phase is '{phase_state.phase}', not 'incubating'",
-                }
-            )
-
-        previous_colony = phase_state.incubating_colony_name
-        await phase_state.switch_to_independent(source="tool")
-        return json.dumps(
-            {
-                "status": "cancelled",
-                "previous_colony_name": previous_colony,
-            }
-        )
-
-    _cancel_incubation_tool = Tool(
-        name="cancel_incubation",
-        description=(
-            "Bail out of INCUBATING phase back to INDEPENDENT. Use "
-            "when the spec turns out to not be ready after all — the "
-            "user changed their mind, the work is actually one-shot, "
-            "or more than a couple of operational details still need "
-            "to be sorted out. No fork happens; the full coding "
-            "toolkit comes back. Harmless no-op outside INCUBATING."
-        ),
-        parameters={"type": "object", "properties": {}, "required": []},
-    )
-    registry.register(
-        "cancel_incubation",
-        _cancel_incubation_tool,
-        lambda inputs: cancel_incubation(**inputs),
-    )
-    tools_registered += 1
-
-    # --- enqueue_task ------------------------------------------------------------
-
-    async def enqueue_task_tool(
-        *,
-        colony_name: str,
-        goal: str,
-        steps: list[dict] | None = None,
-        sop_items: list[dict] | None = None,
-        payload: Any = None,
-        priority: int = 0,
-        parent_task_id: str | None = None,
-    ) -> str:
-        """Append a single task to an existing colony's progress.db queue.
-
-        Use this when the colony is already created and more work
-        needs to be fanned out (webhook-driven, follow-up requests,
-        worker-generated subtasks). The colony's workers pick it up
-        on their next claim cycle.
-        """
-        cn = (colony_name or "").strip()
-        if not _COLONY_NAME_RE.match(cn):
-            return json.dumps({"error": "colony_name must be lowercase alphanumeric with underscores"})
-
-        from framework.config import COLONIES_DIR as _COLONIES_DIR
-        from framework.host.progress_db import (
-            enqueue_task as _enqueue_task,
-            ensure_progress_db as _ensure_db,
-        )
-
-        colony_dir = _COLONIES_DIR / cn
-        if not colony_dir.is_dir():
-            return json.dumps({"error": f"colony '{cn}' not found"})
-
-        try:
-            db_path = await asyncio.to_thread(_ensure_db, colony_dir)
-            task_id = await asyncio.to_thread(
-                _enqueue_task,
-                db_path,
-                goal,
-                steps=steps,
-                sop_items=sop_items,
-                payload=payload,
-                priority=priority,
-                parent_task_id=parent_task_id,
-            )
-        except Exception as e:
-            logger.exception("enqueue_task: failed to insert row")
-            return json.dumps({"error": f"enqueue_task failed: {e}"})
-
-        return json.dumps(
-            {
-                "status": "enqueued",
-                "colony_name": cn,
-                "task_id": task_id,
-                "db_path": str(db_path),
-            }
-        )
-
-    _enqueue_task_tool = Tool(
-        name="enqueue_task",
-        description=(
-            "Append a single task to an existing colony's progress.db "
-            "queue. Use this after create_colony when more work needs "
-            "to be fanned out — e.g. a webhook fired, the user asked "
-            "for a follow-up run, or a worker spawned a subtask. The "
-            "colony's workers pick it up on their next claim cycle "
-            "(atomic UPDATE … WHERE status='pending'). For bulk "
-            "authoring at colony creation time, pass the 'tasks' "
-            "array to create_colony instead."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "colony_name": {
-                    "type": "string",
-                    "description": "Target colony name (lowercase + underscores).",
-                },
-                "goal": {
-                    "type": "string",
-                    "description": (
-                        "Human-readable task description. Self-contained — "
-                        "the worker has no context beyond this string plus "
-                        "any steps/sop_items/payload you attach."
-                    ),
-                },
-                "steps": {
-                    "type": "array",
-                    "description": (
-                        "Optional ordered subtasks the worker should "
-                        "check off as it executes. Each step needs a "
-                        "'title'; optional 'detail' for longer "
-                        "instructions."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "detail": {"type": "string"},
-                        },
-                        "required": ["title"],
-                    },
-                },
-                "sop_items": {
-                    "type": "array",
-                    "description": (
-                        "Optional hard-gate checklist items the worker "
-                        "MUST address before marking the task done. "
-                        "Each item needs a 'key' (slug) and "
-                        "'description'; 'required' defaults to true."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string"},
-                            "description": {"type": "string"},
-                            "required": {"type": "boolean"},
-                        },
-                        "required": ["key", "description"],
-                    },
-                },
-                "payload": {
-                    "description": ("Optional task-specific parameters. Stored as JSON in the 'payload' column."),
-                },
-                "priority": {
-                    "type": "integer",
-                    "description": "Higher values run first. Default 0.",
-                },
-                "parent_task_id": {
-                    "type": "string",
-                    "description": (
-                        "Optional reference to an existing task this "
-                        "one was spawned from (audit only; no blocking "
-                        "dependency resolver today)."
-                    ),
-                },
-            },
-            "required": ["colony_name", "goal"],
-        },
-    )
-    # NOTE: ``enqueue_task`` is intentionally NOT registered. The Tool object
-    # and helper above are kept for potential reuse by other code paths or
-    # a future per-persona registration gate; today no queen receives it.
-    _ = _enqueue_task_tool
-
-    # --- switch_to_reviewing ----------------------------------------------------
-
-    async def switch_to_reviewing_tool() -> str:
-        """Stop the worker and switch to editing phase for config tweaks.
-
-        The worker stays loaded. You can re-run with different input,
-        inject config adjustments, or escalate to building/planning.
-        """
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_reviewing()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "reviewing"})
-
-        if can_transition:
-            result["phase"] = "reviewing"
-            result["message"] = (
-                "Worker stopped. You are now in reviewing phase. "
-                "Review the latest results and decide whether to re-run, "
-                "edit the agent, or move into planning."
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. Phase will not change until shutdown completes."
-            )
-        return json.dumps(result)
-
-    _switch_editing_tool = Tool(
-        name="switch_to_reviewing",
-        description=(
-            "Stop the running worker and switch to editing phase. "
-            "The worker stays loaded — you can tweak config and re-run. "
-            "Use this when you want to adjust the worker without rebuilding."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    # NOTE: ``switch_to_reviewing`` is intentionally NOT registered as a tool
-    # for the queen. The phase transition is still callable on QueenPhaseState
-    # (and used by routes_execution + queen_orchestrator); the LLM-facing
-    # tool wrapper is dormant.
-    _ = _switch_editing_tool
-
-    # --- stop_worker_and_review --------------------------------------------------
-
-    async def stop_worker_and_review() -> str:
-        """Stop the loaded graph and switch to building phase for editing the agent."""
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        # Switch to building phase
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_building()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "building"})
-
-        if can_transition:
-            result["phase"] = "building"
-            result["message"] = (
-                "Graph stopped. You are now in building phase. "
-                "Use your coding tools to modify the agent, then call "
-                "load_built_agent(path) to stage it again."
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. Phase will not change until shutdown completes."
-            )
-        # Nudge the queen to start coding instead of blocking for user input.
-        if can_transition and phase_state is not None and phase_state.inject_notification:
-            await phase_state.inject_notification(
-                "[PHASE CHANGE] Switched to BUILDING phase. Start implementing the changes now."
-            )
-        return json.dumps(result)
-
-    _stop_edit_tool = Tool(
-        name="stop_worker_and_review",
-        description=(
-            "Stop the running graph and switch to building phase. "
-            "Use this when you need to modify the agent's code, nodes, or configuration. "
-            "After editing, call load_built_agent(path) to reload and run."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    # NOTE: ``stop_worker_and_review`` is intentionally NOT registered. The
-    # phase transition method ``phase_state.switch_to_building`` it would
-    # invoke is no longer defined since the planning/building pipeline was
-    # removed; the wrapper is left here as a stub for future reintroduction.
-    _ = _stop_edit_tool
-
-    # --- stop_worker (Running → Staging) --------------------------------------
-
-    async def stop_worker_to_staging() -> str:
-        """Stop the running graph and switch to staging phase.
-
-        After stopping, ask the user whether they want to:
-        1. Re-run the agent with new input → call run_agent_with_input(task)
-        2. Edit the agent code → call stop_worker_and_review() to go to building phase
-        """
-        stop_result = await stop_worker()
-        result, can_transition = _stop_result_allows_phase_transition(stop_result)
-
-        # Switch to staging phase
-        if phase_state is not None and can_transition:
-            await phase_state.switch_to_staging()
-            _update_meta_json(session_manager, manager_session_id, {"phase": "staging"})
-
-        if can_transition:
-            result["phase"] = "staging"
-            result["message"] = (
-                "Graph stopped. You are now in staging phase. "
-                "Ask the user: would they like to re-run with new input, "
-                "or edit the agent code?"
-            )
-        else:
-            result["message"] = (
-                "Stop requested, but the worker is still shutting down. "
-                "Stay in the current phase until shutdown completes."
-            )
-        return json.dumps(result)
-
-    _stop_worker_tool = Tool(
-        name="stop_worker",
-        description=(
-            "Stop the running graph and switch to staging phase. "
-            "After stopping, ask the user whether they want to re-run "
-            "with new input or edit the agent code."
-        ),
-        parameters={"type": "object", "properties": {}},
-    )
-    registry.register("stop_worker", _stop_worker_tool, lambda inputs: stop_worker_to_staging())
-    tools_registered += 1
+    # NOTE: removed dead phase-transition tool stubs that were never registered
+    # for the queen — ``switch_to_reviewing`` and ``stop_worker_and_review`` (the
+    # latter broken: it called ``phase_state.switch_to_building``, removed with
+    # the planning/building pipeline) — plus a duplicate ``stop_worker``
+    # (``stop_worker_to_staging``) that registered under the same name and
+    # silently OVERWROTE the colony ``stop_worker`` above, and their shared
+    # helper ``_stop_result_allows_phase_transition``. Live phase transitions
+    # remain on QueenPhaseState; git history preserves the wrappers if revived.
 
     # --- get_worker_status -----------------------------------------------------
 
@@ -2905,8 +2681,8 @@ def register_queen_lifecycle_tools(
         - _active_execs (internal, stripped before return)
         """
 
-        colony_id = runtime.colony_id
-        reg = runtime.get_worker_registration(colony_id)
+        stream_id = runtime.stream_id
+        reg = runtime.get_worker_registration(stream_id)
         if reg is None:
             return {"status": "not_loaded"}
 
@@ -2971,7 +2747,81 @@ def register_queen_lifecycle_tools(
                 count += 1
         return count
 
-    def _format_summary(preamble: dict[str, Any], red_flags: int) -> str:
+    # Status port the gcu bridge serves /status and /contexts on. Mirrors
+    # tools/src/gcu/browser/bridge.py: STATUS_PORT = BRIDGE_PORT + 1.
+    # Hard-coded rather than imported so core stays independent of the
+    # gcu package layout.
+    _GCU_STATUS_PORT = 9230
+
+    async def _build_worker_browsers(runtime: Any) -> dict[str, dict[str, Any]]:
+        """Authoritative per-worker browser snapshot from the gcu bridge.
+
+        Each parallel worker gets its own Chrome tab group — the
+        worker_id IS the browser profile (see
+        ``core/framework/host/worker.py``). The gcu bridge already
+        exposes a plain HTTP status server in the gcu subprocess; we
+        ask it for ``/contexts`` and intersect with the colony's active
+        workers so the queen sees one entry per live worker that owns a
+        tab group. Going over the bridge's own HTTP endpoint avoids
+        adding a new MCP tool (which would clutter every worker's tool
+        list) while still reading from the single source of truth.
+
+        Returns ``{worker_id: {groupId, activeTab, tabs}}``. Empty when
+        no worker has a browser session, when the bridge isn't running,
+        or when the fetch fails — all expected non-browser cases, so
+        the caller can use a falsy check without special-casing errors.
+        """
+        # Gather currently-active worker IDs so we filter out the queen's
+        # own profile and any stale tab groups for finished workers.
+        active_workers: set[str] = set()
+        try:
+            workers = getattr(runtime, "_workers", None) or {}
+            for wid, w in workers.items():
+                if getattr(w, "is_active", False):
+                    active_workers.add(wid)
+        except Exception:
+            return {}
+        if not active_workers:
+            return {}
+
+        # Cheap HTTP GET to the gcu bridge's status server. Tight timeout
+        # because /contexts may call into the extension to enumerate tabs
+        # per group, and a hung extension shouldn't stall the queen's
+        # status check. httpx is already a project dependency.
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=2.0) as http:
+                resp = await http.get(f"http://127.0.0.1:{_GCU_STATUS_PORT}/contexts")
+                if resp.status_code != 200:
+                    return {}
+                parsed = resp.json()
+        except Exception:
+            return {}
+
+        if not isinstance(parsed, dict):
+            return {}
+
+        contexts = parsed.get("contexts") or []
+        out: dict[str, dict[str, Any]] = {}
+        for ctx in contexts:
+            if not isinstance(ctx, dict):
+                continue
+            profile = ctx.get("profile")
+            if not isinstance(profile, str) or profile not in active_workers:
+                continue
+            out[profile] = {
+                "groupId": ctx.get("groupId"),
+                "activeTab": ctx.get("activeTab"),
+                "tabs": ctx.get("tabs") or [],
+            }
+        return out
+
+    def _format_summary(
+        preamble: dict[str, Any],
+        red_flags: int,
+        worker_browsers: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
         """Generate a 1-2 sentence prose summary from the preamble."""
         status = preamble["status"]
 
@@ -3012,6 +2862,12 @@ def register_queen_lifecycle_tools(
                 sa_msg = str(latest.data.get("message", ""))[:200]
                 ago = _format_time_ago(latest.timestamp)
                 parts.append(f"Latest subagent update ({ago}): {sa_msg}")
+
+        # Per-worker browser sessions: surface a one-line hint when any
+        # parallel worker has its own tab group. Empty for non-browser
+        # colonies, so it adds no noise to the summary.
+        if worker_browsers:
+            parts.append(f"{len(worker_browsers)} worker(s) on isolated browser tab groups (focus='full' for per-worker tabs)")
 
         return ". ".join(parts) + "."
 
@@ -3106,11 +2962,7 @@ def register_queen_lifecycle_tools(
         tool_started = bus.get_history(event_type=EventType.TOOL_CALL_STARTED, limit=last_n * 2)
         tool_completed = bus.get_history(event_type=EventType.TOOL_CALL_COMPLETED, limit=last_n * 2)
         completed_ids = {evt.data.get("tool_use_id") for evt in tool_completed if evt.data.get("tool_use_id")}
-        running = [
-            evt
-            for evt in tool_started
-            if evt.data.get("tool_use_id") and evt.data.get("tool_use_id") not in completed_ids
-        ]
+        running = [evt for evt in tool_started if evt.data.get("tool_use_id") and evt.data.get("tool_use_id") not in completed_ids]
 
         if running:
             names = [evt.data.get("tool_name", "?") for evt in running]
@@ -3235,9 +3087,7 @@ def register_queen_lifecycle_tools(
             total_out = sum(evt.data.get("output_tokens", 0) or 0 for evt in llm_events)
             total_tok = total_in + total_out
             lines.append("")
-            lines.append(
-                f"Tokens: {len(llm_events)} LLM turns, {total_tok:,} total ({total_in:,} in + {total_out:,} out)."
-            )
+            lines.append(f"Tokens: {len(llm_events)} LLM turns, {total_tok:,} total ({total_in:,} in + {total_out:,} out).")
 
         # Execution outcomes
         exec_completed = bus.get_history(event_type=EventType.EXECUTION_COMPLETED, limit=5)
@@ -3245,9 +3095,7 @@ def register_queen_lifecycle_tools(
         completed_n = len(exec_completed)
         failed_n = len(exec_failed)
         active_n = len(runtime.get_active_streams())
-        lines.append(
-            f"Executions: {completed_n} completed, {failed_n} failed" + (f" ({active_n} active)." if active_n else ".")
-        )
+        lines.append(f"Executions: {completed_n} completed, {failed_n} failed" + (f" ({active_n} active)." if active_n else "."))
         if exec_failed:
             for evt in exec_failed[:3]:
                 error = evt.data.get("error", "")[:150]
@@ -3264,11 +3112,11 @@ def register_queen_lifecycle_tools(
     ) -> dict[str, Any]:
         """Build the legacy full JSON response (backward compat for focus='full')."""
 
-        colony_id = runtime.colony_id
+        stream_id = runtime.stream_id
         goal = runtime.goal
         result: dict[str, Any] = {
-            "worker_colony_id": colony_id,
-            "worker_goal": getattr(goal, "name", colony_id),
+            "worker_colony_id": stream_id,
+            "worker_goal": getattr(goal, "name", stream_id),
             "status": preamble["status"],
         }
 
@@ -3289,11 +3137,7 @@ def register_queen_lifecycle_tools(
         tool_started = bus.get_history(event_type=EventType.TOOL_CALL_STARTED, limit=last_n * 2)
         tool_completed = bus.get_history(event_type=EventType.TOOL_CALL_COMPLETED, limit=last_n * 2)
         completed_ids = {evt.data.get("tool_use_id") for evt in tool_completed if evt.data.get("tool_use_id")}
-        running = [
-            evt
-            for evt in tool_started
-            if evt.data.get("tool_use_id") and evt.data.get("tool_use_id") not in completed_ids
-        ]
+        running = [evt for evt in tool_started if evt.data.get("tool_use_id") and evt.data.get("tool_use_id") not in completed_ids]
         if running:
             result["running_tools"] = [
                 {
@@ -3464,10 +3308,7 @@ def register_queen_lifecycle_tools(
             return json.dumps(
                 {
                     "status": "cooldown",
-                    "message": (
-                        f"Status '{focus or 'summary'}' was checked {int(elapsed_since)}s ago. "
-                        f"Wait {remaining}s or try a different focus."
-                    ),
+                    "message": (f"Status '{focus or 'summary'}' was checked {int(elapsed_since)}s ago. Wait {remaining}s or try a different focus."),
                 }
             )
         _status_last_called[tier] = now
@@ -3485,7 +3326,8 @@ def register_queen_lifecycle_tools(
             if focus is None:
                 # Default: brief prose summary
                 red_flags = _detect_red_flags(bus) if bus else 0
-                return _format_summary(preamble, red_flags)
+                worker_browsers = await _build_worker_browsers(runtime)
+                return _format_summary(preamble, red_flags, worker_browsers)
 
             if bus is None:
                 return f"Worker is {preamble['status']}. EventBus unavailable — only basic status returned."
@@ -3509,6 +3351,11 @@ def register_queen_lifecycle_tools(
                         result["goal_progress"] = progress
                 except Exception:
                     pass
+                # Authoritative per-worker browser snapshot (empty when
+                # no parallel worker has started a tab group).
+                wb = await _build_worker_browsers(runtime)
+                if wb:
+                    result["worker_browsers"] = wb
                 return json.dumps(result, default=str, ensure_ascii=False)
             else:
                 return f"Unknown focus '{focus}'. Valid options: activity, memory, tools, issues, progress, full."
@@ -3526,7 +3373,9 @@ def register_queen_lifecycle_tools(
             "- tools: running and recent tool calls\n"
             "- issues: retries, stalls, constraint violations\n"
             "- progress: goal criteria, token consumption\n"
-            "- full: everything as JSON"
+            "- full: everything as JSON\n"
+            "For a PLAYBOOK (run_playbook), use get_playbook_status(run_id=...) "
+            "instead — it reports the convergence run's progress by run_id."
         ),
         parameters={
             "type": "object",
@@ -3559,8 +3408,8 @@ def register_queen_lifecycle_tools(
         if runtime is None:
             return json.dumps({"error": "No colony running in this session."})
 
-        colony_id = runtime.colony_id
-        reg = runtime.get_worker_registration(colony_id)
+        stream_id = runtime.stream_id
+        reg = runtime.get_worker_registration(stream_id)
         if reg is None:
             return json.dumps({"error": "Colony not found"})
 
@@ -3660,8 +3509,7 @@ def register_queen_lifecycle_tools(
                 all_accounts = [
                     a
                     for a in all_accounts
-                    if a.get("credential_id", "").startswith(credential_id)
-                    or a.get("provider", "") in (credential_id, resolved_provider)
+                    if a.get("credential_id", "").startswith(credential_id) or a.get("provider", "") in (credential_id, resolved_provider)
                 ]
 
             return json.dumps(
@@ -3753,9 +3601,7 @@ def register_queen_lifecycle_tools(
             "properties": {
                 "credential_id": {
                     "type": "string",
-                    "description": (
-                        "Filter to a specific credential type (e.g. 'brave_search'). Omit to list all credentials."
-                    ),
+                    "description": ("Filter to a specific credential type (e.g. 'brave_search'). Omit to list all credentials."),
                 },
             },
             "required": [],
@@ -3906,12 +3752,7 @@ def register_queen_lifecycle_tools(
                 available[trigger_id] = tdef
             else:
                 return json.dumps(
-                    {
-                        "error": (
-                            f"Trigger '{trigger_id}' not found. "
-                            "Provide trigger_type and trigger_config to create a custom trigger."
-                        )
-                    }
+                    {"error": (f"Trigger '{trigger_id}' not found. Provide trigger_type and trigger_config to create a custom trigger.")}
                 )
 
         # Apply task override if provided
@@ -3921,10 +3762,7 @@ def register_queen_lifecycle_tools(
         # Task is mandatory before activation
         if not tdef.task:
             return json.dumps(
-                {
-                    "error": f"Trigger '{trigger_id}' has no task configured. "
-                    "Set a task describing what the worker should do when this trigger fires."
-                }
+                {"error": f"Trigger '{trigger_id}' has no task configured. Set a task describing what the worker should do when this trigger fires."}
             )
 
         # Use provided overrides if given
@@ -3939,14 +3777,7 @@ def register_queen_lifecycle_tools(
         if t_type == "webhook":
             path = t_config.get("path", "").strip()
             if not path or not path.startswith("/"):
-                return json.dumps(
-                    {
-                        "error": (
-                            "Webhook trigger requires 'path' starting with '/'"
-                            " in trigger_config (e.g. '/hooks/github')."
-                        )
-                    }
-                )
+                return json.dumps({"error": ("Webhook trigger requires 'path' starting with '/' in trigger_config (e.g. '/hooks/github').")})
             valid_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
             methods = t_config.get("methods", ["POST"])
             invalid = [m.upper() for m in methods if m.upper() not in valid_methods]
@@ -3958,27 +3789,11 @@ def register_queen_lifecycle_tools(
             except Exception as e:
                 return json.dumps({"error": f"Failed to start webhook trigger: {e}"})
 
-            tdef.active = True
+            tdef.enabled = True
             session.active_trigger_ids.add(trigger_id)
             await _persist_active_triggers(session, session_id)
             _save_trigger_to_agent(session, trigger_id, tdef)
-            bus = getattr(session, "event_bus", None)
-            if bus:
-                _runner = getattr(session, "runner", None)
-                _graph_entry = _runner.graph.entry_node if _runner else None
-                await bus.publish(
-                    AgentEvent(
-                        type=EventType.TRIGGER_ACTIVATED,
-                        stream_id="queen",
-                        data={
-                            "trigger_id": trigger_id,
-                            "trigger_type": t_type,
-                            "trigger_config": t_config,
-                            "name": tdef.description or trigger_id,
-                            **({"entry_node": _graph_entry} if _graph_entry else {}),
-                        },
-                    )
-                )
+            await _publish_trigger_activated(trigger_id, t_type, t_config, tdef)
             port = int(t_config.get("port", 8090))
             return json.dumps(
                 {
@@ -4008,37 +3823,18 @@ def register_queen_lifecycle_tools(
         else:
             return json.dumps({"error": "Timer trigger needs 'cron' or 'interval_minutes' in trigger_config."})
 
-        # Start timer
         try:
             await _start_trigger_timer(session, trigger_id, tdef)
         except Exception as e:
             return json.dumps({"error": f"Failed to start trigger timer: {e}"})
 
-        tdef.active = True
+        tdef.enabled = True
         session.active_trigger_ids.add(trigger_id)
 
         # Persist to session state and agent definition
         await _persist_active_triggers(session, session_id)
         _save_trigger_to_agent(session, trigger_id, tdef)
-
-        # Emit event
-        bus = getattr(session, "event_bus", None)
-        if bus:
-            _runner = getattr(session, "runner", None)
-            _graph_entry = _runner.graph.entry_node if _runner else None
-            await bus.publish(
-                AgentEvent(
-                    type=EventType.TRIGGER_ACTIVATED,
-                    stream_id="queen",
-                    data={
-                        "trigger_id": trigger_id,
-                        "trigger_type": t_type,
-                        "trigger_config": t_config,
-                        "name": tdef.description or trigger_id,
-                        **({"entry_node": _graph_entry} if _graph_entry else {}),
-                    },
-                )
-            )
+        await _publish_trigger_activated(trigger_id, t_type, t_config, tdef)
 
         return json.dumps(
             {
@@ -4072,9 +3868,7 @@ def register_queen_lifecycle_tools(
                 "trigger_config": {
                     "type": "object",
                     "description": (
-                        "Config for the trigger."
-                        " Timer: {cron: '*/5 * * * *'} or {interval_minutes: 5}."
-                        " Only needed for custom triggers."
+                        "Config for the trigger. Timer: {cron: '*/5 * * * *'} or {interval_minutes: 5}. Only needed for custom triggers."
                     ),
                 },
                 "task": {
@@ -4119,7 +3913,7 @@ def register_queen_lifecycle_tools(
         available = getattr(session, "available_triggers", {})
         tdef = available.get(trigger_id)
         if tdef:
-            tdef.active = False
+            tdef.enabled = False
 
         # Persist to session state and remove from agent definition
         await _persist_active_triggers(session, session_id)
@@ -4172,7 +3966,7 @@ def register_queen_lifecycle_tools(
                     "trigger_config": tdef.trigger_config,
                     "description": tdef.description,
                     "task": tdef.task,
-                    "active": tdef.active,
+                    "enabled": tdef.enabled,
                 }
             )
         return json.dumps({"triggers": triggers})
@@ -4187,6 +3981,12 @@ def register_queen_lifecycle_tools(
     )
     registry.register("list_triggers", _list_triggers_tool, lambda inputs: list_triggers())
     tools_registered += 1
+
+    # run_playbook — deterministic tracker-reconciliation orchestration.
+    # Implemented in its own module to keep this file from growing further.
+    from framework.tools.playbook_tools import register_playbook_tools
+
+    tools_registered += register_playbook_tools(registry, session)
 
     logger.info("Registered %d queen lifecycle tools", tools_registered)
     return tools_registered

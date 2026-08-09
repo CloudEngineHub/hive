@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from framework.loader.mcp_registry import MCPRegistry
+from framework.loader.mcp_registry import _DEFAULT_LOCAL_SERVERS, MCPRegistry
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -264,7 +264,8 @@ def test_list_installed(tmp_path: Path):
     registry.initialize()
     registry.add_local(name="a", transport="http", url="http://localhost:1")
     registry.add_local(name="b", transport="http", url="http://localhost:2")
-    assert len(registry.list_installed()) == 2
+    names = {s["name"] for s in registry.list_installed()}
+    assert {"a", "b"}.issubset(names)
 
 
 def test_get_server(tmp_path: Path):
@@ -489,7 +490,8 @@ def test_resolve_profile(tmp_path: Path):
 
 def test_resolve_profile_all(tmp_path: Path):
     registry = _setup_registry_with_servers(tmp_path)
-    assert len(registry.resolve_for_agent(profile="all")) == 3
+    names = {c.name for c in registry.resolve_for_agent(profile="all")}
+    assert {"jira", "slack", "github"}.issubset(names)
 
 
 def test_resolve_max_tools(tmp_path: Path):
@@ -1078,10 +1080,12 @@ def test_disable_nonexistent_raises(tmp_path: Path):
         registry.disable("ghost")
 
 
-def test_list_installed_empty(tmp_path: Path):
+def test_list_installed_fresh_registry(tmp_path: Path):
+    """A fresh registry contains exactly the bundled default servers — nothing more, nothing less."""
     registry = MCPRegistry(base_path=tmp_path / "mcp_registry")
     registry.initialize()
-    assert registry.list_installed() == []
+    names = {s["name"] for s in registry.list_installed()}
+    assert names == set(_DEFAULT_LOCAL_SERVERS)
 
 
 def test_list_available_empty_index(tmp_path: Path):

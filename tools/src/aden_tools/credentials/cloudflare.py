@@ -7,10 +7,7 @@ CLOUDFLARE_CREDENTIALS = {
         required=True,
         help_url="https://dash.cloudflare.com/profile/api-tokens",
         credential_id="cloudflare_api_token",
-        api_key_instructions=(
-            "Create an API token with Zone/DNS read and edit permissions: "
-            "https://dash.cloudflare.com/profile/api-tokens"
-        ),
+        api_key_instructions=("Create an API token with Zone/DNS read and edit permissions: https://dash.cloudflare.com/profile/api-tokens"),
         direct_api_key_supported=True,
         health_check_endpoint="https://api.cloudflare.com/client/v4/user/tokens/verify",
         tools=[

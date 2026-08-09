@@ -683,6 +683,168 @@ class TestToolExecution:
         assert llm._call_index >= 2
 
 
+class TestToolCallLifetimeBudget:
+    @pytest.mark.asyncio
+    async def test_lifetime_budget_forces_grace_winddown(self, runtime, node_spec, buffer):
+        """A loop that keeps calling tools is forced into grace wind-down
+        once it exhausts its cumulative (lifetime) tool-call budget — well
+        before max_iterations — with the budget-specific reminder firing.
+
+        Each outer iteration makes one tool call then yields text; the model
+        never sets the required output, so the implicit judge RETRYs forever
+        and the loop would run to max_iterations (50) if the lifetime budget
+        (3) didn't stop it first.
+        """
+        node_spec.output_keys = ["result"]  # implicit judge keeps RETRYing
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            return ToolResult(tool_use_id=tool_use.id, content="ok", is_error=False)
+
+        # Distinct tool_use_id + input per call so the conversation doesn't
+        # drop "duplicate" results and the replay detector stays out of it —
+        # each outer iteration: one tool call, then a text yield.
+        scenarios: list[list] = []
+        for i in range(8):
+            scenarios.append(tool_call_scenario("search", {"q": f"q{i}"}, tool_use_id=f"call_{i}"))
+            scenarios.append(text_scenario(f"still working {i}"))
+        llm = MockStreamingLLM(scenarios=scenarios)
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="search", description="Search", parameters={})],
+            is_subagent_mode=True,  # stream_id="judge": no worker auto-escalation
+        )
+        node = EventLoopNode(
+            tool_executor=tool_exec,
+            config=LoopConfig(
+                max_iterations=50,
+                tool_call_lifetime_budget=3,
+                # Isolate the budget path from the other independent safety
+                # nets that would otherwise trip first on a repetitive mock:
+                # the doom-loop detector (repeated identical tool call) and
+                # the stall detector (near-identical text yields).
+                tool_doom_loop_enabled=False,
+                stall_detection_threshold=999,
+            ),
+        )
+        result = await node.execute(ctx)
+
+        # Counter stops exactly at the budget — the mid-turn / boundary hard
+        # stop prevents overshoot.
+        assert node._tool_calls_used == 3
+        # Grace was entered via the lifetime-budget trigger (not iterations).
+        assert node._counters.get("tool_lifetime_budget_grace") == 1
+        assert node._in_grace is True
+        # Terminated far short of max_iterations (50 iters would be ~100
+        # stream calls); budget drove the exit, not iteration exhaustion.
+        assert llm._call_index < 20
+        # No report_to_parent available on this stream → wind-down exits via
+        # the max-iterations path (the framework backstops the report).
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_lifetime_grace_lets_worker_report(self, runtime, node_spec, buffer):
+        """A worker that exhausts its lifetime budget must still WIND DOWN
+        gracefully: in grace, report_to_parent (and tracker_upsert/task_update)
+        are exempt from the lifetime hard stop, so the worker reports back
+        instead of dying silently at max_iterations.
+
+        Regression guard: the lifetime mid-turn hard stop must NOT defer the
+        grace-allowed terminal tools — otherwise a budget-exhausted worker can
+        never call report_to_parent and the queen gets no real report.
+        """
+        node_spec.output_keys = ["result"]  # implicit judge RETRYs → loop stays alive
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            return ToolResult(tool_use_id=tool_use.id, content="ok", is_error=False)
+
+        report_scenario = [
+            ToolCallEvent(
+                tool_use_id="rep",
+                tool_name="report_to_parent",
+                tool_input={"status": "partial", "summary": "wound down under budget", "data": {}},
+            ),
+            FinishEvent(stop_reason="tool_calls", input_tokens=10, output_tokens=5, model="mock"),
+        ]
+        llm = MockStreamingLLM(
+            scenarios=[
+                tool_call_scenario("search", {"q": "a"}, tool_use_id="s0"),
+                text_scenario("step a"),
+                tool_call_scenario("search", {"q": "b"}, tool_use_id="s1"),
+                text_scenario("step b"),
+                report_scenario,  # fired in grace — must NOT be deferred by the budget
+                text_scenario("done"),
+            ]
+        )
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="search", description="Search", parameters={})],
+            stream_id="worker:budget_test",  # enables report_to_parent
+        )
+        node = EventLoopNode(
+            tool_executor=tool_exec,
+            config=LoopConfig(
+                max_iterations=10,
+                grace_iterations=1,
+                tool_call_lifetime_budget=2,
+                tool_doom_loop_enabled=False,
+                stall_detection_threshold=999,
+            ),
+        )
+        result = await node.execute(ctx)
+
+        # The worker terminated cleanly via its own report_to_parent — proof the
+        # terminal tool executed in grace rather than being deferred.
+        assert result.success is True
+        assert node._report_terminated is True
+        assert node._counters.get("tool_lifetime_budget_grace") == 1
+        # 2 budget-burning searches + the report_to_parent that wound it down.
+        assert node._tool_calls_used == 3
+
+    @pytest.mark.asyncio
+    async def test_resume_restores_cursor_and_tool_calls_used(self, tmp_path, runtime, node_spec, buffer):
+        """A new AgentLoop pointed at a populated store resumes from the saved
+        cursor — including the cumulative tool-call count, so the lifetime
+        tool-call budget is a TRUE cap across resumes rather than refilling.
+
+        This is the load-bearing invariant the queen-driven worker-resume
+        feature relies on: rebuild a worker over its existing store and the
+        loop continues from where it stopped.
+        """
+        store = FileConversationStore(tmp_path / "conv")
+        await store.write_meta({"system_prompt": "sys", "output_keys": []})
+        await store.write_part(0, {"seq": 0, "role": "user", "content": "original task"})
+        await store.write_part(1, {"seq": 1, "role": "assistant", "content": "did some work"})
+        # iteration=2 → resume continues at 3; tool_calls_used carries the cap forward.
+        await store.write_cursor({"iteration": 2, "next_seq": 2, "tool_calls_used": 7, "outputs": {}})
+
+        node_spec.output_keys = []
+        llm = MockStreamingLLM(scenarios=[text_scenario("done")])
+        ctx = build_ctx(runtime, node_spec, buffer, llm, is_subagent_mode=True)
+        node = EventLoopNode(
+            conversation_store=store,
+            config=LoopConfig(max_iterations=10, tool_call_lifetime_budget=150),
+        )
+
+        # _restore reflects the saved cursor + conversation.
+        restored = await node._restore(ctx)
+        assert restored is not None
+        assert restored.start_iteration == 3  # cursor iteration 2 + 1
+        assert restored.tool_calls_used == 7
+        assert restored.conversation.message_count == 2
+
+        # execute() seeds the live counter from the restored cursor, so the
+        # lifetime budget continues counting from 7 rather than 0.
+        result = await node.execute(ctx)
+        assert result.success is True
+        assert node._tool_calls_used == 7  # restored; this run made no tool calls
+
+
 # ===========================================================================
 # Write-through persistence with real FileConversationStore
 # ===========================================================================
@@ -771,9 +933,7 @@ class TestCrashRecovery:
                     "type": "function",
                     "function": {
                         "name": "ask_user",
-                        "arguments": (
-                            '{"questions":[{"id":"city","prompt":"What city?","options":["Seattle","Chicago"]}]}'
-                        ),
+                        "arguments": ('{"questions":[{"id":"city","prompt":"What city?","options":["Seattle","Chicago"]}]}'),
                     },
                 }
             ],
@@ -832,6 +992,101 @@ class TestCrashRecovery:
         assert llm._call_index == 0
         assert len(input_events) == 1
         assert input_events[0].data["questions"][0]["prompt"] == "What city?"
+
+    @pytest.mark.asyncio
+    async def test_answering_restored_question_clears_pending_input_on_disk(self, tmp_path, runtime, buffer):
+        """Answering a restored ask_user wait must clear pending_input on
+        disk in that same step — not defer it to a later checkpoint.
+
+        Regression guard. ``pending_input`` is the single source of truth
+        ``restore()`` consults to decide whether to re-block on resume.
+        The 6g cursor checkpoint that clears it sits behind early-``continue``
+        branches (compaction / empty-response / stall) that the iteration
+        right after an answer can take, skipping the write. If clearing is
+        deferred, a stale ``pending_input`` survives on disk and the *next*
+        cold resume re-pops a question the user already answered.
+
+        This test runs ONLY the restored-wait iteration (``max_iterations``
+        caps the range at one), so no later iteration — and no 6g
+        checkpoint — can clear the cursor as a side effect. The cursor is
+        clean afterwards only if the answered-wait path persists it itself.
+        """
+        store = FileConversationStore(tmp_path / "conv")
+        conv = NodeConversation(
+            system_prompt="You are a test assistant.",
+            output_keys=[],
+            store=store,
+        )
+        conv.set_current_phase("queen")
+        await conv.add_user_message("Session started.")
+        await conv.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": "ask_1",
+                    "type": "function",
+                    "function": {
+                        "name": "ask_user",
+                        "arguments": ('{"questions":[{"id":"city","prompt":"What city?","options":["Seattle","Chicago"]}]}'),
+                    },
+                }
+            ],
+        )
+        await conv.add_tool_result("ask_1", "Waiting for user input...")
+        await conv.add_assistant_message("What city should I target?")
+        await store.write_cursor(
+            {
+                "iteration": 4,
+                "next_seq": conv.next_seq,
+                "pending_input": {
+                    "questions": [{"id": "city", "prompt": "What city?", "options": ["Seattle", "Chicago"]}],
+                    "emit_client_request": True,
+                },
+            }
+        )
+
+        spec = NodeSpec(
+            id="queen",
+            name="Queen",
+            description="interactive queen",
+            node_type="event_loop",
+            output_keys=[],
+        )
+        llm = MockStreamingLLM(scenarios=[text_scenario("This should not run.")])
+        bus = EventBus()
+
+        node = EventLoopNode(
+            event_bus=bus,
+            conversation_store=store,
+            # start_iteration is cursor.iteration + 1 = 5, so range(5, 6)
+            # runs only the restored-wait iteration. No later iteration —
+            # hence no 6g checkpoint — can clear the cursor for us.
+            config=LoopConfig(max_iterations=6),
+        )
+
+        # Answer the question the instant it is re-emitted. The input lands
+        # *during* the wait (not pre-drained before the iteration starts),
+        # which is exactly the answered-restored-wait path under test.
+        async def answer_on_question(event):
+            await node.inject_event("Seattle", is_client_input=True)
+
+        bus.subscribe(
+            event_types=[EventType.CLIENT_INPUT_REQUESTED],
+            handler=answer_on_question,
+        )
+
+        ctx = build_ctx(runtime, spec, buffer, llm, stream_id="queen")
+        result = await node.execute(ctx)
+
+        # Loop exits via max-iterations (success False) — irrelevant here;
+        # the LLM never ran, proving only the restored wait executed and
+        # nothing else could have rewritten the cursor.
+        assert result is not None
+        assert llm._call_index == 0
+        # The regression assertion: the answered question is no longer
+        # marked pending on disk, so a subsequent cold resume won't re-pop it.
+        cursor = await store.read_cursor()
+        assert cursor.get("pending_input") is None
 
     @pytest.mark.asyncio
     @pytest.mark.skip(
@@ -1069,7 +1324,7 @@ class TestOutputAccumulator:
 class ErrorThenSuccessLLM(LLMProvider):
     """LLM that raises on the first N calls, then succeeds.
 
-    Used to test the retry-with-backoff wrapper around _run_single_turn().
+    Used to test the retry-with-backoff wrapper around _run_turn_loop().
     """
 
     model: str = "mock"
@@ -1755,6 +2010,408 @@ class TestToolDoomLoopIntegration:
         assert "failing_tool" in doom_events[0].data["description"]
 
 
+class TestToolReplayBreaker:
+    """Hard-breaker variant of the per-call replay detector.
+
+    The detector lives in ``_handle_pending_tools``; once the consecutive
+    streak of ``(tool_name, canonical-args)`` reaches
+    ``tool_doom_loop_threshold`` — counted both in-batch and across
+    recent assistant turns — the offending call is stubbed instead of
+    executed and the loop parks as ``ParkReason.DOOM_LOOP``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_breaker_trips_on_cross_turn_streak(
+        self,
+        runtime,
+        node_spec,
+        buffer,
+    ):
+        """3 consecutive turns of identical tool call → breaker trips
+        BEFORE the 3rd execution. tool_exec is called only twice.
+
+        Uses an LLM that emits tool calls back-to-back without
+        intermediate text-only turns — mirroring the captured loop
+        session where the model never inserted a text turn between
+        the offending calls.
+        """
+        from framework.agent_loop.reminders import ParkReason
+
+        node_spec.output_keys = []
+        judge = AsyncMock(spec=JudgeProtocol)
+        judge.evaluate = AsyncMock(return_value=JudgeVerdict(action="ACCEPT"))
+
+        call_idx = 0
+
+        class BackToBackLLM(LLMProvider):
+            model: str = "mock"
+
+            async def stream(self, messages, **kwargs):
+                nonlocal call_idx
+                idx = call_idx
+                call_idx += 1
+                # First 5 LLM calls each emit a single identical tool
+                # call (no text), so the conversation never gets a
+                # text-only break. After that, return text so the loop
+                # can exit.
+                if idx < 5:
+                    yield ToolCallEvent(
+                        tool_use_id=f"c{idx}",
+                        tool_name="get_time",
+                        tool_input={"tz": "UTC"},
+                    )
+                    yield FinishEvent(
+                        stop_reason="tool_calls",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+                else:
+                    text = f"done (call {idx})"
+                    yield TextDeltaEvent(content=text, snapshot=text)
+                    yield FinishEvent(
+                        stop_reason="stop",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+
+            def complete(self, messages, **kwargs):
+                return LLMResponse(content="ok", model="mock", stop_reason="stop")
+
+        llm = BackToBackLLM()
+        bus = EventBus()
+        doom_events: list = []
+        bus.subscribe(
+            event_types=[EventType.NODE_TOOL_DOOM_LOOP],
+            handler=lambda e: doom_events.append(e),
+        )
+
+        exec_count = 0
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            nonlocal exec_count
+            exec_count += 1
+            return ToolResult(tool_use_id=tool_use.id, content="result", is_error=False)
+
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="get_time", description="t", parameters={})],
+            is_subagent_mode=True,
+        )
+        node = EventLoopNode(
+            judge=judge,
+            tool_executor=tool_exec,
+            event_bus=bus,
+            config=LoopConfig(
+                max_iterations=10,
+                tool_doom_loop_threshold=3,
+                stall_similarity_threshold=1.0,
+            ),
+        )
+
+        # The breaker parks via _await_user_input; bypass so the test
+        # does not hang. Record the park reasons it was called with.
+        park_reasons: list = []
+
+        async def fake_await(_ctx, *, reason=None, **_kw):
+            park_reasons.append(reason)
+            return True
+
+        node._await_user_input = fake_await
+
+        await node.execute(ctx)
+
+        # 5 identical LLM tool emissions, threshold=3. The breaker MUST
+        # trip at least once, preventing at least one execution. After
+        # the park returns (mocked), the model recovers — the stubbed
+        # tool result has is_error=True which breaks the streak so the
+        # next call may execute before another trip — so we don't pin
+        # the exact count, just bound it below the emission total.
+        assert exec_count < 5
+        assert len(doom_events) >= 1
+        assert "get_time" in doom_events[0].data["description"]
+        assert ParkReason.DOOM_LOOP in park_reasons
+
+    @pytest.mark.asyncio
+    async def test_breaker_trips_on_within_turn_duplicates(
+        self,
+        runtime,
+        node_spec,
+        buffer,
+    ):
+        """A single LLM response with 3 identical tool calls trips the
+        breaker before any of them execute. This is the iter-15 case
+        from the captured loop session — 25 identical parallel calls
+        in one response collapse to zero executions."""
+        from framework.agent_loop.reminders import ParkReason
+
+        node_spec.output_keys = []
+        judge = AsyncMock(spec=JudgeProtocol)
+        judge.evaluate = AsyncMock(return_value=JudgeVerdict(action="ACCEPT"))
+
+        # Custom LLM: first response emits 3 identical tool calls in
+        # one batch; subsequent responses are text so the loop can exit.
+        call_idx = 0
+
+        class BatchLLM(LLMProvider):
+            model: str = "mock"
+
+            async def stream(self, messages, **kwargs):
+                nonlocal call_idx
+                idx = call_idx
+                call_idx += 1
+                if idx == 0:
+                    for j in range(3):
+                        yield ToolCallEvent(
+                            tool_use_id=f"c{j}",
+                            tool_name="get_time",
+                            tool_input={"tz": "UTC"},
+                        )
+                    yield FinishEvent(
+                        stop_reason="tool_calls",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+                else:
+                    text = f"done (call {idx})"
+                    yield TextDeltaEvent(content=text, snapshot=text)
+                    yield FinishEvent(
+                        stop_reason="stop",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+
+            def complete(self, messages, **kwargs):
+                return LLMResponse(content="ok", model="mock", stop_reason="stop")
+
+        llm = BatchLLM()
+        bus = EventBus()
+        doom_events: list = []
+        bus.subscribe(
+            event_types=[EventType.NODE_TOOL_DOOM_LOOP],
+            handler=lambda e: doom_events.append(e),
+        )
+
+        exec_count = 0
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            nonlocal exec_count
+            exec_count += 1
+            return ToolResult(tool_use_id=tool_use.id, content="result", is_error=False)
+
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="get_time", description="t", parameters={})],
+            is_subagent_mode=True,
+        )
+        node = EventLoopNode(
+            judge=judge,
+            tool_executor=tool_exec,
+            event_bus=bus,
+            config=LoopConfig(
+                max_iterations=5,
+                tool_doom_loop_threshold=3,
+                stall_similarity_threshold=1.0,
+            ),
+        )
+
+        park_reasons: list = []
+
+        async def fake_await(_ctx, *, reason=None, **_kw):
+            park_reasons.append(reason)
+            return True
+
+        node._await_user_input = fake_await
+
+        await node.execute(ctx)
+
+        # None of the 3 in-batch identical calls executed — in_batch_dup=3
+        # on the very first call satisfies the threshold.
+        assert exec_count == 0
+        assert len(doom_events) >= 1
+        assert ParkReason.DOOM_LOOP in park_reasons
+
+    @pytest.mark.asyncio
+    async def test_breaker_disabled_when_replay_detector_off(
+        self,
+        runtime,
+        node_spec,
+        buffer,
+    ):
+        """``replay_detector_enabled=False`` disables both the soft
+        steer and the hard breaker — back-compat with the legacy
+        opt-out."""
+        node_spec.output_keys = []
+        judge = AsyncMock(spec=JudgeProtocol)
+        eval_count = 0
+
+        async def judge_eval(*args, **kwargs):
+            nonlocal eval_count
+            eval_count += 1
+            return JudgeVerdict(action="ACCEPT" if eval_count >= 6 else "RETRY")
+
+        judge.evaluate = judge_eval
+
+        llm = ToolRepeatLLM("get_time", {"tz": "UTC"}, tool_turns=5)
+        bus = EventBus()
+        doom_events: list = []
+        bus.subscribe(
+            event_types=[EventType.NODE_TOOL_DOOM_LOOP],
+            handler=lambda e: doom_events.append(e),
+        )
+
+        exec_count = 0
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            nonlocal exec_count
+            exec_count += 1
+            return ToolResult(tool_use_id=tool_use.id, content="result", is_error=False)
+
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="get_time", description="t", parameters={})],
+            is_subagent_mode=True,
+        )
+        node = EventLoopNode(
+            judge=judge,
+            tool_executor=tool_exec,
+            event_bus=bus,
+            config=LoopConfig(
+                max_iterations=10,
+                tool_doom_loop_threshold=3,
+                replay_detector_enabled=False,
+                stall_similarity_threshold=1.0,
+            ),
+        )
+        await node.execute(ctx)
+
+        # With the detector disabled all 5 identical calls execute.
+        assert exec_count == 5
+        # The new breaker did not emit (only the turn-level detector
+        # might, and ToolRepeatLLM's per-iteration fingerprints match
+        # exactly, so the existing detector still does its job). We
+        # don't pin that here — the assertion is about the new path
+        # being inert.
+        # Tool executions are the load-bearing assertion.
+
+    @pytest.mark.asyncio
+    async def test_breaker_no_trip_on_different_args(
+        self,
+        runtime,
+        node_spec,
+        buffer,
+    ):
+        """Identical tool name but different args across turns must not
+        trip the breaker — each call is legitimately distinct work."""
+        node_spec.output_keys = []
+        judge = AsyncMock(spec=JudgeProtocol)
+        eval_count = 0
+
+        async def judge_eval(*args, **kwargs):
+            nonlocal eval_count
+            eval_count += 1
+            return JudgeVerdict(action="ACCEPT" if eval_count >= 5 else "RETRY")
+
+        judge.evaluate = judge_eval
+
+        call_idx = 0
+
+        class DiffArgsLLM(LLMProvider):
+            model: str = "mock"
+
+            async def stream(self, messages, **kwargs):
+                nonlocal call_idx
+                idx = call_idx
+                call_idx += 1
+                outer = idx // 2
+                if idx % 2 == 0 and outer < 4:
+                    yield ToolCallEvent(
+                        tool_use_id=f"c{idx}",
+                        tool_name="get_time",
+                        tool_input={"tz": f"zone_{outer}"},
+                    )
+                    yield FinishEvent(
+                        stop_reason="tool_calls",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+                else:
+                    text = f"done (call {idx})"
+                    yield TextDeltaEvent(content=text, snapshot=text)
+                    yield FinishEvent(
+                        stop_reason="stop",
+                        input_tokens=10,
+                        output_tokens=5,
+                        model="mock",
+                    )
+
+            def complete(self, messages, **kwargs):
+                return LLMResponse(content="ok", model="mock", stop_reason="stop")
+
+        llm = DiffArgsLLM()
+        bus = EventBus()
+        doom_events: list = []
+        bus.subscribe(
+            event_types=[EventType.NODE_TOOL_DOOM_LOOP],
+            handler=lambda e: doom_events.append(e),
+        )
+
+        exec_count = 0
+
+        def tool_exec(tool_use: ToolUse) -> ToolResult:
+            nonlocal exec_count
+            exec_count += 1
+            return ToolResult(tool_use_id=tool_use.id, content="result", is_error=False)
+
+        ctx = build_ctx(
+            runtime,
+            node_spec,
+            buffer,
+            llm,
+            tools=[Tool(name="get_time", description="t", parameters={})],
+            is_subagent_mode=True,
+        )
+        node = EventLoopNode(
+            judge=judge,
+            tool_executor=tool_exec,
+            event_bus=bus,
+            config=LoopConfig(
+                max_iterations=10,
+                tool_doom_loop_threshold=3,
+                stall_similarity_threshold=1.0,
+            ),
+        )
+
+        park_reasons: list = []
+
+        async def fake_await(_ctx, *, reason=None, **_kw):
+            park_reasons.append(reason)
+            return True
+
+        node._await_user_input = fake_await
+
+        await node.execute(ctx)
+
+        # All 4 calls had distinct args — all executed, no breaker.
+        assert exec_count == 4
+        from framework.agent_loop.reminders import ParkReason
+
+        assert ParkReason.DOOM_LOOP not in park_reasons
+
+
 # ===========================================================================
 # execution_id plumbing
 # ===========================================================================
@@ -2131,6 +2788,112 @@ class TestToolConcurrencyPartition:
 
         # Both tools must have run: soft errors don't cascade.
         assert executed == ["call_1", "call_2"]
+
+
+class TestToolBudgetOverflow:
+    """Per-turn tool-call budget overflow → advisory reminder, not errors."""
+
+    @pytest.mark.asyncio
+    async def test_overflow_defers_calls_as_advisory(self, runtime, node_spec, buffer):
+        """4 tool calls with hard_limit=2: 2 run, 2 are deferred with
+        non-error advisory results, and a <system-reminder> about the
+        budget lands on the next turn's request."""
+        node_spec.output_keys = []
+        scenario = _multi_tool_scenario(
+            ("execute_command", {"command": "echo 1"}, "call_1"),
+            ("execute_command", {"command": "echo 2"}, "call_2"),
+            ("execute_command", {"command": "echo 3"}, "call_3"),
+            ("execute_command", {"command": "echo 4"}, "call_4"),
+        )
+        llm = MockStreamingLLM(scenarios=[scenario, text_scenario("done")])
+
+        executed: list[str] = []
+
+        async def tool_exec(tool_use: ToolUse) -> ToolResult:
+            executed.append(tool_use.id)
+            return ToolResult(tool_use_id=tool_use.id, content="ok", is_error=False)
+
+        tools = [
+            Tool(
+                name="execute_command",
+                description="",
+                parameters={},
+                concurrency_safe=False,
+            ),
+        ]
+        ctx = build_ctx(runtime, node_spec, buffer, llm, tools=tools, is_subagent_mode=True)
+        node = EventLoopNode(
+            tool_executor=tool_exec,
+            config=LoopConfig(
+                max_iterations=3,
+                tool_call_budget=2,
+                tool_call_hard_multiple=1,  # hard_limit = 2 * 1 = 2
+            ),
+        )
+        await node.execute(ctx)
+
+        # Only the first two of the four calls run.
+        assert executed == ["call_1", "call_2"]
+        # Counter bumped by the count of deferred calls.
+        assert node.stats().get("tool_budget_deferred") == 2
+
+        # Turn 2's request must carry the deferred calls' neutral
+        # (non-error) results and the overflow <system-reminder>.
+        assert len(llm.stream_calls) >= 2
+        turn2 = " ".join(str(m.get("content", "")) for m in llm.stream_calls[1]["messages"])
+        assert "Not executed" in turn2  # neutral advisory wording
+        assert "were deferred" in turn2  # the posted reminder
+        assert "hard stop of 2 calls" in turn2
+
+    @pytest.mark.asyncio
+    async def test_soft_budget_checkpoint_rides_tail_without_stopping(self, runtime, node_spec, buffer):
+        """budget=2, hard_multiple=5 (hard stop at 10): a 4-call turn runs
+        every call (no deferral) but rides one escalating soft 'Tool-call
+        checkpoint' <system-reminder> on the next turn's request."""
+        node_spec.output_keys = []
+        scenario = _multi_tool_scenario(
+            ("execute_command", {"command": "echo 1"}, "call_1"),
+            ("execute_command", {"command": "echo 2"}, "call_2"),
+            ("execute_command", {"command": "echo 3"}, "call_3"),
+            ("execute_command", {"command": "echo 4"}, "call_4"),
+        )
+        llm = MockStreamingLLM(scenarios=[scenario, text_scenario("done")])
+
+        executed: list[str] = []
+
+        async def tool_exec(tool_use: ToolUse) -> ToolResult:
+            executed.append(tool_use.id)
+            return ToolResult(tool_use_id=tool_use.id, content="ok", is_error=False)
+
+        tools = [
+            Tool(
+                name="execute_command",
+                description="",
+                parameters={},
+                concurrency_safe=False,
+            ),
+        ]
+        ctx = build_ctx(runtime, node_spec, buffer, llm, tools=tools, is_subagent_mode=True)
+        node = EventLoopNode(
+            tool_executor=tool_exec,
+            config=LoopConfig(
+                max_iterations=3,
+                tool_call_budget=2,
+                tool_call_hard_multiple=5,  # hard stop at 10
+            ),
+        )
+        await node.execute(ctx)
+
+        # All four calls run — the soft checkpoint never defers work.
+        assert executed == ["call_1", "call_2", "call_3", "call_4"]
+        assert node.stats().get("tool_budget_deferred") is None
+        assert node.stats().get("tool_budget_soft_reminder") == 1
+
+        # Turn 2's request carries the checkpoint reminder.
+        assert len(llm.stream_calls) >= 2
+        turn2 = " ".join(str(m.get("content", "")) for m in llm.stream_calls[1]["messages"])
+        assert "Tool-call checkpoint" in turn2
+        assert "checkpoint, not a stop" in turn2
 
 
 # ===========================================================================

@@ -36,10 +36,12 @@ from framework.agents.queen.queen_tools_config import (
     update_queen_tools_config,
 )
 from framework.agents.queen.queen_tools_defaults import (
+    configured_always_enabled_categories,
     list_category_names,
     queen_role_categories,
     resolve_category_tools,
 )
+from framework.cloud_sync_hooks import schedule_push
 
 logger = logging.getLogger(__name__)
 
@@ -48,33 +50,46 @@ _SYNTHETIC_NAMES = {"ask_user"}
 
 
 async def _ensure_manager_catalog(manager: Any) -> dict[str, list[dict[str, Any]]]:
-    """Return the cached MCP tool catalog, building it on first call.
+    """Return a fresh MCP tool catalog from the manager's bootstrap registry.
 
-    ``queen_orchestrator.create_queen`` populates ``_mcp_tool_catalog`` on
-    every queen boot. On a fresh backend process the user may open the
-    Tool Library before any queen session has started, so the catalog is
-    empty. In that case we build one from the shared MCP config; the
-    first call pays an MCP-subprocess-spawn cost, subsequent calls are
-    cache hits. The build runs off the event loop via asyncio.to_thread
-    so the HTTP worker stays responsive while MCP servers initialize.
+    Critically, this reads through the registry's
+    ``get_full_mcp_catalog()`` accessor on every call rather than
+    caching a dict snapshot. The registry rebuilds its own
+    ``_mcp_full_catalog`` whenever ``resync_mcp_servers_if_needed``
+    fires (credential save, env-var change), so reading through the
+    registry guarantees the response reflects the current credential
+    state without needing any explicit invalidation step.
+
+    On the first call after a fresh backend process — when no queen
+    has booted yet — we lazily build the registry via
+    ``build_queen_tool_registry_bare``. That spawns MCP subprocesses
+    once and stashes the registry on the manager for subsequent calls.
     """
     if manager is None:
         return {}
-    catalog = getattr(manager, "_mcp_tool_catalog", None)
-    if isinstance(catalog, dict) and catalog:
-        return catalog
-    try:
-        import asyncio
 
-        from framework.server.queen_orchestrator import build_queen_tool_registry_bare
+    registry = getattr(manager, "_bootstrap_tool_registry", None)
+    if registry is not None:
+        return _normalize_catalog(registry.get_full_mcp_catalog())
 
-        registry, built = await asyncio.to_thread(build_queen_tool_registry_bare)
-        manager._mcp_tool_catalog = built  # type: ignore[attr-defined]
-        manager._bootstrap_tool_registry = registry  # type: ignore[attr-defined]
-        return built
-    except Exception:
-        logger.warning("Tool catalog bootstrap failed", exc_info=True)
-        return {}
+    # Legacy dict snapshot (still used by some tests). Production
+    # writes ``_bootstrap_tool_registry`` so this branch is rarely
+    # exercised at runtime.
+    legacy = getattr(manager, "_mcp_tool_catalog", None)
+    if isinstance(legacy, dict) and legacy:
+        return _normalize_catalog(legacy)
+
+    from framework.server.queen_orchestrator import ensure_bootstrap_tool_registry
+
+    registry = await ensure_bootstrap_tool_registry(manager)
+    return _normalize_catalog(registry.get_full_mcp_catalog() if registry is not None else {})
+
+
+def _normalize_catalog(
+    catalog: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Sort each per-server tool list by name for stable rendering."""
+    return {server: sorted((dict(e) for e in entries), key=lambda e: e.get("name", "")) for server, entries in catalog.items()}
 
 
 def _lifecycle_entries_without_session(
@@ -162,15 +177,16 @@ def _synthetic_entries() -> list[dict[str, Any]]:
 
 
 def _live_queen_session(manager: Any, queen_id: str) -> Any:
-    """Return any live DM session owned by this queen, or ``None``."""
+    """Return a live session owned by this queen, preferring DM over colony."""
     sessions = getattr(manager, "_sessions", None) or {}
+    colony_fallback = None
     for session in sessions.values():
         if getattr(session, "queen_name", None) != queen_id:
             continue
-        # Prefer DM (non-colony) sessions
         if getattr(session, "colony_runtime", None) is None:
             return session
-    return None
+        colony_fallback = session
+    return colony_fallback
 
 
 def _render_mcp_servers(
@@ -228,9 +244,13 @@ def _catalog_from_live_session(session: Any) -> dict[str, list[dict[str, Any]]]:
         if phase_state is None:
             return {}
         mcp_names = getattr(phase_state, "mcp_tool_names_all", set()) or set()
-        independent_tools = getattr(phase_state, "independent_tools", []) or []
+        phase_tools = (
+            phase_state.get_current_tools()
+            if callable(getattr(phase_state, "get_current_tools", None))
+            else getattr(phase_state, "independent_tools", []) or []
+        )
         result: dict[str, list[dict[str, Any]]] = {"MCP Tools": []}
-        for tool in independent_tools:
+        for tool in phase_tools:
             if tool.name not in mcp_names:
                 continue
             result["MCP Tools"].append(
@@ -282,18 +302,25 @@ def _lifecycle_entries(
     session: Any,
     mcp_tool_names_all: set[str],
 ) -> list[dict[str, Any]]:
-    """Lifecycle tools = independent_tools minus MCP-origin minus synthetic.
+    """Lifecycle tools = current-phase tools minus MCP-origin minus synthetic.
 
     We compute this from a live session when available so the list exactly
-    matches what the queen actually sees on her next turn.
+    matches what the queen actually sees on her next turn. Uses
+    ``get_current_tools()`` so the correct phase (independent / colony)
+    is reflected.
     """
     if session is None:
         return []
     phase_state = getattr(session, "phase_state", None)
     if phase_state is None:
         return []
+    current_tools = (
+        phase_state.get_current_tools()
+        if callable(getattr(phase_state, "get_current_tools", None))
+        else getattr(phase_state, "independent_tools", []) or []
+    )
     result: list[dict[str, Any]] = []
-    for tool in getattr(phase_state, "independent_tools", []) or []:
+    for tool in current_tools:
         if tool.name in mcp_tool_names_all:
             continue
         if tool.name in _SYNTHETIC_NAMES:
@@ -308,21 +335,17 @@ def _lifecycle_entries(
     return sorted(result, key=lambda x: x["name"])
 
 
-async def handle_get_tools(request: web.Request) -> web.Response:
-    """GET /api/queen/{queen_id}/tools — enumerate tool surface for the UI."""
-    queen_id = request.match_info["queen_id"]
-    ensure_default_queens()
-    try:
-        load_queen_profile(queen_id)
-    except FileNotFoundError:
-        return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
+async def _build_tools_snapshot(manager: Any, queen_id: str) -> dict[str, Any]:
+    """Build the same response shape returned by GET /api/queen/{id}/tools.
 
-    manager = request.app.get("manager")
+    Factored out so PATCH/DELETE can return the post-mutation snapshot
+    in their response body — saves the editor a round-trip and keeps
+    its local state from drifting against a catalog that may have
+    changed concurrently (e.g. the user authorised a provider in
+    another tab between the GET and the save).
+    """
     session = _live_queen_session(manager, queen_id) if manager is not None else None
 
-    # Prefer a live session's registry for freshness. Otherwise use (or
-    # build on demand) the manager-level catalog so the Tool Library works
-    # even before any queen has been started in this process.
     if session is not None:
         catalog = _catalog_from_live_session(session)
     else:
@@ -343,17 +366,20 @@ async def handle_get_tools(request: web.Request) -> web.Response:
     else:
         lifecycle = _lifecycle_entries_without_session(manager, mcp_tool_names_all)
 
-    # Allowlist lives in the dedicated tools.json sidecar; helper
-    # migrates legacy profile.yaml field on first read, and falls back
-    # to the role-based default when no sidecar exists.
+    # Default-on for OAuth: when the queen is on the role-based default
+    # (no tools.json saved), ``load_queen_tools_config`` augments the
+    # allowlist with every tool whose provider is currently authorised.
+    # That augmentation lives in ``queen_tools_config`` so the queen
+    # orchestrator's boot path (which calls the same loader) gets the
+    # same answer — without that, the UI promised tools the runtime
+    # didn't actually expose to the queen. Once the user saves an
+    # explicit allowlist, the sidecar exists and the augmentation
+    # branch isn't taken — their explicit unticks survive.
     enabled_mcp_tools = load_queen_tools_config(queen_id, mcp_catalog=catalog)
     is_role_default = not tools_config_exists(queen_id)
-
-    # Snapshot live OAuth providers so the UI can grey out rows whose
-    # credential isn't authorized yet and surface a Connect button.
     connected_providers = _connected_providers()
 
-    response = {
+    return {
         "queen_id": queen_id,
         "enabled_mcp_tools": enabled_mcp_tools,
         "is_role_default": is_role_default,
@@ -368,7 +394,20 @@ async def handle_get_tools(request: web.Request) -> web.Response:
         "categories": _render_categories(queen_id, catalog),
         "connected_providers": sorted(connected_providers),
     }
-    return web.json_response(response)
+
+
+async def handle_get_tools(request: web.Request) -> web.Response:
+    """GET /api/queen/{queen_id}/tools — enumerate tool surface for the UI."""
+    queen_id = request.match_info["queen_id"]
+    ensure_default_queens()
+    try:
+        load_queen_profile(queen_id)
+    except FileNotFoundError:
+        return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
+
+    manager = request.app.get("manager")
+    snapshot = await _build_tools_snapshot(manager, queen_id)
+    return web.json_response(snapshot)
 
 
 def _connected_providers() -> set[str]:
@@ -396,18 +435,32 @@ def _render_categories(
 
     Each entry carries the category name, the resolved member tool names
     (after ``@server:NAME`` shorthand expansion against the live catalog),
-    and ``in_role_default`` to flag categories that contribute to this
-    queen's role-based default. Lets the Tool Library group tools by
-    category alongside the per-server view.
+    ``in_role_default`` to flag categories that contribute to this queen's
+    role-based default, and ``always_enabled`` to flag categories whose tools
+    are loaded up front and bypass the allowlist (locked on in the UI — the
+    queen always has them; the rest are searchable / loaded on demand). Lets
+    the Tool Library group tools by tier and by category.
+
+    ``email_senders`` is omitted while the senders feature is off (Settings →
+    Developer): its tools aren't registered with the MCP server then, so the
+    category would render as an empty, un-tickable shell. The category stays
+    in the role-default table regardless — the names simply match nothing
+    while off, and light up the moment the feature is enabled.
     """
+    from framework.config import get_email_senders_enabled
+
+    hidden = set() if get_email_senders_enabled() else {"email_senders"}
     applied = set(queen_role_categories(queen_id))
     out: list[dict[str, Any]] = []
     for name in list_category_names():
+        if name in hidden:
+            continue
         out.append(
             {
                 "name": name,
                 "tools": resolve_category_tools(name, mcp_catalog),
                 "in_role_default": name in applied,
+                "always_enabled": name in configured_always_enabled_categories(),
             }
         )
     return out
@@ -506,12 +559,43 @@ async def handle_patch_tools(request: web.Request) -> web.Response:
         "null" if enabled is None else f"{len(enabled)} tool(s)",
         refreshed,
     )
-    return web.json_response(
-        {
-            "queen_id": queen_id,
-            "enabled_mcp_tools": enabled,
-            "refreshed_sessions": refreshed,
-        }
+
+    # Build the post-mutation snapshot so the editor can replace its
+    # local state without a follow-up GET — and broadcast a cross-tab
+    # event so any other Tool Library window viewing the same queen
+    # silently refetches.
+    snapshot = await _build_tools_snapshot(manager, queen_id)
+    snapshot["refreshed_sessions"] = refreshed
+    await _publish_tools_config_changed(
+        scope="queen",
+        scope_id=queen_id,
+        action="update",
+    )
+    schedule_push("tool_allowlist", f"queen:{queen_id}")
+    return web.json_response(snapshot)
+
+
+async def _publish_tools_config_changed(
+    *,
+    scope: str,
+    scope_id: str,
+    action: str,
+) -> None:
+    """Broadcast a TOOLS_CONFIG_CHANGED event on the global bus.
+
+    Subscribers (Tool Library tabs) that are viewing the same scope
+    use this to refetch silently. ``scope`` is ``"queen"`` or
+    ``"colony"``; ``action`` is ``"update"`` (PATCH) or ``"reset"``
+    (DELETE → fall back to role default).
+    """
+    from framework.host.event_bus import AgentEvent, EventType, publish_global
+
+    await publish_global(
+        AgentEvent(
+            type=EventType.TOOLS_CONFIG_CHANGED,
+            stream_id="global",
+            data={"scope": scope, "scope_id": scope_id, "action": action},
+        )
     )
 
 
@@ -571,15 +655,20 @@ async def handle_delete_tools(request: web.Request) -> web.Response:
         removed,
         refreshed,
     )
-    return web.json_response(
-        {
-            "queen_id": queen_id,
-            "removed": removed,
-            "enabled_mcp_tools": new_enabled,
-            "is_role_default": True,
-            "refreshed_sessions": refreshed,
-        }
+
+    # Return the same shape PATCH does + the removed flag, so the
+    # editor replaces its local state in one shot. Also broadcast on
+    # the global bus so other tabs refetch.
+    snapshot = await _build_tools_snapshot(manager, queen_id)
+    snapshot["removed"] = removed
+    snapshot["refreshed_sessions"] = refreshed
+    await _publish_tools_config_changed(
+        scope="queen",
+        scope_id=queen_id,
+        action="reset",
     )
+    schedule_push("tool_allowlist", f"queen:{queen_id}")
+    return web.json_response(snapshot)
 
 
 def register_routes(app: web.Application) -> None:

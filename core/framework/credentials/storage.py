@@ -137,14 +137,11 @@ class EncryptedFileStorage(CredentialStorage):
         try:
             from cryptography.fernet import Fernet
         except ImportError as e:
-            raise ImportError(
-                "Encrypted storage requires 'cryptography'. Install with: uv pip install cryptography"
-            ) from e
+            raise ImportError("Encrypted storage requires 'cryptography'. Install with: uv pip install cryptography") from e
 
         if base_path is None:
-            # Honor HIVE_HOME (set by the desktop shell to a per-user dir) so
-            # the encrypted store doesn't fork between ~/.hive and the desktop
-            # userData root. Falls back to ~/.hive/credentials when standalone.
+            # Honor the desktop's per-user HIVE_HOME override. Falls back to
+            # ~/.hive/credentials when running standalone (no env var set).
             from framework.config import HIVE_HOME
 
             base_path = HIVE_HOME / "credentials"
@@ -162,10 +159,7 @@ class EncryptedFileStorage(CredentialStorage):
             else:
                 # Generate new key
                 self._key = Fernet.generate_key()
-                logger.warning(
-                    f"Generated new encryption key. To persist credentials across restarts, "
-                    f"set {key_env_var}={self._key.decode()}"
-                )
+                logger.warning(f"Generated new encryption key. To persist credentials across restarts, set {key_env_var}={self._key.decode()}")
 
         self._fernet = Fernet(self._key)
 
@@ -319,11 +313,7 @@ class EncryptedFileStorage(CredentialStorage):
         """Build a single index entry from a CredentialObject (no secrets)."""
         # Visible key names: drop internal markers like _alias / _integration_type
         # / _identity_* so the entry shows what's actually a credential key.
-        visible_keys = [
-            name
-            for name in credential.keys.keys()
-            if name not in self.INDEX_INTERNAL_KEY_NAMES and not name.startswith("_identity_")
-        ]
+        visible_keys = [name for name in credential.keys.keys() if name not in self.INDEX_INTERNAL_KEY_NAMES and not name.startswith("_identity_")]
 
         # Earliest expiry across all keys (most likely the access_token).
         earliest_expiry: datetime | None = None
@@ -482,9 +472,7 @@ class EnvVarStorage(CredentialStorage):
 
     def save(self, credential: CredentialObject) -> None:
         """Cannot save to environment variables at runtime."""
-        raise NotImplementedError(
-            "EnvVarStorage is read-only. Set environment variables externally or use EncryptedFileStorage."
-        )
+        raise NotImplementedError("EnvVarStorage is read-only. Set environment variables externally or use EncryptedFileStorage.")
 
     def load(self, credential_id: str) -> CredentialObject | None:
         """Load credential from environment variable."""
@@ -519,7 +507,7 @@ class EnvVarStorage(CredentialStorage):
     def exists(self, credential_id: str) -> bool:
         """Check if credential is available in environment."""
         env_var = self._get_env_var_name(credential_id)
-        return bool(self._read_env_value(env_var))
+        return self._read_env_value(env_var) is not None
 
     def add_mapping(self, credential_id: str, env_var: str) -> None:
         """

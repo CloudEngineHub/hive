@@ -63,8 +63,7 @@ def _ensure_index_available(registry) -> bool:
                 )
                 return True
             print(
-                f"Error: no registry index available and refresh failed: {exc}\n"
-                "Check your network connection and try: hive mcp update",
+                f"Error: no registry index available and refresh failed: {exc}\nCheck your network connection and try: hive mcp update",
                 file=sys.stderr,
             )
             return False
@@ -73,8 +72,7 @@ def _ensure_index_available(registry) -> bool:
 
 
 _SECURITY_NOTICE = (
-    "Registry servers run code on your machine. Only install servers you trust.\n"
-    "Learn more: https://github.com/aden-hive/hive-mcp-registry"
+    "Registry servers run code on your machine. Only install servers you trust.\nLearn more: https://github.com/aden-hive/hive-mcp-registry"
 )
 _NOTICE_SENTINEL = ".security_notice_shown"
 
@@ -212,15 +210,7 @@ def _render_installed_table(entries: list[dict]) -> None:
     transport_w = max(len(e.get("transport", "")) for e in entries)
     transport_w = max(transport_w, 9)
 
-    header = (
-        f"  {'NAME':<{name_w}}  "
-        f"{'TRANSPORT':<{transport_w}}  "
-        f"{'ENABLED':<7}  "
-        f"{'HEALTH':<9}  "
-        f"{'TOOLS':<5}  "
-        f"{'TRUST':<10}  "
-        f"{'SOURCE'}"
-    )
+    header = f"  {'NAME':<{name_w}}  {'TRANSPORT':<{transport_w}}  {'ENABLED':<7}  {'HEALTH':<9}  {'TOOLS':<5}  {'TRUST':<10}  {'SOURCE'}"
     print(header)
     print("  " + "─" * (len(header) - 2))
 

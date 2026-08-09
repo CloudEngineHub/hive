@@ -335,9 +335,7 @@ def register_tools(
             return data
 
         lead = data.get("lead") or {}
-        issue_types = [
-            {"name": it.get("name", ""), "subtask": it.get("subtask", False)} for it in data.get("issueTypes", [])
-        ]
+        issue_types = [{"name": it.get("name", ""), "subtask": it.get("subtask", False)} for it in data.get("issueTypes", [])]
 
         return {
             "key": data.get("key", ""),

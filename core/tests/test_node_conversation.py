@@ -131,6 +131,31 @@ class TestMessage:
         assert "tool_calls" not in d2
         assert "is_error" not in d2
 
+    def test_thinking_blocks_echoed_back_in_llm_dict(self):
+        """Reasoning models require prior `thinking` blocks — signature
+        included — to be sent back verbatim, or the next request 400s.
+        ``to_llm_dict`` must carry them so litellm's Anthropic transform
+        re-emits them as content blocks."""
+        tb = [{"type": "thinking", "thinking": "weighing options", "signature": "SIG-XYZ"}]
+        m = Message(seq=0, role="assistant", content="answer", thinking_blocks=tb)
+        d = m.to_llm_dict()
+        assert d["thinking_blocks"] == tb
+        # Also present when the turn made tool calls.
+        m_tc = Message(seq=1, role="assistant", content="", tool_calls=SAMPLE_TOOL_CALLS, thinking_blocks=tb)
+        assert m_tc.to_llm_dict()["thinking_blocks"] == tb
+        # Absent for non-reasoning turns — no empty key.
+        assert "thinking_blocks" not in Message(seq=2, role="assistant", content="hi").to_llm_dict()
+
+    def test_thinking_blocks_survive_storage_roundtrip(self):
+        """thinking_blocks must persist so they are echoed back even after a
+        session reload — display state and API state both keep them."""
+        tb = [{"type": "thinking", "thinking": "step one", "signature": "SIG-1"}]
+        m = Message(seq=7, role="assistant", content="ok", thinking_blocks=tb)
+        restored = Message.from_storage_dict(m.to_storage_dict())
+        assert restored.thinking_blocks == tb
+        # Omitted when absent.
+        assert "thinking_blocks" not in Message(seq=8, role="assistant", content="x").to_storage_dict()
+
 
 # ===================================================================
 # NodeConversation (in-memory)
@@ -196,6 +221,33 @@ class TestNodeConversation:
 
         conv.update_token_count(500)
         assert conv.estimate_tokens() == 500  # actual API value
+
+    @pytest.mark.asyncio
+    async def test_update_token_count_reflects_last_call_not_sum(self):
+        """Repeated updates store the latest call's input size, not a sum.
+
+        Regression for the unit-mismatch bug where the per-iteration caller
+        was passing token_counts["input"] (a cumulative billing sum across
+        all inner LLM calls in a turn). That made usage_ratio compare a
+        billing aggregate against max_context_tokens (a single-prompt
+        budget), producing fictional 1000%+ ratios. update_token_count is
+        single-call by contract; subsequent calls replace, never sum.
+        """
+        conv = NodeConversation(max_context_tokens=180_000)
+
+        conv.update_token_count(40_000)
+        assert conv.estimate_tokens() == 40_000
+        assert conv.usage_ratio() < 1.0
+
+        # Simulate the next inner LLM call returning a slightly larger prompt
+        conv.update_token_count(50_000)
+        assert conv.estimate_tokens() == 50_000  # NOT 40_000 + 50_000
+
+        # And many more calls — the value tracks the LAST one, not the sum
+        for size in (60_000, 70_000, 80_000, 90_000):
+            conv.update_token_count(size)
+        assert conv.estimate_tokens() == 90_000  # NOT 40 + 50 + 60 + 70 + 80 + 90 = 390k
+        assert conv.usage_ratio() == 90_000 / 180_000
 
     @pytest.mark.asyncio
     async def test_compact_resets_token_count(self):
@@ -428,6 +480,94 @@ class TestNodeConversation:
         assert conv.next_seq == 4
 
     @pytest.mark.asyncio
+    async def test_compact_preserves_client_input_messages(self):
+        """Real client input survives compaction verbatim, not via LLM paraphrase."""
+        conv = NodeConversation()
+        await conv.add_user_message("original task: chart ISRG", is_client_input=True)
+        await conv.add_assistant_message("starting work")
+        await conv.add_user_message("[system nudge — continue]")  # not client input
+        await conv.add_assistant_message("continuing")
+        await conv.add_user_message("also check OSCR", is_client_input=True)
+        await conv.add_assistant_message("acknowledged")
+        await conv.add_assistant_message("most recent")
+
+        await conv.compact("LLM summary text", keep_recent=1)
+
+        # Live order: [client_input_1, client_input_2, summary, recent]
+        roles = [m.role for m in conv.messages]
+        contents = [m.content for m in conv.messages]
+        assert roles == ["user", "user", "user", "assistant"]
+        assert contents[0] == "original task: chart ISRG"
+        assert contents[1] == "also check OSCR"
+        assert contents[2] == "LLM summary text"
+        assert contents[3] == "most recent"
+        # System nudge (is_client_input=False) was discarded.
+        assert all("[system nudge" not in c for c in contents)
+
+    @pytest.mark.asyncio
+    async def test_compact_client_input_preserved_across_chained_compactions(self):
+        """Successive compactions keep the original prompt without unbounded growth."""
+        conv = NodeConversation()
+        await conv.add_user_message("ORIGINAL", is_client_input=True)
+        for i in range(6):
+            await conv.add_assistant_message(f"work {i}")
+
+        await conv.compact("first summary", keep_recent=1)
+        # After 1st pass: [client_input, summary, recent]
+        assert [m.content for m in conv.messages] == ["ORIGINAL", "first summary", "work 5"]
+
+        # Add more activity, then compact again
+        for i in range(6):
+            await conv.add_assistant_message(f"more {i}")
+        await conv.compact("second summary", keep_recent=1)
+
+        # The first summary (which is role=user but is_client_input=False) must NOT
+        # be re-preserved; only the original client input should survive.
+        contents = [m.content for m in conv.messages]
+        assert contents.count("first summary") == 0
+        assert contents == ["ORIGINAL", "second summary", "more 5"]
+
+    @pytest.mark.asyncio
+    async def test_compact_client_input_collision_at_boundary(self):
+        """If the last old message is itself client input, it merges into the summary."""
+        conv = NodeConversation()
+        await conv.add_user_message("first prompt", is_client_input=True)
+        await conv.add_assistant_message("response")
+        # This client input sits at the split boundary (its seq == summary_seq)
+        await conv.add_user_message("boundary prompt", is_client_input=True)
+        await conv.add_assistant_message("most recent")
+
+        await conv.compact("SUMMARY", keep_recent=1)
+
+        # The boundary client input got absorbed into the summary slot,
+        # so only the first prompt survives as a standalone preserved message.
+        contents = [m.content for m in conv.messages]
+        assert contents == ["first prompt", "SUMMARY", "most recent"]
+
+    @pytest.mark.asyncio
+    async def test_compact_client_input_persisted_to_store(self):
+        """Preserved client inputs survive a cold restore from disk."""
+        store = MockConversationStore()
+        conv = NodeConversation(store=store)
+        await conv.add_user_message("keep me", is_client_input=True)
+        await conv.add_assistant_message("work 1")
+        await conv.add_assistant_message("work 2")
+        await conv.add_assistant_message("work 3")
+        await conv.add_assistant_message("most recent")
+
+        await conv.compact("summary", keep_recent=1)
+
+        # Verify in-memory state
+        assert [m.content for m in conv.messages] == ["keep me", "summary", "most recent"]
+
+        # Verify store reflects the same order (parts are read sorted by seq).
+        parts = await store.read_parts()
+        roles_in_store = [p["role"] for p in parts]
+        contents_in_store = [p["content"] for p in parts]
+        assert contents_in_store == ["keep me", "summary", "most recent"]
+        assert roles_in_store == ["user", "user", "assistant"]
+
+    @pytest.mark.asyncio
     async def test_clear(self):
         """Clear removes messages, keeps system prompt, preserves next_seq."""
         conv = NodeConversation(system_prompt="keep me")
@@ -503,9 +643,7 @@ class TestExtractProtectedValues:
     @pytest.mark.asyncio
     async def test_extract_embedded_json(self):
         conv = NodeConversation(output_keys=["lead_score"])
-        await conv.add_assistant_message(
-            'Based on my analysis, here are the results: {"lead_score": 87, "status": "hot"}'
-        )
+        await conv.add_assistant_message('Based on my analysis, here are the results: {"lead_score": 87, "status": "hot"}')
         assert conv._extract_protected_values(conv.messages) == {"lead_score": "87"}
 
     @pytest.mark.asyncio
@@ -1141,227 +1279,6 @@ def _make_tool_call(call_id: str, name: str, args: dict) -> dict:
     }
 
 
-async def _build_tool_heavy_conversation(
-    store: MockConversationStore | None = None,
-) -> NodeConversation:
-    """Build a conversation with many tool call pairs.
-
-    Layout: user msg, then 5x (assistant with append_data tool_call + tool result),
-    then 1x (assistant with set_output tool_call + tool result), then user msg + assistant msg.
-    """
-    conv = NodeConversation(store=store)
-    await conv.add_user_message("Process the data")  # seq 0
-
-    for i in range(5):
-        args = {"filename": "output.html", "content": "x" * 500}
-        tc = [_make_tool_call(f"call_{i}", "append_data", args)]
-        conv._messages.append(
-            Message(
-                seq=conv._next_seq,
-                role="assistant",
-                content=f"Appending part {i}",
-                tool_calls=tc,
-            )
-        )
-        if store:
-            await store.write_part(conv._next_seq, conv._messages[-1].to_storage_dict())
-        conv._next_seq += 1
-        conv._messages.append(
-            Message(
-                seq=conv._next_seq,
-                role="tool",
-                content='{"success": true}',
-                tool_use_id=f"call_{i}",
-            )
-        )
-        if store:
-            await store.write_part(conv._next_seq, conv._messages[-1].to_storage_dict())
-        conv._next_seq += 1
-
-    # set_output call — must be protected
-    so_tc = [_make_tool_call("call_so", "set_output", {"key": "result", "value": "done"})]
-    conv._messages.append(Message(seq=conv._next_seq, role="assistant", content="Setting output", tool_calls=so_tc))
-    if store:
-        await store.write_part(conv._next_seq, conv._messages[-1].to_storage_dict())
-    conv._next_seq += 1
-    conv._messages.append(
-        Message(
-            seq=conv._next_seq,
-            role="tool",
-            content="Output 'result' set successfully.",
-            tool_use_id="call_so",
-        )
-    )
-    if store:
-        await store.write_part(conv._next_seq, conv._messages[-1].to_storage_dict())
-    conv._next_seq += 1
-
-    # Recent messages
-    await conv.add_user_message("Continue")
-    await conv.add_assistant_message("Working on it")
-    return conv
-
-
-# ---------------------------------------------------------------------------
-# Tests: aggressive structural compaction
-# ---------------------------------------------------------------------------
-
-
-class TestAggressiveStructuralCompaction:
-    @pytest.mark.asyncio
-    async def test_aggressive_collapses_tool_pairs(self, tmp_path):
-        """Aggressive mode should collapse non-essential tool pairs into a summary."""
-        conv = await _build_tool_heavy_conversation()
-        spill = str(tmp_path)
-
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=True,
-        )
-
-        # The 5 append_data pairs (10 msgs) + 1 user msg should be collapsed.
-        # Remaining: ref_msg + set_output pair (2 msgs) + 2 recent = 5
-        assert conv.message_count == 5
-        assert conv.messages[0].role == "user"  # ref message
-        assert "TOOLS ALREADY CALLED" in conv.messages[0].content
-        assert "append_data (5x)" in conv.messages[0].content
-
-        # set_output pair should be preserved
-        assert conv.messages[1].role == "assistant"
-        assert conv.messages[1].tool_calls is not None
-        assert conv.messages[1].tool_calls[0]["function"]["name"] == "set_output"
-        assert conv.messages[2].role == "tool"
-
-        # Recent messages intact
-        assert conv.messages[3].content == "Continue"
-        assert conv.messages[4].content == "Working on it"
-
-    @pytest.mark.asyncio
-    async def test_aggressive_preserves_set_output(self, tmp_path):
-        """set_output tool calls are always protected in aggressive mode."""
-        conv = await _build_tool_heavy_conversation()
-        spill = str(tmp_path)
-
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=True,
-        )
-
-        # Find all tool calls in remaining messages
-        tool_names = []
-        for msg in conv.messages:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_names.append(tc["function"]["name"])
-
-        assert "set_output" in tool_names
-        # append_data should NOT be in remaining messages (collapsed)
-        assert "append_data" not in tool_names
-
-    @pytest.mark.asyncio
-    async def test_aggressive_preserves_errors(self, tmp_path):
-        """Error tool results are always protected in aggressive mode."""
-        conv = NodeConversation()
-        await conv.add_user_message("Start")
-
-        # Regular tool call
-        tc1 = [_make_tool_call("call_ok", "web_search", {"query": "test"})]
-        conv._messages.append(Message(seq=conv._next_seq, role="assistant", content="", tool_calls=tc1))
-        conv._next_seq += 1
-        conv._messages.append(Message(seq=conv._next_seq, role="tool", content="results", tool_use_id="call_ok"))
-        conv._next_seq += 1
-
-        # Error tool call
-        tc2 = [_make_tool_call("call_err", "web_scrape", {"url": "http://broken.com"})]
-        conv._messages.append(Message(seq=conv._next_seq, role="assistant", content="", tool_calls=tc2))
-        conv._next_seq += 1
-        conv._messages.append(
-            Message(
-                seq=conv._next_seq,
-                role="tool",
-                content="Connection timeout",
-                tool_use_id="call_err",
-                is_error=True,
-            )
-        )
-        conv._next_seq += 1
-
-        await conv.add_user_message("Next")
-        await conv.add_assistant_message("OK")
-
-        spill = str(tmp_path)
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=True,
-        )
-
-        # Error pair should be preserved
-        error_msgs = [m for m in conv.messages if m.role == "tool" and m.is_error]
-        assert len(error_msgs) == 1
-        assert error_msgs[0].content == "Connection timeout"
-
-    @pytest.mark.asyncio
-    async def test_standard_mode_keeps_all_tool_pairs(self, tmp_path):
-        """Non-aggressive mode should keep all tool pairs (existing behavior)."""
-        conv = await _build_tool_heavy_conversation()
-        spill = str(tmp_path)
-
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=False,
-        )
-
-        # All 6 tool pairs (12 msgs) should be kept as structural.
-        # Removed: 1 user msg (freeform). Remaining: ref + 12 structural + 2 recent = 15
-        assert conv.message_count == 15
-
-    @pytest.mark.asyncio
-    async def test_two_pass_sequence(self, tmp_path):
-        """Standard pass then aggressive pass produces valid result."""
-        conv = await _build_tool_heavy_conversation()
-        spill = str(tmp_path)
-
-        # Pass 1: standard
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-        )
-        after_standard = conv.message_count
-        assert after_standard == 15  # all structural kept
-
-        # Pass 2: aggressive
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=True,
-        )
-        after_aggressive = conv.message_count
-        assert after_aggressive < after_standard
-        # ref + set_output pair + 2 recent = 5
-        assert after_aggressive == 5
-
-    @pytest.mark.asyncio
-    async def test_aggressive_persists_correctly(self, tmp_path):
-        """Aggressive compaction correctly updates the store."""
-        store = MockConversationStore()
-        conv = await _build_tool_heavy_conversation(store=store)
-        spill = str(tmp_path)
-
-        await conv.compact_preserving_structure(
-            spillover_dir=spill,
-            keep_recent=2,
-            aggressive=True,
-        )
-
-        # Verify store state matches in-memory state
-        parts = await store.read_parts()
-        assert len(parts) == conv.message_count
-
-
 class TestExtractToolCallHistory:
     def test_basic_extraction(self):
         msgs = [
@@ -1379,16 +1296,14 @@ class TestExtractToolCallHistory:
                 role="assistant",
                 content="",
                 tool_calls=[
-                    _make_tool_call("c2", "read_file", {"path": "/tmp/output.txt"}),
+                    _make_tool_call("c2", "terminal_exec", {"command": "cat /tmp/output.txt"}),
                 ],
             ),
             Message(seq=3, role="tool", content="contents", tool_use_id="c2"),
         ]
         result = extract_tool_call_history(msgs)
         assert "web_search (1x)" in result
-        assert "read_file (1x)" in result
-        # read_file paths are tracked under FILES SAVED in production
-        assert "FILES SAVED: /tmp/output.txt" in result
+        assert "terminal_exec (1x)" in result
 
     def test_errors_included(self):
         msgs = [
@@ -1716,6 +1631,76 @@ class TestRepairOrphanedToolCalls:
         assert roles == ["user", "assistant", "tool", "user"]
         assert repaired[2]["tool_call_id"] == "tc_2"
 
+    def test_interleaved_user_messages_hoist_real_result(self):
+        """Async user injections between a tool_call and its result must not
+        mask the real result with an 'interrupted' stub (worker-report bug)."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "Hollinden in.",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "tracker_sql", "arguments": "{}"}}
+                ],
+            },
+            {"role": "user", "content": "[WORKER_REPORT] Hubcap"},
+            {"role": "user", "content": "[WORKER_REPORT] Hivehouse"},
+            {"role": "tool", "tool_call_id": "tc_1", "content": '{"success": true}'},
+        ]
+        repaired = NodeConversation._repair_orphaned_tool_calls(msgs)
+        roles = [m["role"] for m in repaired]
+        assert roles == ["assistant", "tool", "user", "user"]
+        # The real result was hoisted, not replaced by a synthetic error.
+        assert repaired[1]["tool_call_id"] == "tc_1"
+        assert repaired[1]["content"] == '{"success": true}'
+        assert not any("interrupted" in str(m.get("content", "")).lower() for m in repaired)
+
+    def test_injection_splitting_multiple_results(self):
+        """Injection lands between results of the same assistant block."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "a", "arguments": "{}"}},
+                    {"id": "tc_2", "function": {"name": "b", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "r1"},
+            {"role": "user", "content": "[WORKER_REPORT]"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "r2"},
+        ]
+        repaired = NodeConversation._repair_orphaned_tool_calls(msgs)
+        roles = [m["role"] for m in repaired]
+        assert roles == ["assistant", "tool", "tool", "user"]
+        assert repaired[1]["content"] == "r1"
+        assert repaired[2]["content"] == "r2"
+
+    def test_hoist_across_later_assistant_block(self):
+        """A displaced result found after a later assistant block is hoisted
+        to its own tool_call; the later block still pairs normally."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "function": {"name": "a", "arguments": "{}"}}],
+            },
+            {"role": "user", "content": "injected"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_2", "function": {"name": "b", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "r1"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "r2"},
+        ]
+        repaired = NodeConversation._repair_orphaned_tool_calls(msgs)
+        roles = [m["role"] for m in repaired]
+        assert roles == ["assistant", "tool", "user", "assistant", "tool"]
+        assert repaired[1]["tool_call_id"] == "tc_1"
+        assert repaired[1]["content"] == "r1"
+        assert repaired[4]["tool_call_id"] == "tc_2"
+        assert repaired[4]["content"] == "r2"
+
 
 # ===================================================================
 # Continue-nudge + replay-detector helpers (DS-14)
@@ -1788,6 +1773,86 @@ class TestFindCompletedToolCall:
         assert conv.find_completed_tool_call("browser_setup", {}, within_last_turns=10) is not None
 
 
+class TestCountConsecutiveCompletedToolCalls:
+    def test_returns_zero_when_no_prior(self):
+        conv = NodeConversation(system_prompt="s")
+        conv._messages = [Message(seq=0, role="user", content="go")]
+        assert conv.count_consecutive_completed_tool_calls("get_time", {}) == 0
+
+    def test_counts_three_consecutive_matching_turns(self):
+        conv = NodeConversation(system_prompt="s")
+        msgs: list[Message] = [Message(seq=0, role="user", content="go")]
+        for i in range(3):
+            tc_id = f"tc_{i}"
+            msgs.append(_mk_assistant_with_tool_call(1 + i * 2, tc_id, "get_time", {"tz": "UTC"}))
+            msgs.append(Message(seq=2 + i * 2, role="tool", content="ok", tool_use_id=tc_id))
+        conv._messages = msgs
+        assert conv.count_consecutive_completed_tool_calls("get_time", {"tz": "UTC"}) == 3
+
+    def test_non_matching_turn_breaks_streak(self):
+        conv = NodeConversation(system_prompt="s")
+        # 2 matching turns, then 1 turn with a different tool, then 1 matching.
+        # Walking back from end, the latest turn matches, the one before is
+        # "other" → streak breaks at 1.
+        conv._messages = [
+            Message(seq=0, role="user", content="go"),
+            _mk_assistant_with_tool_call(1, "tc_a", "get_time", {"tz": "UTC"}),
+            Message(seq=2, role="tool", content="ok", tool_use_id="tc_a"),
+            _mk_assistant_with_tool_call(3, "tc_b", "get_time", {"tz": "UTC"}),
+            Message(seq=4, role="tool", content="ok", tool_use_id="tc_b"),
+            _mk_assistant_with_tool_call(5, "tc_c", "other_tool", {}),
+            Message(seq=6, role="tool", content="ok", tool_use_id="tc_c"),
+            _mk_assistant_with_tool_call(7, "tc_d", "get_time", {"tz": "UTC"}),
+            Message(seq=8, role="tool", content="ok", tool_use_id="tc_d"),
+        ]
+        assert conv.count_consecutive_completed_tool_calls("get_time", {"tz": "UTC"}) == 1
+
+    def test_error_result_does_not_count(self):
+        conv = NodeConversation(system_prompt="s")
+        conv._messages = [
+            Message(seq=0, role="user", content="go"),
+            _mk_assistant_with_tool_call(1, "tc_a", "get_time", {}),
+            Message(seq=2, role="tool", content="boom", tool_use_id="tc_a", is_error=True),
+        ]
+        assert conv.count_consecutive_completed_tool_calls("get_time", {}) == 0
+
+    def test_canonicalises_args(self):
+        conv = NodeConversation(system_prompt="s")
+        conv._messages = [
+            Message(seq=0, role="user", content="go"),
+            _mk_assistant_with_tool_call(1, "tc_a", "fetch", {"b": 2, "a": 1}),
+            Message(seq=2, role="tool", content="ok", tool_use_id="tc_a"),
+        ]
+        assert conv.count_consecutive_completed_tool_calls("fetch", {"a": 1, "b": 2}) == 1
+        assert conv.count_consecutive_completed_tool_calls("fetch", {"a": 1, "b": 3}) == 0
+
+    def test_text_only_turn_breaks_streak(self):
+        conv = NodeConversation(system_prompt="s")
+        # 2 matching turns then a text-only turn (no tool_calls) — streak resets.
+        conv._messages = [
+            Message(seq=0, role="user", content="go"),
+            _mk_assistant_with_tool_call(1, "tc_a", "get_time", {}),
+            Message(seq=2, role="tool", content="ok", tool_use_id="tc_a"),
+            _mk_assistant_with_tool_call(3, "tc_b", "get_time", {}),
+            Message(seq=4, role="tool", content="ok", tool_use_id="tc_b"),
+            Message(seq=5, role="assistant", content="just thinking"),
+        ]
+        assert conv.count_consecutive_completed_tool_calls("get_time", {}) == 0
+
+    def test_respects_within_last_turns_window(self):
+        conv = NodeConversation(system_prompt="s")
+        msgs: list[Message] = [Message(seq=0, role="user", content="go")]
+        for i in range(5):
+            tc_id = f"tc_{i}"
+            msgs.append(_mk_assistant_with_tool_call(1 + i * 2, tc_id, "get_time", {}))
+            msgs.append(Message(seq=2 + i * 2, role="tool", content="ok", tool_use_id=tc_id))
+        conv._messages = msgs
+        # Window=3 caps the count at 3 even though 5 matching turns exist.
+        assert conv.count_consecutive_completed_tool_calls("get_time", {}, within_last_turns=3) == 3
+        # Window=10 sees all 5.
+        assert conv.count_consecutive_completed_tool_calls("get_time", {}, within_last_turns=10) == 5
+
+
 class TestPartialCheckpoint:
     @pytest.mark.asyncio
     async def test_checkpoint_is_cleared_when_real_part_lands(self, tmp_path):
@@ -1850,14 +1915,269 @@ class TestPartialCheckpoint:
         assert await store.read_all_partials() == []
 
 
+class TestProactiveMicrocompact:
+    """``add_tool_result`` triggers ``microcompact`` when the new result
+    pushes the conversation past ``MICROCOMPACT_KEEP_RECENT`` compactable
+    tool results in flight. Compactable tools are those in
+    ``COMPACTABLE_TOOLS`` (terminal_exec, terminal_rg, browser_*, etc.) —
+    their results are re-derivable from their tool name + args, so
+    clearing older ones early is a free win.
+    """
+
+    @pytest.mark.asyncio
+    async def test_over_keep_recent_clears_oldest_recoverably(self) -> None:
+        from framework.agent_loop.internals.compaction import MICROCOMPACT_KEEP_RECENT
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+
+        # Seed KEEP_RECENT + 2 terminal_exec results, each with a recorded
+        # spillover_path. Once the count exceeds MICROCOMPACT_KEEP_RECENT the
+        # oldest are cleared to RECOVERABLE placeholders (cite the spill path),
+        # leaving the most recent KEEP_RECENT intact.
+        n = MICROCOMPACT_KEEP_RECENT + 2
+        for i in range(n):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "terminal_exec", "arguments": '{"command": "cat /tmp/x"}'},
+                    }
+                ],
+            )
+            big_payload = f"file_{i}_contents: " + ("x" * 200)
+            await conv.add_tool_result(
+                tool_use_id=f"call_{i}",
+                content=big_payload,
+                spillover_path=f"/tmp/data/terminal_exec_{i}.txt",
+            )
+
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        assert len(tool_msgs) == n
+
+        cleared = tool_msgs[: n - MICROCOMPACT_KEEP_RECENT]
+        kept = tool_msgs[n - MICROCOMPACT_KEEP_RECENT :]
+        for m in cleared:
+            assert m.content.startswith("Old tool result"), f"oldest should be cleared, got {m.content[:80]!r}"
+            assert "terminal_rg" in m.content and "/tmp/data/terminal_exec_" in m.content, (
+                f"cleared placeholder must cite a recovery path, got {m.content!r}")
+        for m in kept:
+            assert m.content.startswith("file_"), f"recent result should be intact, got {m.content[:80]!r}"
+
+    @pytest.mark.asyncio
+    async def test_pathless_results_are_never_cleared(self) -> None:
+        """Recoverability invariant: a compactable result with NO spill path
+        (and no path in its text) is left INTACT rather than stranded as an
+        unrecoverable placeholder — the cause of the re-read loop."""
+        from framework.agent_loop.internals.compaction import MICROCOMPACT_KEEP_RECENT
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        for i in range(MICROCOMPACT_KEEP_RECENT + 4):  # well over the keep count
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "terminal_exec", "arguments": "{}"},
+                    }
+                ],
+            )
+            # No spillover_path, and no 'saved at:'/'Full result at:' in the text.
+            await conv.add_tool_result(tool_use_id=f"call_{i}", content=f"result_{i} " + ("y" * 200))
+
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        for m in tool_msgs:
+            assert not m.content.startswith("Old tool result"), (
+                f"path-less result must not be cleared, got {m.content[:80]!r}")
+            assert m.content.startswith("result_")
+
+    @pytest.mark.asyncio
+    async def test_batch_within_keep_recent_all_survive(self) -> None:
+        """A batch no larger than KEEP_RECENT survives intact (the fix for a
+        batch of read queries losing entries mid-reasoning)."""
+        from framework.agent_loop.internals.compaction import MICROCOMPACT_KEEP_RECENT
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        for i in range(MICROCOMPACT_KEEP_RECENT):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[{"id": f"c{i}", "type": "function",
+                             "function": {"name": "terminal_exec", "arguments": "{}"}}],
+            )
+            await conv.add_tool_result(tool_use_id=f"c{i}", content="z" * 200,
+                                       spillover_path=f"/d/e_{i}.txt")
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        assert all(not m.content.startswith("Old tool result") for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_metadata_spillover_path_preferred_over_text(self) -> None:
+        """When a cleared result has a spillover_path AND no path in its text,
+        the placeholder cites the metadata path."""
+        from framework.agent_loop.internals.compaction import MICROCOMPACT_KEEP_RECENT
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        for i in range(MICROCOMPACT_KEEP_RECENT + 1):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[{"id": f"c{i}", "type": "function",
+                             "function": {"name": "terminal_exec", "arguments": "{}"}}],
+            )
+            await conv.add_tool_result(tool_use_id=f"c{i}", content=f"payload_{i} " + ("x" * 200),
+                                       spillover_path=f"/session/data/terminal_exec_{i}.txt")
+        oldest = [m for m in conv.messages if m.role == "tool"][0]
+        assert oldest.content.startswith("Old tool result")
+        assert "/session/data/terminal_exec_0.txt" in oldest.content
+
+    @pytest.mark.asyncio
+    async def test_non_compactable_tool_does_not_trigger(self) -> None:
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        # Use a tool name NOT in COMPACTABLE_TOOLS — set_output, write_file
+        # are explicit-side-effect tools. set_output is in the allowlist;
+        # use a custom name that isn't on the allowlist.
+        for i in range(8):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "my_custom_irreversible_tool", "arguments": "{}"},
+                    }
+                ],
+            )
+            await conv.add_tool_result(tool_use_id=f"call_{i}", content="x" * 200)
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        assert len(tool_msgs) == 8
+        for m in tool_msgs:
+            assert not m.content.startswith("Old tool result")
+
+    @pytest.mark.asyncio
+    async def test_error_results_skip_microcompact(self) -> None:
+        # Error tool results never get microcompacted. Seed 5 errors then
+        # confirm none were cleared.
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        for i in range(5):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "terminal_exec", "arguments": "{}"},
+                    }
+                ],
+            )
+            await conv.add_tool_result(tool_use_id=f"call_{i}", content="ERR " * 50, is_error=True)
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        for m in tool_msgs:
+            assert m.is_error
+            assert not m.content.startswith("Old tool result")
+
+
+class TestSpilloverPathExtraction:
+    """``_extract_spillover_filename_inline`` parses spillover paths from
+    three placeholder formats:
+      * NEW    — "Old tool result (44,754 chars) at /tmp/.../web_scrape_1.txt."
+        (emitted by post-density-refactor microcompact + truncate_tool_result)
+      * MID    — "...Full data saved at: /tmp/.../web_scrape_1.txt"
+        (emitted by the previous prose form; appears in long-lived
+        conversations resumed from disk)
+      * LEGACY — "[Saved to '/tmp/.../web_scrape_1.txt']"
+        (bracketed trailer the framework moved off of in 2026-04;
+        still appears in cold-loaded conversations)
+    """
+
+    def test_new_format_at_path(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            _extract_spillover_filename_inline,
+        )
+
+        content = (
+            "Old tool result (44,754 chars) at /tmp/data/web_scrape_1.txt. Use terminal_rg with a pattern against this path to recover specifics."
+        )
+        assert _extract_spillover_filename_inline(content) == "/tmp/data/web_scrape_1.txt"
+
+    def test_mid_saved_at_form(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            _extract_spillover_filename_inline,
+        )
+
+        content = (
+            "Old tool result (44,754 chars) cleared from context. "
+            "Full data saved at: /tmp/data/web_scrape_1.txt\n"
+            "Read the complete data with read_file(path='/tmp/data/web_scrape_1.txt')."
+        )
+        # New regex catches the NEW form pattern first ("chars) at /path"
+        # — there's no "chars) at" here, so it falls through to the
+        # legacy "saved at:" branch.
+        assert _extract_spillover_filename_inline(content) == "/tmp/data/web_scrape_1.txt"
+
+    def test_legacy_bracketed_saved_to(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            _extract_spillover_filename_inline,
+        )
+
+        content = "Some prose. [Saved to '/tmp/data/web_scrape_1.txt']"
+        assert _extract_spillover_filename_inline(content) == "/tmp/data/web_scrape_1.txt"
+
+    def test_no_spillover_returns_none(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            _extract_spillover_filename_inline,
+        )
+
+        assert _extract_spillover_filename_inline("a small tool result") is None
+        assert _extract_spillover_filename_inline("Old tool result (44,754 chars) cleared from context.") is None
+
+
+class TestMicrocompactRecoveryHint:
+    """microcompact's placeholder should steer the agent toward
+    terminal_rg (ripgrep on the spillover path) rather than read_file.
+    Re-reading the full file would hit max_tool_result_chars and force
+    pagination; rg returns only matching lines."""
+
+    @pytest.mark.asyncio
+    async def test_placeholder_recommends_terminal_rg(self) -> None:
+        from framework.agent_loop.internals.compaction import MICROCOMPACT_KEEP_RECENT
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        # Seed enough results to exceed KEEP_RECENT so the oldest is cleared,
+        # with a spillover path embedded in the text (proves text extraction
+        # still works as a fallback).
+        for i in range(MICROCOMPACT_KEEP_RECENT + 2):
+            await conv.add_assistant_message(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "terminal_exec", "arguments": "{}"},
+                    }
+                ],
+            )
+            payload = f"file_{i}_head_content " + ("x" * 200) + f"\nsaved at: /tmp/data/file_{i}.txt"
+            await conv.add_tool_result(tool_use_id=f"call_{i}", content=payload)
+
+        tool_msgs = [m for m in conv.messages if m.role == "tool"]
+        cleared = tool_msgs[0]
+        assert "terminal_rg" in cleared.content, f"Expected terminal_rg recovery hint, got: {cleared.content!r}"
+        assert "read_file" not in cleared.content, f"Should NOT push read_file (it would re-truncate), got: {cleared.content!r}"
+
+
 class TestMessageFlags:
-    def test_is_system_nudge_roundtrip(self):
-        m = Message(seq=0, role="user", content="nudge", is_system_nudge=True)
+    def test_is_system_reminder_roundtrip(self):
+        m = Message(seq=0, role="user", content="reminder", is_system_reminder=True)
         d = m.to_storage_dict()
-        assert d.get("is_system_nudge") is True
+        assert d.get("is_system_reminder") is True
         r = Message.from_storage_dict(d)
-        assert r.is_system_nudge is True
+        assert r.is_system_reminder is True
         assert r.role == "user"
+
+    def test_is_system_reminder_loads_legacy_key(self):
+        """Conversations persisted before the rename used is_system_nudge."""
+        r = Message.from_storage_dict({"seq": 0, "role": "user", "content": "x", "is_system_nudge": True})
+        assert r.is_system_reminder is True
 
     def test_truncated_roundtrip(self):
         m = Message(seq=0, role="assistant", content="half", truncated=True)
@@ -1869,5 +2189,176 @@ class TestMessageFlags:
     def test_defaults_omit_flags_from_storage(self):
         m = Message(seq=0, role="user", content="plain")
         d = m.to_storage_dict()
-        assert "is_system_nudge" not in d
+        assert "is_system_reminder" not in d
         assert "truncated" not in d
+
+
+# ---------------------------------------------------------------------------
+# Defensive truncation guard for oversized user messages.
+#
+# The upload-path size gate (Layer E) prevents huge PDFs from ever landing
+# as a giant user message going forward. But sessions persisted before
+# that gate shipped (or any future bug that bypasses it) could still leave
+# a multi-MB user message in the conversation. Compaction itself would
+# choke trying to summarize it, leaving the loop stuck. The guard runs at
+# the start of every compact() pass.
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateOversizedUserMessages:
+    """``truncate_oversized_user_messages`` clips user messages past
+    :data:`USER_MESSAGE_MAX_CHARS` so compaction can survive historical
+    bloat (e.g. a 2.4 MB calc-textbook text-prepend persisted before
+    Layer E shipped)."""
+
+    def test_small_message_untouched(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        conv._messages.append(Message(seq=0, role="user", content="hello", is_client_input=True))
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 0
+        assert conv.messages[0].content == "hello"
+
+    def test_oversized_user_message_clipped(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            USER_MESSAGE_HEAD_CHARS,
+            USER_MESSAGE_MAX_CHARS,
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        head_marker = "USER_TYPED_THIS_PREFIX " * 50  # ~1.2 KB
+        tail_marker = "[Attachments saved to disk]\n- PDF: /path/to/doc.pdf"
+        # Roughly 500 KB of filler in the middle — well past the threshold.
+        oversized = head_marker + ("FILLER" * 100_000) + "\n" + tail_marker
+        assert len(oversized) > USER_MESSAGE_MAX_CHARS
+
+        conv._messages.append(Message(seq=0, role="user", content=oversized, is_client_input=True))
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 1
+        new_content = conv.messages[0].content
+        # Result is small: head + reminder + tail, no filler in between.
+        assert len(new_content) < USER_MESSAGE_MAX_CHARS
+        # Head and tail are preserved verbatim — that's how the agent
+        # retains the original message's intent + the attachments hint.
+        assert new_content.startswith(head_marker[:USER_MESSAGE_HEAD_CHARS])
+        assert new_content.endswith(tail_marker)
+        # The truncation marker is a system-reminder so the LLM treats
+        # it as framework metadata, not user speech.
+        assert "<system-reminder>" in new_content
+        assert "chars truncated" in new_content
+
+    def test_skips_system_reminder_messages(self) -> None:
+        """Framework-injected reminders are not user input — leave them
+        alone even if they grow large (idle nudges, etc. could in theory
+        accumulate)."""
+        from framework.agent_loop.internals.compaction import (
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        huge = "x" * 500_000
+        conv._messages.append(
+            Message(
+                seq=0,
+                role="user",
+                content=huge,
+                is_client_input=False,
+                is_system_reminder=True,
+            )
+        )
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 0
+        assert conv.messages[0].content == huge
+
+    def test_skips_skill_content_messages(self) -> None:
+        from framework.agent_loop.internals.compaction import (
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        huge_skill = "skill body " * 50_000
+        conv._messages.append(
+            Message(
+                seq=0,
+                role="user",
+                content=huge_skill,
+                is_skill_content=True,
+            )
+        )
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 0
+        assert conv.messages[0].content == huge_skill
+
+    def test_skips_non_user_roles(self) -> None:
+        """Tool and assistant messages have their own pruning paths
+        (microcompact, prune_old_tool_results); the user-message guard
+        must not interfere."""
+        from framework.agent_loop.internals.compaction import (
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        huge = "x" * 500_000
+        conv._messages.append(Message(seq=0, role="assistant", content=huge))
+        conv._messages.append(Message(seq=1, role="tool", content=huge, tool_use_id="t1"))
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 0
+        assert conv.messages[0].content == huge
+        assert conv.messages[1].content == huge
+
+    def test_idempotent_on_already_clipped(self) -> None:
+        """Re-running the guard on already-truncated messages must be a
+        no-op — the head + reminder + tail sit well under the threshold."""
+        from framework.agent_loop.internals.compaction import (
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        oversized = "x" * 500_000
+        conv._messages.append(Message(seq=0, role="user", content=oversized, is_client_input=True))
+
+        first = truncate_oversized_user_messages(conv)
+        assert first == 1
+        second = truncate_oversized_user_messages(conv)
+        assert second == 0
+
+    def test_calc_textbook_scenario(self) -> None:
+        """End-to-end repro of the failure mode: two 2.4 MB user messages
+        (identical PDF text-prepends from twice-uploaded calc textbook).
+        Both clipped, conversation total drops by orders of magnitude."""
+        from framework.agent_loop.internals.compaction import (
+            USER_MESSAGE_MAX_CHARS,
+            truncate_oversized_user_messages,
+        )
+
+        conv = NodeConversation(system_prompt="sys", max_context_tokens=10_000)
+        textbook = (
+            "[2026-05-21 16:40 PDT] teach me calculus 1\n\n"
+            "--- Attached file content ---\n"
+            + ("[PDF page N] dense math content " * 50_000)
+            + "\n\n[Attachments saved to disk]\n- PDF: data/attachments/X.pdf"
+        )
+        original_size = len(textbook)
+        conv._messages.append(Message(seq=0, role="user", content=textbook, is_client_input=True))
+        conv._messages.append(Message(seq=1, role="user", content=textbook, is_client_input=True))
+
+        clipped = truncate_oversized_user_messages(conv)
+        assert clipped == 2
+        total_after = sum(len(m.content) for m in conv.messages)
+        # 2 × 2.4 MB → ~16 KB total. Orders of magnitude.
+        assert total_after < USER_MESSAGE_MAX_CHARS, (
+            f"Expected post-truncate total < {USER_MESSAGE_MAX_CHARS}, got {total_after} (orig {original_size * 2})"
+        )
+        for m in conv.messages:
+            # Each retains the typed prompt and the attachments hint.
+            assert "teach me calculus 1" in m.content
+            assert "[Attachments saved to disk]" in m.content

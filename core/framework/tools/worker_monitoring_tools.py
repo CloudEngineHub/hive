@@ -207,9 +207,7 @@ def register_worker_monitoring_tools(
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": (
-                        "The worker's active session ID. Omit or pass 'auto' to auto-discover the most recent session."
-                    ),
+                    "description": ("The worker's active session ID. Omit or pass 'auto' to auto-discover the most recent session."),
                 },
                 "last_n_steps": {
                     "type": "integer",

@@ -1,12 +1,12 @@
 # find predicate reference
 
-The `terminal_find` wrapper exposes name/iname, type, mtime_days, size bounds, max_depth, max_results. For combinations beyond that, drop to `terminal_exec("find ...")`.
+Plain name/glob file lookups go to `terminal_glob`. For predicate queries — mtime, size, type, depth, permissions, or any combination — there is no structured wrapper; drive `find` directly via `terminal_exec("find ...")` using the predicates below.
 
 ## Time predicates
 
 | Need | find predicate |
 |---|---|
-| Modified within N days | `-mtime -N` (wrapper: `mtime_days=N`) |
+| Modified within N days | `-mtime -N` |
 | Modified more than N days ago | `-mtime +N` |
 | Modified exactly N days ago | `-mtime N` |
 | Accessed within N days | `-atime -N` |
@@ -18,8 +18,8 @@ The `terminal_find` wrapper exposes name/iname, type, mtime_days, size bounds, m
 
 | Need | find predicate |
 |---|---|
-| Bigger than N kilobytes | `-size +Nk` (wrapper: `size_kb_min`) |
-| Smaller than N kilobytes | `-size -Nk` (wrapper: `size_kb_max`) |
+| Bigger than N kilobytes | `-size +Nk` |
+| Smaller than N kilobytes | `-size -Nk` |
 | Exactly N kilobytes | `-size Nk` |
 | Bigger than N megabytes | `-size +NM` |
 | Empty files | `-empty` |
@@ -28,9 +28,9 @@ The `terminal_find` wrapper exposes name/iname, type, mtime_days, size bounds, m
 
 | Need | find predicate |
 |---|---|
-| Regular file | `-type f` (wrapper: `type_filter="f"`) |
-| Directory | `-type d` (wrapper: `type_filter="d"`) |
-| Symlink | `-type l` (wrapper: `type_filter="l"`) |
+| Regular file | `-type f` |
+| Directory | `-type d` |
+| Symlink | `-type l` |
 | Block device | `-type b` |
 | Character device | `-type c` |
 | FIFO | `-type p` |

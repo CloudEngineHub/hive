@@ -182,9 +182,7 @@ class TestRealAPITextStreaming:
 
         # Snapshot must accumulate monotonically
         for i in range(1, len(text_deltas)):
-            assert len(text_deltas[i].snapshot) > len(text_deltas[i - 1].snapshot), (
-                f"Snapshot did not grow at index {i}"
-            )
+            assert len(text_deltas[i].snapshot) > len(text_deltas[i - 1].snapshot), f"Snapshot did not grow at index {i}"
 
         # Must end with TextEndEvent then FinishEvent
         text_ends = [e for e in events if isinstance(e, TextEndEvent)]
@@ -273,8 +271,7 @@ class TestRealAPIToolCallStreaming:
                 }
             ],
             system=(
-                "You have access to tools. When the user asks for multiple things, "
-                "call all the needed tools. Always use tools, never guess results."
+                "You have access to tools. When the user asks for multiple things, call all the needed tools. Always use tools, never guess results."
             ),
             tools=[WEATHER_TOOL, SEARCH_TOOL, CALCULATOR_TOOL],
             max_tokens=512,

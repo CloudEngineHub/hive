@@ -243,7 +243,9 @@ class TestEventSerialization:
             "cached_tokens": 0,
             "cache_creation_tokens": 0,
             "cost_usd": 0.0,
+            "credits": None,
             "model": "gpt-4",
+            "thinking_blocks": [],
         }
 
     @pytest.mark.parametrize("cls", ALL_EVENT_CLASSES, ids=lambda c: c.__name__)
@@ -305,13 +307,14 @@ class TestEventEquality:
         assert a != b
 
     def test_hashable(self):
-        e = FinishEvent(stop_reason="stop", model="gpt-4")
-        s = {e}  # should be hashable since frozen
+        # Use an event without mutable (list/dict) default fields.
+        e = TextEndEvent(full_text="hi")
+        s = {e}
         assert e in s
 
     def test_equal_events_same_hash(self):
-        a = FinishEvent(stop_reason="stop", model="gpt-4")
-        b = FinishEvent(stop_reason="stop", model="gpt-4")
+        a = TextEndEvent(full_text="hi")
+        b = TextEndEvent(full_text="hi")
         assert hash(a) == hash(b)
 
     def test_events_with_dict_not_hashable(self):

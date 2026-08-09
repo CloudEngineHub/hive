@@ -1,18 +1,14 @@
 /**
  * REST + types for the task system.
  *
- * Two list types:
- *   colony:{colony_id}            — colony template (queen's spawn plan)
- *   session:{agent_id}:{sess_id}  — per-session working list
- *
- * Each agent operates on its OWN session list via the four task tools;
- * the colony template is queen-owned and read by the UI.
+ * Each session owns exactly one task list, identified by its session_id.
+ * Each agent operates on its OWN session's list via the four task tools.
  */
 
 import { api, ApiError } from "./client";
 
-export type TaskStatus = "pending" | "in_progress" | "completed";
-export type TaskListRole = "template" | "session";
+export type TaskStatus = "pending" | "in_progress" | "completed" | "abandoned" | "archived";
+export type TaskListRole = "session";
 
 export interface TaskRecord {
   id: number;
@@ -28,124 +24,97 @@ export interface TaskRecord {
   updated_at: number;
 }
 
+// Shape mirrors the backend snapshot (routes_tasks.handle_get_task_list):
+// top-level session_id/role/meta/tasks, with meta = TaskListMeta.model_dump().
 export interface TaskListSnapshot {
-  task_list_id: string;
+  session_id: string;
   role: TaskListRole;
   meta: {
-    task_list_id: string;
     role: TaskListRole;
     creator_agent_id: string | null;
+    /** Anchor goal set on the first task_create of this session (in the
+     *  user's terms). Used as the pivot reference point — a future batch
+     *  whose work falls outside this goal is the queen's signal to fork
+     *  via new_session (DM) or new_colony (colony). Surfaced in the UI as
+     *  the panel title and beside each previous session's date label. */
+    goal: string | null;
     created_at: number;
-    last_seen_session_ids: string[];
     schema_version: number;
   } | null;
   tasks: TaskRecord[];
 }
 
-export interface ColonyTaskLists {
-  template_task_list_id: string;
-  queen_session_task_list_id: string | null;
-}
-
-export interface SessionTaskListInfo {
-  task_list_id: string | null;
-  picked_up_from: { colony_id: string; task_id: number } | null;
-}
-
 export const tasksApi = {
   /**
-   * Snapshot of one task list, identified by its full task_list_id.
+   * Snapshot of one session's task list, keyed by the bare session_id.
    *
-   * Returns ``null`` if the list does not exist on disk yet (404). That
-   * happens when a session has just started and no agent has called
-   * ``task_create`` — the panel should hide until the first task is
-   * created instead of surfacing the 404 as an error.
+   * The backend stores tasks per session (``GET /sessions/{id}/tasks``);
+   * there is no composite ``task_list_id`` route. Returns ``null`` if the
+   * list does not exist on disk yet (404) — happens when a session has
+   * just started and no agent has called ``task_create`` — so the panel
+   * hides until the first task is created instead of surfacing an error.
    */
-  async getList(taskListId: string): Promise<TaskListSnapshot | null> {
+  async getList(sessionId: string): Promise<TaskListSnapshot | null> {
     try {
-      return await api.get<TaskListSnapshot>(`/tasks/${encodeURIComponent(taskListId)}`);
+      return await api.get<TaskListSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/tasks`);
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) return null;
       throw err;
     }
   },
-  /** Helper: resolve template + queen-session list ids for a colony. */
-  async getColonyLists(
-    colonyId: string,
-    queenSessionId?: string,
-  ): Promise<ColonyTaskLists> {
-    const qs = queenSessionId ? `?queen_session_id=${encodeURIComponent(queenSessionId)}` : "";
-    return api.get<ColonyTaskLists>(`/colonies/${encodeURIComponent(colonyId)}/task_lists${qs}`);
-  },
-  /** Helper: resolve task_list_id + picked_up_from for a session. */
-  async getSessionInfo(
+
+  /**
+   * Restore archived tasks to their pre-archive status (History "remove").
+   * Each restored task re-enters the live plan and the agent's working set.
+   * Returns the restored ids. The panel also updates via per-task
+   * `task_updated` SSE events.
+   */
+  async unarchive(
     sessionId: string,
-    agentId: string = "queen",
-  ): Promise<SessionTaskListInfo> {
-    return api.get<SessionTaskListInfo>(
-      `/sessions/${encodeURIComponent(sessionId)}/task_list_id?agent_id=${encodeURIComponent(agentId)}`,
+    taskIds: number[],
+  ): Promise<{ session_id: string; restored: number[] }> {
+    return await api.post<{ session_id: string; restored: number[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/tasks/unarchive`,
+      { task_ids: taskIds },
+    );
+  },
+
+  /**
+   * Archive every completed task on the plan (the panel's "Clear done"
+   * button). Finished tasks move out of the active plan into History — the
+   * same non-destructive archive the queen does, restorable from History.
+   * Returns the archived ids. The panel also updates live via per-task
+   * `task_updated` SSE events flipping them to `archived`.
+   */
+  async clearCompleted(
+    sessionId: string,
+  ): Promise<{ session_id: string; archived: number[] }> {
+    return await api.post<{ session_id: string; archived: number[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/tasks/clear-completed`,
+      {},
     );
   },
 };
 
 // ---------------------------------------------------------------------------
-// SSE event payload shapes
+// SSE event payload shapes. The backend (tasks/events.py) keys these on the
+// bare `session_id` — there is no `task_list_id` field on the wire.
 // ---------------------------------------------------------------------------
 
 export interface TaskCreatedEvent {
-  task_list_id: string;
+  session_id: string;
   task: TaskRecord;
 }
 
 export interface TaskUpdatedEvent {
-  task_list_id: string;
+  session_id: string;
   task_id: number;
   after: TaskRecord;
   fields: string[];
 }
 
 export interface TaskDeletedEvent {
-  task_list_id: string;
+  session_id: string;
   task_id: number;
   cascade: number[];
-}
-
-export interface ColonyTemplateAssignmentEvent {
-  colony_id: string;
-  task_id: number;
-  assigned_session: string | null;
-  assigned_worker_id: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Parse a task_list_id into structured parts (mirrors server-side scoping). */
-export function parseTaskListId(taskListId: string): {
-  kind: "colony" | "session" | "raw";
-  colony_id?: string;
-  agent_id?: string;
-  session_id?: string;
-  raw?: string;
-} {
-  if (taskListId.startsWith("colony:")) {
-    return { kind: "colony", colony_id: taskListId.slice("colony:".length) };
-  }
-  if (taskListId.startsWith("session:")) {
-    const rest = taskListId.slice("session:".length);
-    const idx = rest.indexOf(":");
-    return idx > 0
-      ? { kind: "session", agent_id: rest.slice(0, idx), session_id: rest.slice(idx + 1) }
-      : { kind: "raw", raw: taskListId };
-  }
-  return { kind: "raw", raw: taskListId };
-}
-
-export function colonyTaskListId(colonyId: string): string {
-  return `colony:${colonyId}`;
-}
-
-export function sessionTaskListId(agentId: string, sessionId: string): string {
-  return `session:${agentId}:${sessionId}`;
 }

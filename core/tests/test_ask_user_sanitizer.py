@@ -31,10 +31,7 @@ def test_strips_close_question_tag_case_insensitive_with_whitespace() -> None:
 
 
 def test_recovers_inline_uppercase_options() -> None:
-    raw = (
-        "What do you want to do from here?</question>\n"
-        '_OPTIONS: ["De-risk — trim PRLG", "Add to a position", "Open a short"]'
-    )
+    raw = 'What do you want to do from here?</question>\n_OPTIONS: ["De-risk — trim PRLG", "Add to a position", "Open a short"]'
     q, opts = sanitize_ask_user_inputs(raw, None)
     assert q == "What do you want to do from here?"
     assert opts == ["De-risk — trim PRLG", "Add to a position", "Open a short"]

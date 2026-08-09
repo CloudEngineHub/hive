@@ -1,27 +1,18 @@
-"""File-backed task store with filelock-based coordination.
+"""File-backed task store.
 
-Layout per list::
+Layout per session::
 
-    {task_list_path}/tasks.json        -- TaskListDocument (meta + hwm + tasks)
-    {task_list_path}/tasks.json.lock   -- list-level lock sentinel
+    {session_storage_dir}/tasks.json   -- TaskListDocument (meta + hwm + tasks)
 
-Where ``task_list_path`` is:
-
-    colony:{c}        -> ~/.hive/colonies/{c}/
-    session:{a}:{s}   -> ~/.hive/agents/{a}/sessions/{s}/
-    unscoped:{a}      -> ~/.hive/unscoped/{a}/
-    {malformed}       -> ~/.hive/_misc/{slug}/
-
-An older layout used the same root + a nested ``tasks/`` subdir holding
-``meta.json``, ``.highwatermark``, ``.lock``, and ``NNNN.json`` per task.
-That produced the ugly ``…/tasks/tasks/0001.json`` path. Migration is
-lazy — the first lock-protected access on such a list folds the legacy
-artifacts into ``tasks.json`` and unlinks them.
+Where ``session_storage_dir`` is the canonical session folder, located by
+scanning the three known session layouts (queen DM, queen overseer,
+worker) — see ``_find_session_dir``. The task doc lives next to the rest
+of that session's data: conversations, events, summary, meta.
 
 All filesystem I/O is wrapped in ``asyncio.to_thread`` so the event loop
-never blocks. Locks use a ~3s budget — comfortable headroom for the only
-realistic write contender (colony template under concurrent
-``colony_template_*`` and ``run_parallel_workers`` stamps).
+never blocks. Each session has a single owning agent, so writes are
+serialised by an in-process ``threading.Lock`` keyed by session_id — no
+cross-process file lock is needed.
 """
 
 from __future__ import annotations
@@ -29,14 +20,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
-
-from filelock import FileLock
 
 from framework.tasks.models import (
     ClaimAlreadyCompleted,
@@ -47,33 +35,43 @@ from framework.tasks.models import (
     ClaimResult,
     TaskListDocument,
     TaskListMeta,
-    TaskListRole,
     TaskRecord,
     TaskStatus,
+    is_task_idle,
 )
 from framework.utils.io import atomic_write
 
 logger = logging.getLogger(__name__)
 
-LOCK_TIMEOUT_SECONDS = 3.0  # ~30 retries × ~100ms
-
 DOC_FILENAME = "tasks.json"
-LOCK_FILENAME = "tasks.json.lock"  # only colony lists (cross-process writers)
 
-# Per-list in-memory locks for single-process scopes (session/unscoped/_misc).
-# Sessions have one owning agent, so only same-process concurrency matters
-# (e.g. parallel tool use within a single turn) — no on-disk lock needed.
+# Per-session in-memory locks. Each session has one owning agent, so only
+# same-process concurrency matters (e.g. parallel tool use within a single
+# turn) — no on-disk lock needed.
 _INPROC_LOCKS: dict[str, threading.Lock] = {}
 _INPROC_LOCKS_GUARD = threading.Lock()
 
 
-def _get_inproc_lock(task_list_id: str) -> threading.Lock:
+def _get_inproc_lock(session_id: str) -> threading.Lock:
     with _INPROC_LOCKS_GUARD:
-        lock = _INPROC_LOCKS.get(task_list_id)
+        lock = _INPROC_LOCKS.get(session_id)
         if lock is None:
             lock = threading.Lock()
-            _INPROC_LOCKS[task_list_id] = lock
+            _INPROC_LOCKS[session_id] = lock
         return lock
+
+
+# Resolved-session-dir cache: (session_id, hive_root) -> canonical folder.
+# Session folders are created once and never move, so a positive resolution
+# is stable for the process; we still re-validate it exists (one stat) on
+# read so a deleted/relocated session falls back to a fresh scan. NEGATIVE
+# results are deliberately NOT cached — a session dir frequently doesn't
+# exist on disk yet on the first lookup and appears moments later. Without
+# this cache every task-store read (including the per-session idle-nudge
+# poll) re-walks the entire queens/ + colonies/ tree; over a long idle that
+# repeated blocking scan starves the shared thread pool and hangs reads.
+_SESSION_DIR_CACHE: dict[tuple[str, str], Path] = {}
+_SESSION_DIR_CACHE_GUARD = threading.Lock()
 
 
 class _Unset:
@@ -90,84 +88,83 @@ def _hive_root() -> Path:
     return Path(os.environ.get("HIVE_HOME", str(Path.home() / ".hive")))
 
 
-def _find_queen_session_dir(session_id: str, *, hive_root: Path) -> Path | None:
-    """Return ``agents/queens/{queen}/sessions/{session_id}`` if one exists.
+def _find_session_dir(session_id: str, *, hive_root: Path) -> Path | None:
+    """Return the on-disk session folder if one exists, regardless of agent type.
 
-    Queens live under ``QUEENS_DIR = hive_root / "agents" / "queens"`` (see
-    ``framework.config``). The task system gets a generic ``agent_id ==
-    "queen"`` in its ``task_list_id``, which would otherwise dead-end at
-    ``agents/queen/...``, decoupled from the real session folder. By
-    probing the canonical layout we keep the task doc beside conversations,
-    events, summary, and meta for the same session.
+    Three canonical homes — session_id is globally unique (timestamp +
+    UUID), so a cross-layout scan finds exactly one match:
+
+    - Queen DM:       ``queens/<queen>/sessions/<session_id>/``
+    - Queen overseer: ``colonies/<c>/queens/<queen>/sessions/<session_id>/``
+    - Worker:         ``colonies/<c>/workers/<session_id>/``
     """
-    queens_dir = hive_root / "agents" / "queens"
-    if not queens_dir.exists():
-        return None
-    try:
-        candidates = [d for d in queens_dir.iterdir() if d.is_dir()]
-    except OSError:
-        return None
-    for queen_dir in candidates:
-        candidate = queen_dir / "sessions" / session_id
-        if candidate.is_dir():
-            return candidate
+    queens_dir = hive_root / "queens"
+    if queens_dir.exists():
+        try:
+            for queen_root in queens_dir.iterdir():
+                if not queen_root.is_dir():
+                    continue
+                candidate = queen_root / "sessions" / session_id
+                if candidate.is_dir():
+                    return candidate
+        except OSError:
+            pass
+    colonies_dir = hive_root / "colonies"
+    if colonies_dir.exists():
+        try:
+            for colony_root in colonies_dir.iterdir():
+                if not colony_root.is_dir():
+                    continue
+                # Worker session: colonies/<c>/workers/<sid>/
+                candidate = colony_root / "workers" / session_id
+                if candidate.is_dir():
+                    return candidate
+                # Queen overseer session: colonies/<c>/queens/<q>/sessions/<sid>/
+                queens_root = colony_root / "queens"
+                if not queens_root.is_dir():
+                    continue
+                for queen_root in queens_root.iterdir():
+                    if not queen_root.is_dir():
+                        continue
+                    candidate = queen_root / "sessions" / session_id
+                    if candidate.is_dir():
+                        return candidate
+        except OSError:
+            pass
     return None
 
 
-def task_list_path(task_list_id: str, *, hive_root: Path | None = None) -> Path:
-    """Resolve task_list_id -> directory containing ``tasks.json``.
+def session_storage_dir(session_id: str, *, hive_root: Path | None = None) -> Path:
+    """Resolve a session_id to the directory containing its ``tasks.json``.
 
-    Note: this returns the *parent* of the doc file, not the file itself.
-    For session/colony/unscoped lists, this is the agent or colony's home
-    dir; the task doc is one filename inside it. (The older layout had an
-    extra ``tasks/`` subdir under this path — see ``_legacy_root``.)
-
-    For ``session:`` lists, the canonical queen session folder is preferred
-    when it exists on disk: the task doc lives next to the rest of that
-    session's data (conversations, events, summary).
+    Returns the canonical session folder if found by scanning the known
+    layouts; otherwise falls back to ``_misc/<session_id>/`` so callers
+    operating outside the canonical layouts (tests, ad-hoc tools) still
+    get a deterministic, sandboxed path inside hive_root.
     """
+    if not session_id:
+        raise ValueError("session_id must be a non-empty string")
     root = hive_root or _hive_root()
-    if task_list_id.startswith("colony:"):
-        colony_id = task_list_id[len("colony:") :]
-        return root / "colonies" / colony_id
-    if task_list_id.startswith("session:"):
-        rest = task_list_id[len("session:") :]
-        agent_id, _, session_id = rest.partition(":")
-        if not session_id:
-            raise ValueError(f"Malformed session task_list_id: {task_list_id!r}")
-        canonical = _find_queen_session_dir(session_id, hive_root=root)
-        if canonical is not None:
-            return canonical
-        return root / "agents" / agent_id / "sessions" / session_id
-    if task_list_id.startswith("unscoped:"):
-        agent_id = task_list_id[len("unscoped:") :]
-        return root / "unscoped" / agent_id
-    # Last-ditch sanitization for HIVE_TASK_LIST_ID overrides — slugify the
-    # whole thing so the test/dev path can't escape the hive root.
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in task_list_id)
-    return root / "_misc" / safe
-
-
-def _legacy_root(task_list_id: str, *, hive_root: Path | None = None) -> Path:
-    """Where the older artifacts (meta.json, .highwatermark, tasks/NNNN.json) lived.
-
-    Pinned to the *pre-canonical* layout — for queen session lists this is
-    ``agents/{agent_id}/sessions/{session_id}/tasks`` (i.e. the literal
-    ``agent_id`` folder, not the canonical ``agents/queens/{queen}/...``
-    path). The lazy migration reads from here and writes the new doc to
-    wherever ``task_list_path`` resolves now.
-    """
-    root = hive_root or _hive_root()
-    if task_list_id.startswith("colony:"):
-        return root / "colonies" / task_list_id[len("colony:") :] / "tasks"
-    if task_list_id.startswith("session:"):
-        rest = task_list_id[len("session:") :]
-        agent_id, _, session_id = rest.partition(":")
-        return root / "agents" / agent_id / "sessions" / session_id / "tasks"
-    if task_list_id.startswith("unscoped:"):
-        return root / "unscoped" / task_list_id[len("unscoped:") :] / "tasks"
-    # _misc fallback: legacy lived directly in the slug dir, same as the new parent.
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in task_list_id)
+    cache_key = (session_id, str(root))
+    with _SESSION_DIR_CACHE_GUARD:
+        cached = _SESSION_DIR_CACHE.get(cache_key)
+    if cached is not None:
+        if cached.is_dir():
+            return cached
+        # The cached folder vanished (session deleted/relocated) — drop the
+        # stale entry and fall through to a fresh scan.
+        with _SESSION_DIR_CACHE_GUARD:
+            if _SESSION_DIR_CACHE.get(cache_key) == cached:
+                del _SESSION_DIR_CACHE[cache_key]
+    canonical = _find_session_dir(session_id, hive_root=root)
+    if canonical is not None:
+        with _SESSION_DIR_CACHE_GUARD:
+            _SESSION_DIR_CACHE[cache_key] = canonical
+        return canonical
+    # Sandboxed fallback for ids that don't (yet) have a canonical folder
+    # on disk — slugify so a malformed id can't escape hive_root. Not cached:
+    # the canonical folder may appear on a later call.
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)
     return root / "_misc" / safe
 
 
@@ -180,7 +177,8 @@ class TaskStore:
     """Async wrapper around the on-disk store.
 
     A single TaskStore is fine to share across the process; locking is
-    file-based, so even multiple processes are safe.
+    in-memory per session_id, so multi-process is not supported (and not
+    needed — each session is owned by a single process).
     """
 
     def __init__(self, *, hive_root: Path | None = None) -> None:
@@ -190,55 +188,97 @@ class TaskStore:
 
     async def ensure_task_list(
         self,
-        task_list_id: str,
+        session_id: str,
         *,
-        role: TaskListRole,
         creator_agent_id: str | None = None,
-        session_id: str | None = None,
     ) -> TaskListMeta:
-        """Create a list if absent; if present, append session_id to last_seen.
+        """Create the session's task list if absent.
 
         Idempotent: callers (ColonyRuntime bringup, lazy session creation)
         can call this every time.
         """
         return await asyncio.to_thread(
             self._ensure_task_list_sync,
-            task_list_id,
-            role,
-            creator_agent_id,
             session_id,
+            creator_agent_id,
         )
 
-    async def list_exists(self, task_list_id: str) -> bool:
-        """A list exists if its doc is on disk OR a legacy artifact is.
+    async def set_goal(self, session_id: str, goal: str) -> None:
+        """Write ``meta.goal`` without creating any tasks.
 
-        The legacy fallback exists so that lists created under the older
-        layout and not yet migrated still surface to the REST layer.
+        Used by ColonyRuntime at worker spawn to seed the queen-authored
+        goal — the human-readable "what is this worker doing" line the UI
+        shows as the worker's title. Composes with the task_create
+        executor's documented contract: a later task_create that omits
+        ``goal`` keeps this one; one that passes its own overwrites it.
         """
+        await asyncio.to_thread(self._set_goal_sync, session_id, goal)
+
+    def _set_goal_sync(self, session_id: str, goal: str) -> None:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
+            if doc is None:
+                doc = TaskListDocument(meta=TaskListMeta())
+            doc.meta.goal = goal
+            self._write_doc_unsafe(session_id, doc)
+
+    async def list_exists(self, session_id: str) -> bool:
+        """True iff ``tasks.json`` is on disk for this session."""
 
         def _check() -> bool:
-            if self._doc_path(task_list_id).exists():
-                return True
-            return self._has_legacy_artifacts(task_list_id)
+            return self._doc_path(session_id).exists()
 
         return await asyncio.to_thread(_check)
 
-    async def get_meta(self, task_list_id: str) -> TaskListMeta | None:
-        return await asyncio.to_thread(self._read_meta_sync, task_list_id)
+    async def get_meta(self, session_id: str) -> TaskListMeta | None:
+        return await asyncio.to_thread(self._read_meta_sync, session_id)
 
-    async def reset_task_list(self, task_list_id: str) -> None:
+    async def reset_task_list(self, session_id: str) -> None:
         """Delete all tasks but preserve the high-water-mark.
 
         Test helper. Never wired to runtime lifecycle.
         """
-        await asyncio.to_thread(self._reset_sync, task_list_id)
+        await asyncio.to_thread(self._reset_sync, session_id)
+
+    async def archive_completed_tasks(self, session_id: str) -> list[TaskRecord]:
+        """Archive every completed task on the list; return the archived records.
+
+        The user-facing "clean up the plan" action (the panel's "Clear done"
+        button). Mirrors the agent's own ``task_update`` status="archived" for
+        each completed task — stamping the same ``archived_from`` /
+        ``archived_at`` / ``archived_goal`` markers History groups by — so
+        button-archived and agent-archived tasks land in the same History
+        batches. Non-completed and already-archived tasks are left untouched.
+        Emitting ``task_updated`` for each returned record is the caller's job
+        (the store stays event-free — see events.py).
+        """
+        return await asyncio.to_thread(self._archive_completed_sync, session_id)
+
+    async def unarchive_tasks(
+        self, session_id: str, task_ids: list[int]
+    ) -> list[int]:
+        """Restore archived tasks to their pre-archive status; return the
+        restored ids.
+
+        Reverses an archive (the agent's ``task_update`` status="archived",
+        or the History "remove") for the given ids: reads
+        ``metadata.archived_from`` to put each task back where it was
+        (falling back to ``pending`` if that's missing), strips the
+        ``archived_*`` markers, and touches ``updated_at``. Ids not found
+        or not currently archived are skipped.
+        """
+        return await asyncio.to_thread(
+            self._unarchive_sync, session_id, list(task_ids)
+        )
 
     # ----- task CRUD ----------------------------------------------------
 
     async def create_tasks_batch(
         self,
-        task_list_id: str,
+        session_id: str,
         specs: list[dict[str, Any]],
+        *,
+        goal: str | None = None,
     ) -> list[TaskRecord]:
         """Atomically create N tasks under a single list-lock acquisition.
 
@@ -247,12 +287,17 @@ class TaskStore:
         contiguously; if any spec is malformed the whole batch is
         rejected before any write. The doc model makes "atomic-or-none"
         free — we mutate one in-memory document and write it once.
+
+        ``goal`` — when provided, also writes ``meta.goal`` under the same
+        lock. Used by the task-create executor so the anchor goal lands
+        atomically with the first batch (and re-anchors are coherent with
+        the tasks that introduced them).
         """
-        return await asyncio.to_thread(self._create_tasks_batch_sync, task_list_id, specs)
+        return await asyncio.to_thread(self._create_tasks_batch_sync, session_id, specs, goal)
 
     async def create_task(
         self,
-        task_list_id: str,
+        session_id: str,
         *,
         subject: str,
         description: str = "",
@@ -262,7 +307,7 @@ class TaskStore:
     ) -> TaskRecord:
         return await asyncio.to_thread(
             self._create_task_sync,
-            task_list_id,
+            session_id,
             subject,
             description,
             active_form,
@@ -270,23 +315,23 @@ class TaskStore:
             metadata or {},
         )
 
-    async def get_task(self, task_list_id: str, task_id: int) -> TaskRecord | None:
-        return await asyncio.to_thread(self._read_task_sync, task_list_id, task_id)
+    async def get_task(self, session_id: str, task_id: int) -> TaskRecord | None:
+        return await asyncio.to_thread(self._read_task_sync, session_id, task_id)
 
     async def list_tasks(
         self,
-        task_list_id: str,
+        session_id: str,
         *,
         include_internal: bool = False,
     ) -> list[TaskRecord]:
-        records = await asyncio.to_thread(self._list_tasks_sync, task_list_id)
+        records = await asyncio.to_thread(self._list_tasks_sync, session_id)
         if include_internal:
             return records
         return [r for r in records if not r.metadata.get("_internal")]
 
     async def update_task(
         self,
-        task_list_id: str,
+        session_id: str,
         task_id: int,
         *,
         subject: str | None = None,
@@ -301,7 +346,7 @@ class TaskStore:
         """Update a task; returns (new_record, fields_changed) or (None, [])."""
         return await asyncio.to_thread(
             self._update_task_sync,
-            task_list_id,
+            session_id,
             task_id,
             subject,
             description,
@@ -313,275 +358,114 @@ class TaskStore:
             metadata_patch,
         )
 
-    async def delete_task(self, task_list_id: str, task_id: int) -> tuple[bool, list[int]]:
+    async def sweep_idle_tasks(self, session_id: str) -> list[TaskRecord]:
+        """Flip stale `in_progress` tasks to `abandoned` and persist.
+
+        Returns the records that changed (empty if nothing was stale). The
+        caller is responsible for emitting `task_updated` events for each
+        — the store itself stays event-free by design (see events.py).
+
+        Idempotent: a task already in `abandoned` is left alone, and a
+        sweep that finds nothing skips the disk write.
+        """
+        return await asyncio.to_thread(self._sweep_idle_tasks_sync, session_id)
+
+    async def delete_task(self, session_id: str, task_id: int) -> tuple[bool, list[int]]:
         """Delete a task; returns (was_deleted, cascaded_ids).
 
         ``cascaded_ids`` are the ids of other tasks whose blocks/blocked_by
         referenced the deleted id and were stripped.
         """
-        return await asyncio.to_thread(self._delete_task_sync, task_list_id, task_id)
+        return await asyncio.to_thread(self._delete_task_sync, session_id, task_id)
 
     async def claim_task_with_busy_check(
         self,
-        task_list_id: str,
+        session_id: str,
         task_id: int,
         claimant: str,
     ) -> ClaimResult:
         """Atomic claim under list-lock.
 
-        Used internally by ``run_parallel_workers`` when stamping
+        Used internally by ``run_worker`` when stamping
         ``metadata.assigned_session`` on colony template entries — not
         exposed to LLMs as a worker-facing claim race.
         """
-        return await asyncio.to_thread(self._claim_sync, task_list_id, task_id, claimant)
+        return await asyncio.to_thread(self._claim_sync, session_id, task_id, claimant)
 
     # =====================================================================
     # Sync internals — all called via asyncio.to_thread
     # =====================================================================
 
-    def _list_dir(self, task_list_id: str) -> Path:
-        return task_list_path(task_list_id, hive_root=self._hive_root)
+    def _list_dir(self, session_id: str) -> Path:
+        return session_storage_dir(session_id, hive_root=self._hive_root)
 
-    def _doc_path(self, task_list_id: str) -> Path:
-        return self._list_dir(task_list_id) / DOC_FILENAME
+    def _doc_path(self, session_id: str) -> Path:
+        return self._list_dir(session_id) / DOC_FILENAME
 
-    def _list_lock(self, task_list_id: str):
-        """Return a context manager that serialises writes to this list.
+    def _list_lock(self, session_id: str):
+        """Return a context manager that serialises writes to this session's list.
 
-        Colony template lists need a cross-process ``FileLock`` because
-        ``run_parallel_workers`` spawns worker subprocesses that stamp
-        completion back onto the template. Session/unscoped/_misc lists
-        have a single owning agent — only same-process concurrency
-        matters (e.g. parallel tool use within one turn), so an
-        in-memory ``threading.Lock`` is enough and avoids the visible
-        ``tasks.json.lock`` sentinel beside session folders.
+        Each session has a single owning agent, so only same-process
+        concurrency matters (e.g. parallel tool use within one turn) —
+        an in-memory ``threading.Lock`` is enough.
         """
-        d = self._list_dir(task_list_id)
+        d = self._list_dir(session_id)
         d.mkdir(parents=True, exist_ok=True)
-        if task_list_id.startswith("colony:"):
-            return FileLock(str(d / LOCK_FILENAME), timeout=LOCK_TIMEOUT_SECONDS)
-        return _get_inproc_lock(task_list_id)
-
-    def _legacy_dir(self, task_list_id: str) -> Path:
-        return _legacy_root(task_list_id, hive_root=self._hive_root)
-
-    def _legacy_meta_path(self, task_list_id: str) -> Path:
-        return self._legacy_dir(task_list_id) / "meta.json"
-
-    def _legacy_hwm_path(self, task_list_id: str) -> Path:
-        return self._legacy_dir(task_list_id) / ".highwatermark"
-
-    def _legacy_lock_path(self, task_list_id: str) -> Path:
-        return self._legacy_dir(task_list_id) / ".lock"
-
-    def _legacy_tasks_dir(self, task_list_id: str) -> Path:
-        return self._legacy_dir(task_list_id) / "tasks"
-
-    def _has_legacy_artifacts(self, task_list_id: str) -> bool:
-        if self._legacy_meta_path(task_list_id).exists():
-            return True
-        td = self._legacy_tasks_dir(task_list_id)
-        if td.exists():
-            try:
-                return any(p.suffix == ".json" for p in td.iterdir())
-            except OSError:
-                return False
-        return False
+        return _get_inproc_lock(session_id)
 
     # ----- doc IO -------------------------------------------------------
 
-    def _read_doc_sync(self, task_list_id: str) -> TaskListDocument | None:
-        """Lock-free read for already-migrated lists; falls back to a
-        lock-protected migration if only legacy artifacts exist.
-
-        Returns None if the list doesn't exist on disk in either form.
-        """
-        doc_path = self._doc_path(task_list_id)
+    def _read_doc_sync(self, session_id: str) -> TaskListDocument | None:
+        """Lock-free read of the session's task doc, or None if absent."""
+        doc_path = self._doc_path(session_id)
         if doc_path.exists():
             try:
                 return TaskListDocument.model_validate_json(doc_path.read_text(encoding="utf-8"))
             except Exception:
                 logger.warning("Corrupt tasks.json at %s", doc_path, exc_info=True)
-                # Fall through — legacy fallback may rescue us.
-
-        if self._has_legacy_artifacts(task_list_id):
-            with self._list_lock(task_list_id):
-                # Re-check under lock: a parallel writer may have just
-                # finished migrating, in which case we read the new doc.
-                if doc_path.exists():
-                    try:
-                        return TaskListDocument.model_validate_json(doc_path.read_text(encoding="utf-8"))
-                    except Exception:
-                        logger.warning(
-                            "Corrupt tasks.json at %s (post-lock)",
-                            doc_path,
-                            exc_info=True,
-                        )
-                doc = self._migrate_legacy_unsafe(task_list_id)
-                if doc is not None:
-                    self._write_doc_unsafe(task_list_id, doc)
-                    self._cleanup_legacy_unsafe(task_list_id)
-                return doc
         return None
 
-    def _read_doc_unsafe(self, task_list_id: str) -> TaskListDocument | None:
-        """Same as ``_read_doc_sync`` but assumes the list-lock is already
-        held — used by methods that are already inside ``with self._list_lock``.
-        Migration happens in-place without re-entering the lock.
-        """
-        doc_path = self._doc_path(task_list_id)
+    def _read_doc_unsafe(self, session_id: str) -> TaskListDocument | None:
+        """Same as ``_read_doc_sync`` but assumes the list-lock is already held."""
+        doc_path = self._doc_path(session_id)
         if doc_path.exists():
             try:
                 return TaskListDocument.model_validate_json(doc_path.read_text(encoding="utf-8"))
             except Exception:
                 logger.warning("Corrupt tasks.json at %s", doc_path, exc_info=True)
-        if self._has_legacy_artifacts(task_list_id):
-            doc = self._migrate_legacy_unsafe(task_list_id)
-            if doc is not None:
-                self._write_doc_unsafe(task_list_id, doc)
-                self._cleanup_legacy_unsafe(task_list_id)
-                return doc
         return None
 
-    def _write_doc_unsafe(self, task_list_id: str, doc: TaskListDocument) -> None:
+    def _write_doc_unsafe(self, session_id: str, doc: TaskListDocument) -> None:
         """Atomically rewrite the doc. Caller MUST hold the list-lock."""
-        path = self._doc_path(task_list_id)
+        path = self._doc_path(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with atomic_write(path) as f:
             f.write(doc.model_dump_json(indent=2))
-
-    # ----- migration ----------------------------------------------------
-
-    def _migrate_legacy_unsafe(self, task_list_id: str) -> TaskListDocument | None:
-        """Fold legacy artifacts into a TaskListDocument. Caller MUST hold lock."""
-        meta = self._read_legacy_meta(task_list_id)
-        if meta is None:
-            inferred_role = TaskListRole.TEMPLATE if task_list_id.startswith("colony:") else TaskListRole.SESSION
-            meta = TaskListMeta(task_list_id=task_list_id, role=inferred_role)
-
-        tasks: list[TaskRecord] = []
-        td = self._legacy_tasks_dir(task_list_id)
-        if td.exists():
-            for p in sorted(td.iterdir()):
-                if p.suffix != ".json":
-                    continue
-                try:
-                    tasks.append(TaskRecord.model_validate_json(p.read_text(encoding="utf-8")))
-                except Exception:
-                    logger.warning(
-                        "Skipping corrupt legacy task file %s during migration",
-                        p,
-                        exc_info=True,
-                    )
-        tasks.sort(key=lambda r: r.id)
-
-        hwm = self._read_legacy_hwm(task_list_id)
-        max_id = max((r.id for r in tasks), default=0)
-        hwm = max(hwm, max_id)
-
-        if not tasks and hwm == 0 and not self._legacy_meta_path(task_list_id).exists():
-            return None
-
-        return TaskListDocument(
-            meta=meta,
-            highwatermark=hwm,
-            tasks=tasks,
-        )
-
-    def _read_legacy_meta(self, task_list_id: str) -> TaskListMeta | None:
-        path = self._legacy_meta_path(task_list_id)
-        if not path.exists():
-            return None
-        try:
-            return TaskListMeta.model_validate_json(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("Corrupt legacy meta.json at %s", path, exc_info=True)
-            return None
-
-    def _read_legacy_hwm(self, task_list_id: str) -> int:
-        path = self._legacy_hwm_path(task_list_id)
-        if not path.exists():
-            return 0
-        try:
-            return int(path.read_text(encoding="utf-8").strip() or "0")
-        except (ValueError, OSError):
-            return 0
-
-    def _cleanup_legacy_unsafe(self, task_list_id: str) -> None:
-        """Remove the older layout's files. Caller MUST hold the list-lock.
-
-        For session/colony/unscoped lists the legacy_dir is a dedicated
-        ``tasks/`` subdir, so we remove the whole tree. For the ``_misc``
-        fallback the legacy_dir is the same as the new parent dir — we
-        delete only the specific legacy filenames so we don't clobber
-        the new ``tasks.json``.
-        """
-        legacy = self._legacy_dir(task_list_id)
-        if not legacy.exists():
-            return
-
-        if legacy != self._list_dir(task_list_id):
-            try:
-                shutil.rmtree(legacy)
-            except OSError:
-                logger.warning("Failed to remove legacy task dir %s", legacy, exc_info=True)
-            return
-
-        # _misc case: shared parent dir — surgical delete only.
-        for p in (
-            self._legacy_meta_path(task_list_id),
-            self._legacy_hwm_path(task_list_id),
-            self._legacy_lock_path(task_list_id),
-        ):
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("Failed to remove %s", p, exc_info=True)
-        td = self._legacy_tasks_dir(task_list_id)
-        if td.exists():
-            try:
-                shutil.rmtree(td)
-            except OSError:
-                logger.warning("Failed to remove legacy tasks subdir %s", td, exc_info=True)
 
     # ----- meta accessors over the doc ----------------------------------
 
     def _ensure_task_list_sync(
         self,
-        task_list_id: str,
-        role: TaskListRole,
+        session_id: str,
         creator_agent_id: str | None,
-        session_id: str | None,
     ) -> TaskListMeta:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
-                meta = TaskListMeta(
-                    task_list_id=task_list_id,
-                    role=role,
-                    creator_agent_id=creator_agent_id,
-                    last_seen_session_ids=[session_id] if session_id else [],
-                )
+                meta = TaskListMeta(creator_agent_id=creator_agent_id)
                 doc = TaskListDocument(meta=meta)
-                self._write_doc_unsafe(task_list_id, doc)
+                self._write_doc_unsafe(session_id, doc)
                 return meta
+            return doc.meta
 
-            meta = doc.meta
-            if session_id and session_id not in meta.last_seen_session_ids:
-                meta.last_seen_session_ids.append(session_id)
-                # Cap at 10 to keep the audit trail bounded.
-                meta.last_seen_session_ids = meta.last_seen_session_ids[-10:]
-                self._write_doc_unsafe(task_list_id, doc)
-            return meta
-
-    def _read_meta_sync(self, task_list_id: str) -> TaskListMeta | None:
-        doc = self._read_doc_sync(task_list_id)
+    def _read_meta_sync(self, session_id: str) -> TaskListMeta | None:
+        doc = self._read_doc_sync(session_id)
         return doc.meta if doc is not None else None
 
     # ----- task IO ------------------------------------------------------
 
-    def _read_task_sync(self, task_list_id: str, task_id: int) -> TaskRecord | None:
-        doc = self._read_doc_sync(task_list_id)
+    def _read_task_sync(self, session_id: str, task_id: int) -> TaskRecord | None:
+        doc = self._read_doc_sync(session_id)
         if doc is None:
             return None
         for r in doc.tasks:
@@ -589,8 +473,8 @@ class TaskStore:
                 return r
         return None
 
-    def _list_tasks_sync(self, task_list_id: str) -> list[TaskRecord]:
-        doc = self._read_doc_sync(task_list_id)
+    def _list_tasks_sync(self, session_id: str) -> list[TaskRecord]:
+        doc = self._read_doc_sync(session_id)
         if doc is None:
             return []
         return sorted(doc.tasks, key=lambda r: r.id)
@@ -599,18 +483,17 @@ class TaskStore:
 
     def _create_task_sync(
         self,
-        task_list_id: str,
+        session_id: str,
         subject: str,
         description: str,
         active_form: str | None,
         owner: str | None,
         metadata: dict[str, Any],
     ) -> TaskRecord:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
-                inferred_role = TaskListRole.TEMPLATE if task_list_id.startswith("colony:") else TaskListRole.SESSION
-                doc = TaskListDocument(meta=TaskListMeta(task_list_id=task_list_id, role=inferred_role))
+                doc = TaskListDocument(meta=TaskListMeta())
             new_id = self._next_id_for_doc(doc)
             now = time.time()
             record = TaskRecord(
@@ -627,13 +510,14 @@ class TaskStore:
             doc.tasks.append(record)
             if new_id > doc.highwatermark:
                 doc.highwatermark = new_id
-            self._write_doc_unsafe(task_list_id, doc)
+            self._write_doc_unsafe(session_id, doc)
             return record
 
     def _create_tasks_batch_sync(
         self,
-        task_list_id: str,
+        session_id: str,
         specs: list[dict[str, Any]],
+        goal: str | None = None,
     ) -> list[TaskRecord]:
         if not specs:
             return []
@@ -643,20 +527,22 @@ class TaskStore:
             if not isinstance(subj, str) or not subj.strip():
                 raise ValueError(f"specs[{i}].subject must be a non-empty string")
 
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
-                inferred_role = TaskListRole.TEMPLATE if task_list_id.startswith("colony:") else TaskListRole.SESSION
-                doc = TaskListDocument(meta=TaskListMeta(task_list_id=task_list_id, role=inferred_role))
+                doc = TaskListDocument(meta=TaskListMeta())
+            if goal is not None:
+                doc.meta.goal = goal
 
             base_id = self._next_id_for_doc(doc)
             now = time.time()
             records: list[TaskRecord] = []
             for offset, spec in enumerate(specs):
+                spec_desc = spec.get("description", "")
                 rec = TaskRecord(
                     id=base_id + offset,
                     subject=spec["subject"],
-                    description=spec.get("description", ""),
+                    description=spec_desc,
                     active_form=spec.get("active_form"),
                     owner=spec.get("owner"),
                     status=TaskStatus.PENDING,
@@ -671,7 +557,7 @@ class TaskStore:
             if highest > doc.highwatermark:
                 doc.highwatermark = highest
             # Single write — atomic batch is free with the doc model.
-            self._write_doc_unsafe(task_list_id, doc)
+            self._write_doc_unsafe(session_id, doc)
             return records
 
     # ----- id assignment ------------------------------------------------
@@ -684,7 +570,7 @@ class TaskStore:
 
     def _update_task_sync(
         self,
-        task_list_id: str,
+        session_id: str,
         task_id: int,
         subject: str | None,
         description: str | None,
@@ -695,8 +581,8 @@ class TaskStore:
         add_blocked_by: list[int] | None,
         metadata_patch: dict[str, Any] | None,
     ) -> tuple[TaskRecord | None, list[str]]:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
                 return None, []
             target = next((r for r in doc.tasks if r.id == task_id), None)
@@ -715,8 +601,25 @@ class TaskStore:
                 metadata_patch=metadata_patch,
             )
             if changed:
-                self._write_doc_unsafe(task_list_id, doc)
+                self._write_doc_unsafe(session_id, doc)
             return new, changed
+
+    def _sweep_idle_tasks_sync(self, session_id: str) -> list[TaskRecord]:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
+            if doc is None:
+                return []
+            now = time.time()
+            changed: list[TaskRecord] = []
+            for record in doc.tasks:
+                if is_task_idle(record, now=now):
+                    record.status = TaskStatus.ABANDONED
+                    record.updated_at = now
+                    changed.append(record)
+            if not changed:
+                return []
+            self._write_doc_unsafe(session_id, doc)
+            return changed
 
     def _update_task_in_doc(
         self,
@@ -750,6 +653,20 @@ class TaskStore:
             current.owner = owner
             changed.append("owner")
         if status is not None and status != current.status:
+            if status is TaskStatus.ARCHIVED:
+                # Archiving (task_update status="archived"): stamp the
+                # markers History groups by (goal) and restore reads
+                # (archived_from). Each task carries its own archive time;
+                # History groups by goal, not timestamp, so that's fine.
+                current.metadata["archived_from"] = current.status.value
+                current.metadata["archived_at"] = time.time()
+                current.metadata["archived_goal"] = doc.meta.goal
+            elif current.status is TaskStatus.ARCHIVED:
+                # Restoring an archived task by editing its status back to a
+                # live one — clear the markers so it re-enters the plan clean.
+                current.metadata.pop("archived_from", None)
+                current.metadata.pop("archived_at", None)
+                current.metadata.pop("archived_goal", None)
             current.status = status
             changed.append("status")
 
@@ -796,9 +713,9 @@ class TaskStore:
 
     # ----- delete -------------------------------------------------------
 
-    def _delete_task_sync(self, task_list_id: str, task_id: int) -> tuple[bool, list[int]]:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+    def _delete_task_sync(self, session_id: str, task_id: int) -> tuple[bool, list[int]]:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
                 return False, []
             idx = next((i for i, r in enumerate(doc.tasks) if r.id == task_id), None)
@@ -825,26 +742,74 @@ class TaskStore:
                 if touched:
                     other.updated_at = now
                     cascaded.append(other.id)
-            self._write_doc_unsafe(task_list_id, doc)
+            self._write_doc_unsafe(session_id, doc)
             return True, cascaded
 
     # ----- reset --------------------------------------------------------
 
-    def _reset_sync(self, task_list_id: str) -> None:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+    def _reset_sync(self, session_id: str) -> None:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
                 return
             max_id = max((r.id for r in doc.tasks), default=0)
             doc.highwatermark = max(doc.highwatermark, max_id)
             doc.tasks = []
-            self._write_doc_unsafe(task_list_id, doc)
+            self._write_doc_unsafe(session_id, doc)
+
+    def _archive_completed_sync(self, session_id: str) -> list[TaskRecord]:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
+            if doc is None:
+                return []
+            now = time.time()
+            archived: list[TaskRecord] = []
+            for record in doc.tasks:
+                if record.status is not TaskStatus.COMPLETED:
+                    continue
+                # Same markers the update executor's archive branch stamps —
+                # keep them in lockstep so History groups both sources alike.
+                record.metadata["archived_from"] = record.status.value
+                record.metadata["archived_at"] = now
+                record.metadata["archived_goal"] = doc.meta.goal
+                record.status = TaskStatus.ARCHIVED
+                record.updated_at = now
+                archived.append(record)
+            if not archived:
+                return []
+            self._write_doc_unsafe(session_id, doc)
+            return archived
+
+    def _unarchive_sync(self, session_id: str, task_ids: list[int]) -> list[int]:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
+            if doc is None:
+                return []
+            wanted = set(task_ids)
+            now = time.time()
+            restored: list[int] = []
+            for record in doc.tasks:
+                if record.id not in wanted or record.status is not TaskStatus.ARCHIVED:
+                    continue
+                origin = record.metadata.pop("archived_from", None)
+                record.metadata.pop("archived_at", None)
+                record.metadata.pop("archived_goal", None)
+                try:
+                    record.status = TaskStatus(origin) if origin else TaskStatus.PENDING
+                except ValueError:
+                    record.status = TaskStatus.PENDING
+                record.updated_at = now
+                restored.append(record.id)
+            if not restored:
+                return []
+            self._write_doc_unsafe(session_id, doc)
+            return restored
 
     # ----- claim --------------------------------------------------------
 
-    def _claim_sync(self, task_list_id: str, task_id: int, claimant: str) -> ClaimResult:
-        with self._list_lock(task_list_id):
-            doc = self._read_doc_unsafe(task_list_id)
+    def _claim_sync(self, session_id: str, task_id: int, claimant: str) -> ClaimResult:
+        with self._list_lock(session_id):
+            doc = self._read_doc_unsafe(session_id)
             if doc is None:
                 return ClaimNotFound(kind="not_found")
             current = next((r for r in doc.tasks if r.id == task_id), None)
@@ -862,7 +827,7 @@ class TaskStore:
             if unresolved_blockers:
                 return ClaimBlocked(kind="blocked", by=unresolved_blockers)
             new, _ = self._update_task_in_doc(doc, current, owner=claimant)
-            self._write_doc_unsafe(task_list_id, doc)
+            self._write_doc_unsafe(session_id, doc)
             return ClaimOk(kind="ok", record=new)
 
 
@@ -887,33 +852,12 @@ def get_task_store() -> TaskStore:
 
 
 # Convenience for tests / utilities.
-def fingerprint_for_test(task_list_id: str, hive_root: Path) -> Iterable[Path]:
+def fingerprint_for_test(session_id: str, hive_root: Path) -> Iterable[Path]:
     """Yield every task-list-related file — used by tests to assert
     byte-equivalence pre/post shutdown.
-
-    Includes the doc + lock and any legacy leftovers (so this still works
-    while a list is mid-migration).
     """
-    files: list[Path] = []
-    base = task_list_path(task_list_id, hive_root=hive_root)
+    base = session_storage_dir(session_id, hive_root=hive_root)
     if not base.exists():
         return []
     doc = base / DOC_FILENAME
-    if doc.exists():
-        files.append(doc)
-    lock = base / LOCK_FILENAME
-    if lock.exists():
-        files.append(lock)
-    legacy = _legacy_root(task_list_id, hive_root=hive_root)
-    if legacy.exists() and legacy != base:
-        files.extend(sorted(legacy.rglob("*")))
-    elif legacy.exists():
-        # _misc fallback: include only legacy filenames
-        for name in ("meta.json", ".highwatermark", ".lock"):
-            p = legacy / name
-            if p.exists():
-                files.append(p)
-        td = legacy / "tasks"
-        if td.exists():
-            files.extend(sorted(td.rglob("*")))
-    return sorted(files)
+    return [doc] if doc.exists() else []

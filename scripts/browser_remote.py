@@ -9,9 +9,9 @@ Usage:
     uv run scripts/browser_remote.py --no-ui  # API only, no browser open
 
 Then use the UI at http://localhost:9250/ui or curl directly:
-    curl -X POST http://localhost:9250/browser_click \
+    curl -X POST http://localhost:9250/browser_interact \
          -H 'Content-Type: application/json' \
-         -d '{"selector": "#login-btn"}'
+         -d '{"action": "left_click", "selector": "#login-btn"}'
 """
 
 from __future__ import annotations

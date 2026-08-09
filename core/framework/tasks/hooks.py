@@ -39,7 +39,7 @@ class BlockingHookError(Exception):
 @dataclass
 class TaskHookContext:
     event: str
-    task_list_id: str
+    session_id: str
     task: Any  # TaskRecord (avoid import cycle)
     agent_id: str | None = None
     metadata: dict[str, Any] | None = None
@@ -71,7 +71,7 @@ def clear_hooks(event: str | None = None) -> None:
 async def run_task_hooks(
     event: str,
     *,
-    task_list_id: str,
+    session_id: str,
     task: Any,
     agent_id: str | None = None,
     metadata: dict[str, Any] | None = None,
@@ -86,7 +86,7 @@ async def run_task_hooks(
         return
     ctx = TaskHookContext(
         event=event,
-        task_list_id=task_list_id,
+        session_id=session_id,
         task=task,
         agent_id=agent_id,
         metadata=metadata,

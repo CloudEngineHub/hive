@@ -499,6 +499,7 @@ def register_tools(
         subject: str = "",
         account: str = "",
         reply_to_message_id: str = "",
+        signature: str = "",
     ) -> dict:
         """
         Create a draft email in the user's Gmail Drafts folder.
@@ -519,6 +520,9 @@ def register_tools(
             account: Account alias for multi-account routing. Optional.
             reply_to_message_id: Gmail message ID to reply to. When provided, creates
                                   the draft as a threaded reply with proper headers.
+            signature: Optional HTML signature that will be appened after the body.
+                        Get the signature and pass it in this signature field.
+                       (e.g. from gmail_get_signature or a stored preference).
 
         Returns:
             Dict with "success", "draft_id", "message_id", and optionally "thread_id",
@@ -594,12 +598,15 @@ def register_tools(
                 f"</blockquote>"
                 f"</div>"
             )
-            full_html = html + quoted
+            sig_block = f"<br><br>{signature}" if signature else ""
+            full_html = html + sig_block + quoted
         else:
             if not to or not to.strip():
                 return {"error": "Recipient email (to) is required"}
             if not subject or not subject.strip():
                 return {"error": "Subject is required"}
+            sig_block = f"<br><br>{signature}" if signature else ""
+            full_html = html + sig_block
 
         if in_reply_to:
             msg: MIMEMultipart | MIMEText = MIMEMultipart("alternative")
@@ -641,6 +648,82 @@ def register_tools(
         if thread_id:
             result["thread_id"] = thread_id
         return result
+
+    @mcp.tool()
+    def gmail_get_signature(
+        send_as_email: str = "",
+        account: str = "",
+    ) -> dict:
+        """
+        Get the user's Gmail signature from their account settings.
+
+        Reads from Gmail's "Send mail as" aliases. By default returns the primary
+        alias's signature; pass send_as_email to fetch a specific alias.
+
+        Requires the `gmail.settings.basic` OAuth scope. If the granted token
+        does not include it, the API returns 403 and this tool returns an
+        error explaining how to proceed (the caller can fall back to a
+        manually-supplied signature passed to gmail_create_draft).
+
+        Args:
+            send_as_email: Specific alias email to fetch (e.g. "me@example.com").
+                Empty (default) returns the primary alias.
+            account: Account alias for multi-account routing.
+
+        Returns:
+            Dict with "signature" (HTML string, may be empty), "send_as_email",
+            "display_name", and "is_primary"; or error dict.
+        """
+        token = _require_token(account)
+        if isinstance(token, dict):
+            return token
+
+        if send_as_email:
+            try:
+                send_as_email = _sanitize_path_param(send_as_email, "send_as_email")
+            except ValueError as e:
+                return {"error": str(e)}
+            path = f"settings/sendAs/{send_as_email}"
+        else:
+            path = "settings/sendAs"
+
+        try:
+            response = _gmail_request("GET", path, token)
+        except httpx.HTTPError as e:
+            return {"error": f"Request failed: {e}"}
+
+        if response.status_code == 403:
+            return {
+                "error": "Missing OAuth scope: gmail.settings.basic",
+                "help": (
+                    "Reading Gmail signatures requires the gmail.settings.basic scope. "
+                    "Reconnect Gmail via hive.adenhq.com to grant it, or pass the "
+                    "signature directly to gmail_create_draft."
+                ),
+            }
+
+        error = _handle_error(response)
+        if error:
+            return error
+
+        data = response.json()
+
+        if send_as_email:
+            alias = data
+        else:
+            aliases = data.get("sendAs", [])
+            alias = next((a for a in aliases if a.get("isPrimary")), None)
+            if alias is None and aliases:
+                alias = aliases[0]
+            if alias is None:
+                return {"error": "No send-as aliases found on this account"}
+
+        return {
+            "signature": alias.get("signature", "") or "",
+            "send_as_email": alias.get("sendAsEmail", ""),
+            "display_name": alias.get("displayName", ""),
+            "is_primary": bool(alias.get("isPrimary", False)),
+        }
 
     @mcp.tool()
     def gmail_list_labels(account: str = "") -> dict:

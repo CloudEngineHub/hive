@@ -501,8 +501,7 @@ def register_mcp_tools(
                 if not server_type:
                     return {
                         "error": "Either server_url or server_type is required",
-                        "help": "Provide a full server_url or specify server_type "
-                        "(sql, vector-search, genie, functions) with resource_path.",
+                        "help": "Provide a full server_url or specify server_type (sql, vector-search, genie, functions) with resource_path.",
                     }
 
                 valid_types = {"sql", "vector-search", "genie", "functions"}

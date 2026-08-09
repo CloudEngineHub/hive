@@ -213,19 +213,13 @@ def register_tools(
         if not token:
             return {
                 "error": "Mattermost credentials not configured",
-                "help": (
-                    "Set MATTERMOST_ACCESS_TOKEN and MATTERMOST_URL environment variables "
-                    "or configure via credential store"
-                ),
+                "help": ("Set MATTERMOST_ACCESS_TOKEN and MATTERMOST_URL environment variables or configure via credential store"),
             }
         url = _get_url()
         if not url:
             return {
                 "error": "Mattermost server URL not configured",
-                "help": (
-                    "Set MATTERMOST_URL environment variable (e.g. https://mattermost.example.com) "
-                    "or configure via credential store"
-                ),
+                "help": ("Set MATTERMOST_URL environment variable (e.g. https://mattermost.example.com) or configure via credential store"),
             }
         return _MattermostClient(token, url)
 

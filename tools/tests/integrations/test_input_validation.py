@@ -95,9 +95,7 @@ class TestMissingCredentialsError:
         _CRED_TOOL_ENTRIES,
         ids=_CRED_TOOL_IDS,
     )
-    def test_missing_credentials_returns_error_and_help(
-        self, spec_name: str, tool_name: str, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_missing_credentials_returns_error_and_help(self, spec_name: str, tool_name: str, monkeypatch: pytest.MonkeyPatch):
         """Calling a tool without credentials returns {error, help}."""
         # Clear all credential env vars
         for env_var in _ENV_VARS_TO_CLEAR.get(spec_name, []):
@@ -132,9 +130,7 @@ class TestMissingRequiredParams:
         _CRED_TOOL_ENTRIES,
         ids=_CRED_TOOL_IDS,
     )
-    def test_missing_required_params_returns_error(
-        self, spec_name: str, tool_name: str, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_missing_required_params_returns_error(self, spec_name: str, tool_name: str, monkeypatch: pytest.MonkeyPatch):
         """Calling a tool with no args raises TypeError or returns error dict."""
         # Set credential so we can test param validation separately
         spec = CREDENTIAL_SPECS[spec_name]

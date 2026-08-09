@@ -192,10 +192,7 @@ class ErrorCategorizer:
             ErrorCategory.IMPLEMENTATION_ERROR: (
                 "Fix the code in agent nodes/edges. There's a bug in the implementation that needs to be corrected."
             ),
-            ErrorCategory.EDGE_CASE: (
-                "Add a new test for this edge case scenario. "
-                "This is a valid scenario that wasn't covered by existing tests."
-            ),
+            ErrorCategory.EDGE_CASE: ("Add a new test for this edge case scenario. This is a valid scenario that wasn't covered by existing tests."),
         }
         return suggestions.get(category, "Review the test and agent implementation.")
 
@@ -214,17 +211,14 @@ class ErrorCategorizer:
                 "action": "Update success_criteria or constraints",
                 "restart_required": True,
                 "description": (
-                    "The goal definition is incorrect. Update the success criteria "
-                    "or constraints, then restart the full Goal → Agent → Eval flow."
+                    "The goal definition is incorrect. Update the success criteria or constraints, then restart the full Goal → Agent → Eval flow."
                 ),
             },
             ErrorCategory.IMPLEMENTATION_ERROR: {
                 "stage": "Agent",
                 "action": "Fix nodes/edges implementation",
                 "restart_required": False,
-                "description": (
-                    "There's a code bug. Fix the agent implementation, then re-run Eval (skip Goal stage)."
-                ),
+                "description": ("There's a code bug. Fix the agent implementation, then re-run Eval (skip Goal stage)."),
             },
             ErrorCategory.EDGE_CASE: {
                 "stage": "Eval",

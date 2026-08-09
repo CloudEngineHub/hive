@@ -115,7 +115,7 @@ Hive LLM:
 Notes:
 
 - Set `provider` to `hive`
-- Common Hive model values are `queen`, `kimi-k2.5`, and `GLM-5`
+- Common Hive model values are `queen`, `kimi-k2.6`, `kimi-k2.5`, and `GLM-5`
 - Hive LLM requests use the Hive endpoint at `https://api.adenhq.com`
 
 ### Search & Tools (optional)
@@ -198,7 +198,7 @@ MCP (Model Context Protocol) servers are configured in `.mcp.json` at the projec
 }
 ```
 
-The `files-tools` server exposes file I/O (`read_file`, `write_file`, `edit_file`, `hashline_edit`, `search_files`). The `tools` MCP server exposes integration tools including web search, PDF reading, CSV processing, and file system operations.
+The standalone `files-tools` server (`files_server.py`) exposes file I/O (`read_file`, `write_file`, `edit_file`, `hashline_edit`, `search_files`). It is no longer auto-registered for agents — queens/workers do file I/O through the `terminal-tools` server (`terminal_exec` for cat/sed/heredoc, `terminal_rg` / `terminal_glob` for search), which defaults its cwd to the session workdir. The `tools` MCP server exposes integration tools including web search, PDF reading, and CSV processing.
 
 ## Storage
 

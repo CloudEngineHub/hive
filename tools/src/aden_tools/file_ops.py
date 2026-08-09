@@ -208,10 +208,7 @@ def _do_search_files_target(
     out = "\n".join(lines)
     next_offset = offset + len(page)
     if total > next_offset:
-        out += (
-            f"\n\n[Hint: showing {len(page)} of {total} files. "
-            f"Use offset={next_offset} for more, or narrow with a more specific glob.]"
-        )
+        out += f"\n\n[Hint: showing {len(page)} of {total} files. Use offset={next_offset} for more, or narrow with a more specific glob.]"
     return out
 
 
@@ -285,10 +282,7 @@ def _do_search_content_target(
             out = "\n".join(formatted)
             next_offset = offset + len(page)
             if total > next_offset:
-                out += (
-                    f"\n\n[Hint: showing {len(page)} of {total} matches. "
-                    f"Use offset={next_offset} for more, or narrow with file_glob/pattern.]"
-                )
+                out += f"\n\n[Hint: showing {len(page)} of {total} matches. Use offset={next_offset} for more, or narrow with file_glob/pattern.]"
             return out
     except FileNotFoundError:
         pass  # ripgrep missing — Python fallback below
@@ -372,10 +366,7 @@ def _do_search_content_target(
     out = "\n\n".join(page) if context > 0 else "\n".join(page)
     next_offset = offset + len(page)
     if total > next_offset:
-        out += (
-            f"\n\n[Hint: showing {len(page)} of {total} matches. "
-            f"Use offset={next_offset} for more, or narrow with file_glob/pattern.]"
-        )
+        out += f"\n\n[Hint: showing {len(page)} of {total} matches. Use offset={next_offset} for more, or narrow with file_glob/pattern.]"
     return out
 
 
@@ -921,9 +912,7 @@ def _apply_hunk(content: str, hunk: _Hunk) -> tuple[str, str | None]:
         if hunk.context_hint:
             count = content.count(hunk.context_hint)
             if count > 1:
-                return content, (
-                    f"addition-only hunk: context hint '{hunk.context_hint}' is ambiguous ({count} occurrences)"
-                )
+                return content, (f"addition-only hunk: context hint '{hunk.context_hint}' is ambiguous ({count} occurrences)")
             if count == 1:
                 idx = content.find(hunk.context_hint)
                 line_end = content.find("\n", idx)
@@ -1113,9 +1102,7 @@ def _apply_v4a(
             apply_errors.append(f"{resolved}: {e}")
 
     if apply_errors:
-        return None, (
-            "Apply phase failed (state may be inconsistent — run `git diff` to assess):\n  " + "\n  ".join(apply_errors)
-        )
+        return None, ("Apply phase failed (state may be inconsistent — run `git diff` to assess):\n  " + "\n  ".join(apply_errors))
 
     summary_parts: list[str] = []
     if files_modified:
@@ -1164,10 +1151,7 @@ def _patch_replace(
     # changes the user made between calling read_file and patch.
     _fresh = check_fresh(None, resolved)
     if _fresh.status is Freshness.UNREAD:
-        return (
-            f"Refusing to edit '{path}': call read_file('{path}') first so the "
-            f"harness can track its state before you edit it."
-        )
+        return f"Refusing to edit '{path}': call read_file('{path}') first so the harness can track its state before you edit it."
     if _fresh.status is Freshness.STALE:
         return f"Refusing to edit '{path}': {_fresh.detail}. Re-read the file with read_file before editing."
 
@@ -1305,10 +1289,7 @@ WRITE_FILE_DOC = (
     "read_file call first; brand-new files don't."
 )
 WRITE_FILE_PARAMS = {
-    "path": (
-        "File path to write. Relative paths anchor to the agent's home; "
-        "absolute paths used verbatim. System and credential paths are denied."
-    ),
+    "path": ("File path to write. Relative paths anchor to the agent's home; absolute paths used verbatim. System and credential paths are denied."),
     "content": "Complete file content to write.",
 }
 
@@ -1376,32 +1357,20 @@ SEARCH_FILES_DOC = (
     "warned at 3 calls and blocked at 4 — use the results you already have."
 )
 SEARCH_FILES_PARAMS = {
-    "pattern": (
-        "Regex (content mode) or glob (files mode, e.g. '*.py'). For an 'ls'-style listing pass '*' or '*.<ext>'."
-    ),
+    "pattern": ("Regex (content mode) or glob (files mode, e.g. '*.py'). For an 'ls'-style listing pass '*' or '*.<ext>'."),
     "target": (
-        "'content' to grep inside files, 'files' to list/find files. "
-        "Legacy aliases: 'grep' -> 'content', 'find'/'ls' -> 'files'. "
-        "Default 'content'."
+        "'content' to grep inside files, 'files' to list/find files. Legacy aliases: 'grep' -> 'content', 'find'/'ls' -> 'files'. Default 'content'."
     ),
     "path": ("Directory (or, in content mode, a single file) to search. Default '.'."),
-    "file_glob": (
-        "Restrict content search to filenames matching this glob. "
-        "Ignored in files mode (use the 'pattern' argument instead)."
-    ),
+    "file_glob": ("Restrict content search to filenames matching this glob. Ignored in files mode (use the 'pattern' argument instead)."),
     "limit": "Max results to return. Default 50.",
     "offset": "Skip first N results for pagination. Default 0.",
     "output_mode": (
-        "Content-mode output shape: 'content' (lines + line numbers, "
-        "default), 'files_only' (paths only), 'count' (per-file match "
-        "counts)."
+        "Content-mode output shape: 'content' (lines + line numbers, default), 'files_only' (paths only), 'count' (per-file match counts)."
     ),
     "context": ("Lines of context before and after each match (content mode only). Default 0."),
     "hashline": ("Content mode: include N:hhhh hash anchors in matched lines. Default False."),
-    "task_id": (
-        "Optional anti-loop scope key. Defaults to a shared bucket; pass "
-        "a per-task id when multiple agents share a process."
-    ),
+    "task_id": ("Optional anti-loop scope key. Defaults to a shared bucket; pass a per-task id when multiple agents share a process."),
 }
 
 
@@ -1550,9 +1519,7 @@ def register_file_tools(
                     f"overwriting."
                 )
             if _fresh.status is Freshness.STALE:
-                return (
-                    f"Refusing to overwrite '{path}': {_fresh.detail}. Re-read the file with read_file before writing."
-                )
+                return f"Refusing to overwrite '{path}': {_fresh.detail}. Re-read the file with read_file before writing."
 
         try:
             # Create parent dirs first (before git snapshot) so structure exists

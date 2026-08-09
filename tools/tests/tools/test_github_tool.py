@@ -237,9 +237,7 @@ class TestGitHubClient:
         }
         mock_post.return_value = mock_response
 
-        result = self.client.create_pull_request(
-            "owner", "repo", "New PR", "feature-branch", "main", body="PR description"
-        )
+        result = self.client.create_pull_request("owner", "repo", "New PR", "feature-branch", "main", body="PR description")
 
         assert result["success"] is True
         assert result["data"]["number"] == 10

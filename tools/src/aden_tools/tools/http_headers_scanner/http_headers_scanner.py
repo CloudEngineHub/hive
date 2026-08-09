@@ -19,12 +19,8 @@ SECURITY_HEADERS = {
     },
     "Content-Security-Policy": {
         "severity": "high",
-        "description": (
-            "No CSP header. The site is more vulnerable to XSS attacks from inline scripts and untrusted sources."
-        ),
-        "remediation": (
-            "Add a Content-Security-Policy header. Start restrictive: default-src 'self'; script-src 'self'"
-        ),
+        "description": ("No CSP header. The site is more vulnerable to XSS attacks from inline scripts and untrusted sources."),
+        "remediation": ("Add a Content-Security-Policy header. Start restrictive: default-src 'self'; script-src 'self'"),
     },
     "X-Frame-Options": {
         "severity": "medium",
@@ -33,26 +29,17 @@ SECURITY_HEADERS = {
     },
     "X-Content-Type-Options": {
         "severity": "medium",
-        "description": (
-            "No X-Content-Type-Options header. Browsers may MIME-sniff responses, "
-            "potentially executing malicious content."
-        ),
+        "description": ("No X-Content-Type-Options header. Browsers may MIME-sniff responses, potentially executing malicious content."),
         "remediation": "Add the header: X-Content-Type-Options: nosniff",
     },
     "Referrer-Policy": {
         "severity": "low",
-        "description": (
-            "No Referrer-Policy header. Full URLs (including query params) "
-            "may leak to third-party sites via the Referer header."
-        ),
+        "description": ("No Referrer-Policy header. Full URLs (including query params) may leak to third-party sites via the Referer header."),
         "remediation": ("Add the header: Referrer-Policy: strict-origin-when-cross-origin"),
     },
     "Permissions-Policy": {
         "severity": "low",
-        "description": (
-            "No Permissions-Policy header. Browser features like camera, microphone, "
-            "and geolocation are not explicitly restricted."
-        ),
+        "description": ("No Permissions-Policy header. Browser features like camera, microphone, and geolocation are not explicitly restricted."),
         "remediation": ("Add the header: Permissions-Policy: camera=(), microphone=(), geolocation=()"),
     },
 }

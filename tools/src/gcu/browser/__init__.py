@@ -26,9 +26,10 @@ from .session import (
 from .tools import (
     register_advanced_tools,
     register_inspection_tools,
-    register_interaction_tools,
+    register_interact_tools,
     register_lifecycle_tools,
     register_navigation_tools,
+    register_script_tools,
     register_tab_tools,
 )
 
@@ -43,19 +44,22 @@ def register_tools(mcp: FastMCP) -> None:
     Tools are organized into categories:
     - Lifecycle: browser_setup, browser_status, browser_stop (browser_open lazy-creates the context)
     - Tabs: browser_tabs, browser_open, browser_close, browser_activate_tab
-    - Navigation: browser_navigate, browser_go_back, browser_go_forward, browser_reload
-    - Inspection: browser_screenshot, browser_snapshot, browser_console
-    - Interactions: browser_click, browser_click_coordinate, browser_type, browser_type_focused,
-                    browser_press, browser_hover, browser_select, browser_scroll, browser_drag
-    - Advanced: browser_wait, browser_evaluate, browser_get_text, browser_get_attribute,
-                  browser_resize, browser_upload
+    - Navigation: browser_navigate, browser_reload
+    - Inspection: browser_screenshot, browser_snapshot, browser_console, browser_html,
+                  browser_shadow_query
+    - Interact: browser_interact (unified click / type / key / hover / scroll / drag /
+                screenshot / zoom / wait) and browser_select (dropdowns)
+    - Advanced: browser_evaluate, browser_get_text,
+                  browser_resize, browser_upload, browser_dialog_respond
+    - Script:   browser_script (run a skill-bundled orchestration script)
     """
     register_lifecycle_tools(mcp)
     register_tab_tools(mcp)
     register_navigation_tools(mcp)
     register_inspection_tools(mcp)
-    register_interaction_tools(mcp)
+    register_interact_tools(mcp)
     register_advanced_tools(mcp)
+    register_script_tools(mcp)
 
 
 __all__ = [

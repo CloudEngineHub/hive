@@ -35,22 +35,18 @@ _DEFAULT_CONFIG = {
 }
 
 # Default local MCP servers that ship with Hive. Seeded on first startup so
-# fresh users get working file I/O, browser automation, and the hive tool
-# suite without having to run `hive mcp add` manually. ``cwd`` is filled in
-# at registration time with the absolute path to the ``tools/`` directory.
+# fresh users get working file I/O and the hive tool suite without having to
+# run `hive mcp add` manually. (Browser automation is the `hive-browser` CLI
+# now, not a bundled MCP server.) ``cwd`` is filled in at registration time
+# with the absolute path to the ``tools/`` directory.
 _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
     "hive_tools": {
         "description": "Hive tools: web search, email, CRM, calendar, and 100+ integrations",
         "args": ["run", "python", "mcp_server.py", "--stdio"],
     },
-    "gcu-tools": {
-        "description": "Browser automation: click, type, navigate, screenshot, snapshot",
-        "args": ["run", "python", "-m", "gcu.server", "--stdio"],
-    },
-    "files-tools": {
-        "description": "File I/O: read, write, edit, search, list, run commands",
-        "args": ["run", "python", "files_server.py", "--stdio"],
-    },
+    # (Browser automation is no longer a bundled MCP server — it's the
+    # terminal-driven `hive-browser` CLI now. The old `gcu-tools` entry was
+    # removed here so it is not re-seeded into per-user installed.json.)
     "terminal-tools": {
         "description": "Terminal capabilities",
         "args": ["run", "python", "terminal_tools_server.py", "--stdio"],
@@ -59,7 +55,22 @@ _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
         "description": "BI/financial chart + diagram rendering: ECharts, Mermaid",
         "args": ["run", "python", "chart_tools_server.py", "--stdio"],
     },
+    "memory-tools": {
+        "description": "System memory: regex search across a queen/colony's messages",
+        "args": ["run", "python", "memory_tools_server.py", "--stdio"],
+    },
 }
+
+# The framework's own bundled servers. These are NEVER subject to the
+# ``max_tools`` cap — the cap exists to bound *user-added* MCP sprawl, not
+# Hive's essential tools (file I/O, terminal, charts, memory, the hive
+# suite). Capping them caused an intermittent, order-dependent bug where a
+# user server that consumed the tool budget first would push e.g.
+# chart-tools past the cap, so ``chart_render`` silently vanished from the
+# queen's live catalog while still showing as allowlisted (the
+# "search_tools says no chart_render" report). See
+# ``ToolRegistry.load_registry_servers`` and ``resolve_for_agent``.
+DEFAULT_LOCAL_SERVER_NAMES: frozenset[str] = frozenset(_DEFAULT_LOCAL_SERVERS)
 
 # Aliases that earlier versions of ensure_defaults wrote under the wrong name.
 # When we see one of these stale entries, drop it before seeding the canonical
@@ -95,8 +106,8 @@ class MCPRegistry:
         calls this — keeping the seeding here means a fresh ``HIVE_HOME``
         (e.g. the desktop's per-user dir under ``~/.config/Hive/users/<hash>/``
         or ``~/Library/Application Support/Hive/users/<hash>/``) is always
-        populated with ``hive_tools`` / ``gcu-tools`` / ``files-tools`` /
-        ``shell-tools`` before any agent code reads ``installed.json``.
+        populated with ``hive_tools`` / ``files-tools`` / ``shell-tools``
+        before any agent code reads ``installed.json``.
         Without this, ``load_agent_selection()`` resolves an empty registry
         and emits "Server X requested but not installed" warnings even
         though the server is bundled.
@@ -882,6 +893,11 @@ class MCPRegistry:
                     "Server '%s' has no tools list in manifest; max_tools enforced at registration",
                     name,
                 )
+            elif name in DEFAULT_LOCAL_SERVER_NAMES:
+                # Essential bundled servers bypass the cap — they must always
+                # resolve so their tools are guaranteed present in the queen's
+                # boot snapshot regardless of how many user servers precede them.
+                pass
             elif max_tools is not None and total_tools + server_tool_count > max_tools:
                 logger.info(
                     "Skipping server '%s' (%d tools): would exceed max_tools=%d",

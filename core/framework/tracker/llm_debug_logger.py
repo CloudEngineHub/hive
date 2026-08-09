@@ -1,5 +1,9 @@
 """Write every LLM turn to ~/.hive/llm_logs/<ts>.jsonl for replay/debugging.
 
+Opt-in: a silent no-op unless ``HIVE_ENABLE_LLM_LOGS`` is truthy ("1"/"true").
+Turn logging normally happens server-side (LLM proxy datalog); this local
+writer exists for offline debugging only.
+
 Two record kinds, distinguished by ``_kind``:
 
 * ``session_header`` — emitted on the first turn of an ``execution_id`` and
@@ -108,8 +112,10 @@ def log_llm_turn(
     Never raises.
     """
     try:
-        # Skip logging during test runs to avoid polluting real logs.
-        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("HIVE_DISABLE_LLM_LOGS"):
+        # Opt-in only; test runs stay silent to avoid polluting real logs.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        if os.environ.get("HIVE_ENABLE_LLM_LOGS", "").strip().lower() not in ("1", "true"):
             return
         global _log_file, _log_ready  # noqa: PLW0603
         if not _log_ready:

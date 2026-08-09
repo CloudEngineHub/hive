@@ -65,10 +65,7 @@ def build_theme(theme: str = "light") -> dict:
         "color": palette,
         "backgroundColor": "transparent",
         "textStyle": {
-            "fontFamily": (
-                '"Inter Tight", -apple-system, BlinkMacSystemFont, '
-                '"Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
-            ),
+            "fontFamily": ('"Inter Tight", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'),
             "color": fg,
             "fontSize": 12,
         },

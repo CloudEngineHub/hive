@@ -3,7 +3,7 @@ export interface Colony {
   name: string;
   agentPath: string;
   description: string;
-  status: "running" | "idle";
+  status: "active" | "idle" | "parked";
   unreadCount: number;
   queenId: string;
   queenProfileId: string | null;
@@ -35,10 +35,17 @@ export interface Template {
   agentPath: string;
 }
 
+import type { PortraitDescriptor } from "@/api/queens";
+
 export interface QueenProfileSummary {
   id: string;
   name: string;
   title: string;
+  portrait?: PortraitDescriptor | null;
+  /** True when an avatar.{jpg|png|webp} exists on disk for this queen.
+   * Renderers gate the `<img>` load on this so first-time users don't
+   * see a 404 for every queen in the sidebar. */
+  has_avatar?: boolean;
 }
 
 export interface UserProfile {

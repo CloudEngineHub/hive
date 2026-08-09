@@ -7,9 +7,9 @@ foundational to a tool family — the agent shouldn't have to discover
 them reactively after its first broken selector call.
 
 Only the foundation skill (e.g. ``hive.browser-automation``) is wired
-in here. Site-specific skills (``hive.x-automation``,
-``hive.linkedin-automation``) stay in the catalog and rely on their
-descriptions to get picked up on demand.
+in here. Site-specific skills (``hive.x-com-automation``, the ``hive.linkedin-*``
+SDK skills) stay in the catalog and rely on their descriptions to get
+picked up on demand.
 """
 
 from __future__ import annotations
@@ -21,10 +21,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Bundled skills live in two sibling dirs: ``_default_skills`` (always-on
-# infra) and ``_preset_skills`` (capability packs, off by default but
-# still bundled). Tool-gated pre-activation walks both so ``browser_*``
-# tools still pull in the browser-automation preset even though it isn't
-# default-enabled in the catalog.
+# infra + browser-automation, registered in SKILL_REGISTRY) and
+# ``_preset_skills`` (remaining capability packs, off by default but
+# still bundled). Tool-gated pre-activation walks both so a moved skill
+# keeps working from either directory without touching this table.
 _BUNDLED_DIRS: tuple[Path, ...] = (
     Path(__file__).parent / "_default_skills",
     Path(__file__).parent / "_preset_skills",

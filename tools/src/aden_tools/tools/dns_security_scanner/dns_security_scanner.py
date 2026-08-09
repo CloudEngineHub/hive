@@ -101,17 +101,12 @@ def _check_spf(resolver: dns.resolver.Resolver, domain: str) -> dict:
                 issues = []
                 if "~all" in txt:
                     policy = "softfail"
-                    issues.append(
-                        "Uses ~all (softfail) instead of -all (hardfail). Spoofed emails may still be delivered."
-                    )
+                    issues.append("Uses ~all (softfail) instead of -all (hardfail). Spoofed emails may still be delivered.")
                 elif "-all" in txt:
                     policy = "hardfail"
                 elif "+all" in txt:
                     policy = "pass_all"
-                    issues.append(
-                        "Uses +all which allows ANY server to send email for this domain. "
-                        "This effectively disables SPF protection."
-                    )
+                    issues.append("Uses +all which allows ANY server to send email for this domain. This effectively disables SPF protection.")
                 elif "?all" in txt:
                     policy = "neutral"
                     issues.append("Uses ?all (neutral). SPF results are not used for filtering.")
@@ -151,9 +146,7 @@ def _check_dmarc(resolver: dns.resolver.Resolver, domain: str) -> dict:
                         policy = part[2:].strip()
 
                 if policy == "none":
-                    issues.append(
-                        "DMARC policy is 'none' — spoofed emails are not blocked. Upgrade to p=quarantine or p=reject."
-                    )
+                    issues.append("DMARC policy is 'none' — spoofed emails are not blocked. Upgrade to p=quarantine or p=reject.")
                 elif policy == "quarantine":
                     pass  # Acceptable
                 elif policy == "reject":
@@ -248,10 +241,7 @@ def _check_zone_transfer(resolver: dns.resolver.Resolver, domain: str) -> dict:
                     "record_count": len(zone.nodes),
                     "severity": "critical",
                     "finding": f"Zone transfer allowed on {ns_host}",
-                    "remediation": (
-                        "Disable AXFR for public-facing nameservers. "
-                        "Restrict zone transfers to authorized secondary DNS servers only."
-                    ),
+                    "remediation": ("Disable AXFR for public-facing nameservers. Restrict zone transfers to authorized secondary DNS servers only."),
                 }
         except Exception:
             continue

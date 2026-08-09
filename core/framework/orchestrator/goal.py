@@ -130,10 +130,6 @@ class Goal(BaseModel):
         description="What the agent needs: 'llm', 'web_search', 'code_execution', etc.",
     )
 
-    # Input/output schema
-    input_schema: dict[str, Any] = Field(default_factory=dict, description="Expected input format")
-    output_schema: dict[str, Any] = Field(default_factory=dict, description="Expected output format")
-
     # Versioning for evolution
     version: str = "1.0.0"
     parent_version: str | None = None

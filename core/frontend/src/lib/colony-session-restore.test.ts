@@ -26,7 +26,7 @@ describe("resolveInitialColonyPhase", () => {
         prefetchedSessionId: "session_forked",
         resolvedSessionId: "session_forked",
         prefetchedPhase: "independent",
-        serverPhase: "reviewing",
+        serverPhase: "colony",
         hasWorker: true,
       }),
     ).toBe("independent");
@@ -38,10 +38,10 @@ describe("resolveInitialColonyPhase", () => {
         prefetchedSessionId: "session_source",
         resolvedSessionId: "session_forked",
         prefetchedPhase: "independent",
-        serverPhase: "reviewing",
+        serverPhase: "colony",
         hasWorker: true,
       }),
-    ).toBe("reviewing");
+    ).toBe("colony");
   });
 
   it("falls back to worker state when neither restore nor server phase is present", () => {
@@ -53,6 +53,6 @@ describe("resolveInitialColonyPhase", () => {
         serverPhase: undefined,
         hasWorker: true,
       }),
-    ).toBe("working");
+    ).toBe("colony");
   });
 });

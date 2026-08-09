@@ -18,13 +18,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_MS = 30000
 DEFAULT_NAVIGATION_TIMEOUT_MS = 60000
 
-# ContextVar for profile routing (inherited from legacy code)
+# ContextVar for profile routing (inherited from legacy code). This is the
+# AGENT/session id (which tab group), NOT the Chrome browser profile.
 _active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("hive_gcu_profile", default="default")
+
+# ContextVar for the Chrome BROWSER profile (which extension connection / Chrome
+# user a command targets). Distinct from _active_profile. Normally supplied per
+# tool call as the injected ``browser_profile`` CONTEXT_PARAM; this var is the
+# fallback default for gcu-internal helpers that run without that arg.
+_active_browser_profile: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hive_gcu_browser_profile", default="default"
+)
 
 
 def set_active_profile(profile: str) -> contextvars.Token:
-    """Set the active browser profile for the current async context."""
+    """Set the active agent profile for the current async context."""
     return _active_profile.set(profile)
+
+
+def set_active_browser_profile(browser_profile: str) -> contextvars.Token:
+    """Set the active Chrome browser profile for the current async context."""
+    return _active_browser_profile.set(browser_profile)
 
 
 def get_session(profile: str | None = None) -> dict[str, Any]:

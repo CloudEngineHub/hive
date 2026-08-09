@@ -118,11 +118,7 @@ def register_tools(mcp: FastMCP, credentials: Any = None) -> None:
         if not resource_group or not server_name:
             return {"error": "resource_group and server_name are required"}
 
-        url = (
-            f"{BASE_URL}/subscriptions/{sub_id}"
-            f"/resourceGroups/{resource_group}"
-            f"/providers/Microsoft.Sql/servers/{server_name}"
-        )
+        url = f"{BASE_URL}/subscriptions/{sub_id}/resourceGroups/{resource_group}/providers/Microsoft.Sql/servers/{server_name}"
         data = _get(url, headers)
         if "error" in data:
             return data
@@ -144,11 +140,7 @@ def register_tools(mcp: FastMCP, credentials: Any = None) -> None:
         if not resource_group or not server_name:
             return {"error": "resource_group and server_name are required"}
 
-        url = (
-            f"{BASE_URL}/subscriptions/{sub_id}"
-            f"/resourceGroups/{resource_group}"
-            f"/providers/Microsoft.Sql/servers/{server_name}/databases"
-        )
+        url = f"{BASE_URL}/subscriptions/{sub_id}/resourceGroups/{resource_group}/providers/Microsoft.Sql/servers/{server_name}/databases"
         data = _get(url, headers)
         if "error" in data:
             return data
@@ -202,12 +194,7 @@ def register_tools(mcp: FastMCP, credentials: Any = None) -> None:
         if not resource_group or not server_name:
             return {"error": "resource_group and server_name are required"}
 
-        url = (
-            f"{BASE_URL}/subscriptions/{sub_id}"
-            f"/resourceGroups/{resource_group}"
-            f"/providers/Microsoft.Sql/servers/{server_name}"
-            "/firewallRules"
-        )
+        url = f"{BASE_URL}/subscriptions/{sub_id}/resourceGroups/{resource_group}/providers/Microsoft.Sql/servers/{server_name}/firewallRules"
         data = _get(url, headers)
         if "error" in data:
             return data

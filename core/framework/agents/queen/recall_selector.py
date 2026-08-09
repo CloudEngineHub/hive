@@ -72,6 +72,12 @@ async def select_memories(
         logger.debug("recall: no memory files found, skipping selection")
         return []
 
+    # Profile memories are user-identity baseline. The description rarely
+    # enumerates every entity inside the body (e.g. user-profile.md will say
+    # "personal life" but not name every person), so an LLM-only selector
+    # misses queries like "who is <partner-name>". Always include them.
+    pinned = [f.filename for f in files if (f.type or "").lower() == "profile"][:max_results]
+
     logger.debug("recall: selecting from %d memories for query: %.100s", len(files), query)
     manifest = format_memory_manifest(files)
     user_msg = f"## User query\n\n{query}\n\n## Available memories\n\n{manifest}"
@@ -90,7 +96,7 @@ async def select_memories(
                 resp.model,
                 resp.stop_reason,
             )
-            return []
+            return pinned
         # Some models wrap JSON in markdown fences or add preamble text.
         # Try to extract the JSON object if raw parse fails.
         try:
@@ -103,15 +109,58 @@ async def select_memories(
                 data = json.loads(m.group())
             else:
                 logger.warning("recall: LLM returned non-JSON: %.200s", raw)
-                return []
+                return pinned
         selected = data.get("selected_memories", [])
         valid_names = {f.filename for f in files}
-        result = [s for s in selected if s in valid_names][:max_results]
-        logger.debug("recall: selected %d memories: %s", len(result), result)
+        # Some models return filenames without the .md extension or as a
+        # bare slug; tolerate both so we don't silently drop valid picks.
+        name_aliases: dict[str, str] = {}
+        for f in files:
+            name_aliases[f.filename] = f.filename
+            stem = f.filename.removesuffix(".md")
+            name_aliases.setdefault(stem, f.filename)
+        normalized: list[str] = []
+        dropped: list[Any] = []
+        for s in selected:
+            if not isinstance(s, str):
+                dropped.append(s)
+                continue
+            if s in valid_names:
+                normalized.append(s)
+            elif s in name_aliases:
+                normalized.append(name_aliases[s])
+            else:
+                dropped.append(s)
+        merged = list(pinned)
+        for s in normalized:
+            if s not in merged:
+                merged.append(s)
+        result = merged[:max_results]
+        if not normalized:
+            # LLM picked nothing. Log the raw response so the next bug
+            # report is diagnosable; we still return pinned memories.
+            logger.debug(
+                "recall: LLM selected 0 memories (model=%s, raw=%.300s, dropped=%s, pinned=%s)",
+                resp.model,
+                raw,
+                dropped,
+                pinned,
+            )
+        else:
+            logger.debug(
+                "recall: selected %d memories: %s (pinned=%s)",
+                len(result),
+                result,
+                pinned,
+            )
         return result
     except Exception as exc:
-        logger.warning("recall: memory selection failed (%s), returning []", exc)
-        return []
+        logger.warning(
+            "recall: memory selection failed (%s), returning pinned=%s",
+            exc,
+            pinned,
+        )
+        return pinned
 
 
 def _format_relative_age(mtime: float) -> str | None:

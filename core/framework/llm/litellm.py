@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
 import os
+import random
 import re
+import shlex
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,9 +31,11 @@ if TYPE_CHECKING:
 try:
     import litellm
     from litellm.exceptions import RateLimitError
+    from litellm.integrations.custom_logger import CustomLogger
 except ImportError:
     litellm = None  # type: ignore[assignment]
     RateLimitError = Exception  # type: ignore[assignment, misc]
+    CustomLogger = object  # type: ignore[assignment, misc]
 
 from framework.config import HIVE_LLM_ENDPOINT as HIVE_API_BASE
 from framework.llm.model_catalog import get_model_pricing
@@ -97,9 +102,7 @@ def _patch_litellm_anthropic_oauth() -> None:
 
     original = AnthropicModelInfo.validate_environment
 
-    def _patched_validate_environment(
-        self, headers, model, messages, optional_params, litellm_params, api_key=None, api_base=None
-    ):
+    def _patched_validate_environment(self, headers, model, messages, optional_params, litellm_params, api_key=None, api_base=None):
         result = original(
             self,
             headers,
@@ -184,9 +187,76 @@ def _patch_litellm_metadata_nonetype() -> None:
         )
 
 
+def _patch_litellm_preserve_credits() -> None:
+    """Patch litellm's Anthropic ``calculate_usage`` to preserve ``credits``.
+
+    The Hive proxy returns a non-standard ``credits`` field on each
+    ``message_delta.usage`` (cumulative per-request, last-event-wins). Litellm's
+    ``AnthropicConfig.calculate_usage`` constructs its ``Usage`` Pydantic model
+    with explicit kwargs from a fixed schema — anything outside that schema is
+    silently dropped, including ``credits``. Both streaming and non-streaming
+    Anthropic paths funnel through this one function, so wrapping it once
+    catches both.
+
+    The patched wrapper calls the original, then attaches ``credits`` to the
+    returned ``Usage`` as a plain Python attribute (via ``object.__setattr__``
+    to bypass Pydantic v2 validation). ``_credits_from_usage`` upstream reads
+    it back via ``getattr``.
+    """
+    try:
+        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    except ImportError:
+        logger.warning(
+            "Could not apply litellm credits-preservation patch — litellm "
+            "internals may have changed. Hive credit accounting will be "
+            "unavailable. Current litellm version: %s",
+            getattr(litellm, "__version__", "unknown"),
+        )
+        return
+
+    original = AnthropicConfig.calculate_usage
+
+    def _patched_calculate_usage(self, usage_object, *args, **kwargs):
+        usage = original(self, usage_object, *args, **kwargs)
+        if isinstance(usage_object, dict):
+            raw = usage_object.get("credits")
+            logger.debug(
+                "[credits] calculate_usage raw=%s credits=%r keys=%s",
+                "hive-format" if "credits" in usage_object else "no-credits-key",
+                raw,
+                sorted(usage_object.keys()),
+            )
+            if isinstance(raw, (int, float)):
+                # Pydantic v2 with extra="allow" stores unknown fields in
+                # ``model_extra``. Plain ``setattr`` puts the value in
+                # ``__dict__`` only, which gets stripped when downstream
+                # code re-validates the Usage (e.g. when it's passed to
+                # ``ModelResponseStream(usage=usage)``). Writing into
+                # ``model_extra`` survives that round-trip.
+                try:
+                    extra = usage.model_extra
+                    if extra is None:
+                        # Defensive: rebuild via constructor so model_extra
+                        # gets initialized.
+                        from litellm.types.utils import Usage as _U
+
+                        usage = _U(**usage.model_dump(), credits=float(raw))
+                    else:
+                        extra["credits"] = float(raw)
+                        # Mirror to __dict__ so plain ``getattr`` still works.
+                        object.__setattr__(usage, "credits", float(raw))
+                except Exception:
+                    logger.debug("[credits] failed to attach credits", exc_info=True)
+        return usage
+
+    AnthropicConfig.calculate_usage = _patched_calculate_usage  # type: ignore[assignment]
+    logger.info("[credits] applied calculate_usage patch")
+
+
 if litellm is not None:
     _patch_litellm_anthropic_oauth()
     _patch_litellm_metadata_nonetype()
+    _patch_litellm_preserve_credits()
     # Let litellm silently drop params unsupported by the target provider
     # (e.g. stream_options for Anthropic) instead of forwarding them verbatim.
     litellm.drop_params = True
@@ -211,27 +281,53 @@ def _ensure_ollama_chat_prefix(model: str) -> str:
     return model
 
 
-def rewrite_proxy_model(
-    model: str, api_key: str | None, api_base: str | None
-) -> tuple[str, str | None, dict[str, str]]:
+def _log_llm_call(kwargs: dict[str, Any], *, stream: bool = False, attempt: int = 0) -> None:
+    """Emit one INFO line per actual provider call.
+
+    Fires immediately before ``litellm.(a)completion`` so a runtime that
+    "looks frozen" surfaces as a recent ``[llm] →`` line with the model
+    and request shape. Kept terse — model, message count, max_tokens,
+    tool count, stream flag, attempt index (only when > 0).
+    """
+    msgs = kwargs.get("messages") or []
+    tools = kwargs.get("tools") or []
+    extras: list[str] = []
+    if stream:
+        extras.append("stream")
+    if attempt > 0:
+        extras.append(f"attempt={attempt + 1}")
+    tail = (" " + " ".join(extras)) if extras else ""
+    logger.info(
+        "[llm] → model=%s msgs=%d max_tokens=%s tools=%d%s",
+        kwargs.get("model", "?"),
+        len(msgs),
+        kwargs.get("max_tokens", "?"),
+        len(tools),
+        tail,
+    )
+
+
+def rewrite_proxy_model(model: str, api_key: str | None, api_base: str | None) -> tuple[str, str | None, dict[str, str]]:
     """Apply Hive/Kimi proxy rewrites for any caller of ``litellm.acompletion``.
 
-    Both the Hive LLM proxy and Kimi For Coding expose Anthropic-API-
-    compatible endpoints. LiteLLM doesn't recognise the ``hive/`` or
-    ``kimi/`` prefixes natively, so we rewrite them to ``anthropic/``
-    here. For the Hive proxy we also stamp a Bearer token into
-    ``extra_headers`` because litellm's Anthropic handler only sends
-    ``x-api-key`` and the proxy expects ``Authorization: Bearer``.
+    Both the Hive LLM proxy (llm.open-hive.com) and Kimi For Coding expose
+    Anthropic-API-compatible endpoints. LiteLLM doesn't recognise the
+    ``hive/`` or ``kimi/`` prefixes natively, so we rewrite them to
+    ``anthropic/`` here. For the Hive proxy we also stamp a Bearer token
+    into ``extra_headers`` because litellm's Anthropic handler only
+    sends ``x-api-key`` and the proxy expects ``Authorization: Bearer``.
 
-    Used by ad-hoc ``litellm.acompletion`` callers (e.g. the vision-
-    fallback subagent in ``caption_tool_image``) so they hit the same
-    proxy with the same auth as the main agent's ``LiteLLMProvider``.
-    The provider's own ``__init__`` keeps its inlined rewrite for now —
-    this helper is the single source of truth for ad-hoc callers.
+    Single source of truth for proxy-prefix handling. Used by
+    ``LiteLLMProvider.__init__`` / ``reconfigure`` *and* by direct
+    ``litellm.acompletion`` callers (e.g. the vision-fallback
+    subagent in ``caption_tool_image``) so the main agent and any
+    ad-hoc LLM call hit the same proxy with the same auth.
 
     Returns: (rewritten_model, normalised_api_base, extra_headers).
     The ``extra_headers`` dict is non-empty only for the Hive proxy
-    (and only when ``api_key`` is provided).
+    (and only when ``api_key`` is provided); callers that resolve
+    ``api_key`` later should ignore the returned headers and stamp
+    the bearer themselves once the key is known.
     """
     extra_headers: dict[str, str] = {}
     if model.lower().startswith("kimi/"):
@@ -344,6 +440,84 @@ def _build_system_message(
     return sys_msg
 
 
+def _append_json_instruction(full_messages: list[dict[str, Any]]) -> None:
+    """Ask for JSON output via prompt engineering (works across providers).
+
+    Appends to the leading system message when present, otherwise inserts
+    one. Handles both system-content shapes: plain string, and the
+    two-block list form produced by ``_build_system_message`` (where a
+    bare ``+=`` would extend the list with individual characters).
+    """
+    json_instruction = "\n\nPlease respond with a valid JSON object."
+    if full_messages and full_messages[0]["role"] == "system":
+        content = full_messages[0]["content"]
+        if isinstance(content, list):
+            content.append({"type": "text", "text": json_instruction.strip()})
+        else:
+            full_messages[0]["content"] = content + json_instruction
+    else:
+        full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+
+
+def _history_cache_breakpoint_index(messages: list[dict[str, Any]], model: str) -> int:
+    """Return the index in ``messages`` where the rolling cache breakpoint
+    WOULD be placed, or ``-1`` when no breakpoint is placed.
+
+    Non-mutating mirror of ``_apply_history_cache_breakpoint``. Exposed so
+    the AgentLoop can record the anchor position in diagnostic events
+    without re-implementing the selection rule. Both functions must stay
+    in lock-step — change one, change the other.
+    """
+    if not _model_supports_cache_control(model):
+        return -1
+    anchor_idx = len(messages) - 1
+    if anchor_idx < 0:
+        return -1
+    if messages[anchor_idx].get("role") == "system":
+        return -1
+    return anchor_idx
+
+
+def _apply_history_cache_breakpoint(full_messages: list[dict[str, Any]], model: str) -> None:
+    """Attach a rolling Anthropic ``cache_control`` marker on the LAST message.
+
+    Anthropic permits up to 4 ephemeral cache breakpoints per request; we
+    use one on the static system block (``_build_system_message``) and this
+    rolling one at the very end of the history — whatever role the final
+    message has (user turn, assistant reply, or tool result).
+
+    Anchoring at the end is what makes long tool-use turns cacheable: an
+    agent iteration appends one assistant + one tool-result message and
+    re-sends the request, and Anthropic's automatic prefix checking (which
+    looks back up to ~20 content blocks from each explicit breakpoint)
+    finds the previous iteration's cached prefix, so each request reads
+    the whole prior history from cache and writes only the new tail. The
+    previous anchor rule ("message before the last user turn") never
+    advanced inside a turn — for a worker whose only user message is its
+    initial task, it landed on the system message and bailed, leaving the
+    entire growing tool loop uncached on every iteration.
+
+    On compaction the prefix bytes shift and we eat one cache-miss turn
+    (then re-warm at the smaller size); a one-turn cost amortised across
+    many warm turns.
+
+    Skips when:
+      * the provider doesn't honor ``cache_control`` (gated by
+        ``_model_supports_cache_control``);
+      * there are no messages, or the last message is the system block
+        (already cached separately by ``_build_system_message``).
+    """
+    if not _model_supports_cache_control(model):
+        return
+    anchor_idx = len(full_messages) - 1
+    if anchor_idx < 0:
+        return
+    anchor = full_messages[anchor_idx]
+    if anchor.get("role") == "system":
+        return
+    anchor["cache_control"] = {"type": "ephemeral"}
+
+
 # Kimi For Coding uses an Anthropic-compatible endpoint (no /v1 suffix).
 # Claude Code integration uses this format; the /v1 OpenAI-compatible endpoint
 # enforces a coding-agent whitelist that blocks unknown User-Agents.
@@ -388,10 +562,7 @@ def _claude_code_billing_header(messages: list[dict[str, Any]]) -> str:
     sampled = "".join(_sample_js_code_unit(first_text, i) for i in (4, 7, 20))
     version_hash = hashlib.sha256(f"{_CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()).hexdigest()
     entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip() or "cli"
-    return (
-        f"x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{version_hash[:3]}; "
-        f"cc_entrypoint={entrypoint}; cch=00000;"
-    )
+    return f"x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{version_hash[:3]}; cc_entrypoint={entrypoint}; cch=00000;"
 
 
 # Empty-stream retries use a short fixed delay, not the rate-limit backoff.
@@ -423,6 +594,60 @@ def _failed_requests_dir() -> Path:
     from framework.config import HIVE_HOME
 
     return HIVE_HOME / "failed_requests"
+
+
+# ---------------------------------------------------------------------------
+# Failed-request curl capture
+#
+# To make a dumped failure reproducible, we record the exact request litellm
+# built for each call. litellm's pre-call hook fires after the request body
+# and headers are assembled but before the HTTP send, so it sees litellm's
+# real, post-transform request.
+#
+# Propagation is tricky: litellm runs that hook inside its own copied
+# contextvars Context, so a ContextVar.set() there never reaches the caller.
+# Instead the caller installs an *empty holder dict* in the ContextVar before
+# each call (_install_request_holder); litellm's copied context inherits the
+# very same dict object, and the hook *mutates it in place*. Dict mutation
+# crosses the context boundary; a ContextVar reassignment would not. The
+# per-call holder also keeps concurrent agent tasks isolated.
+# ---------------------------------------------------------------------------
+_last_llm_request: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("hive_last_llm_request", default=None)
+
+
+def _install_request_holder() -> None:
+    """Install a fresh holder dict for _RequestCaptureLogger to fill in.
+
+    Must be called immediately before each litellm completion/acompletion
+    invocation, in the same task/thread that issues the call.
+    """
+    _last_llm_request.set({})
+
+
+class _RequestCaptureLogger(CustomLogger):  # type: ignore[misc,valid-type]
+    """litellm callback that records the outgoing request into the holder dict."""
+
+    def log_pre_api_call(self, model: str, messages: list, kwargs: dict) -> None:
+        try:
+            holder = _last_llm_request.get()
+            if holder is None:
+                return  # No holder installed for this call — nothing to fill.
+            aa = kwargs.get("additional_args") or {}
+            holder.update(
+                {
+                    "api_base": aa.get("api_base"),
+                    "headers": aa.get("headers"),
+                    "body": aa.get("complete_input_dict"),
+                    "api_key": kwargs.get("api_key"),
+                }
+            )
+        except Exception:
+            pass  # Capture is best-effort — never disrupt the LLM call.
+
+
+# litellm only invokes log_pre_api_call for callbacks present in input_callback.
+if litellm is not None and not any(isinstance(c, _RequestCaptureLogger) for c in litellm.input_callback):
+    litellm.input_callback.append(_RequestCaptureLogger())
 
 
 # Maximum number of dump files to retain in $HIVE_HOME/failed_requests/.
@@ -466,10 +691,7 @@ def _cost_from_catalog_pricing(
 
     plain_input = max(input_tokens - cached_tokens - cache_creation_tokens, 0)
     total = (
-        plain_input * per_mtok_in
-        + cached_tokens * per_mtok_cache_read
-        + cache_creation_tokens * per_mtok_cache_write
-        + output_tokens * per_mtok_out
+        plain_input * per_mtok_in + cached_tokens * per_mtok_cache_read + cache_creation_tokens * per_mtok_cache_write + output_tokens * per_mtok_out
     ) / 1_000_000
     return float(total) if total > 0 else 0.0
 
@@ -524,6 +746,83 @@ def _extract_cost(response: Any, model: str) -> float:
         if fallback > 0:
             return fallback
     return 0.0
+
+
+def _credits_from_usage(usage: Any) -> float | None:
+    """Read ``usage.credits`` (Hive proxy field). Returns None if absent.
+
+    Only the Hive proxy populates this — direct provider models never carry
+    it. ``None`` means "no estimate" (per the proxy spec), not zero. The
+    value is cumulative for the whole request: in streaming, each event's
+    ``credits`` is the running total, last-event-wins.
+
+    LiteLLM's ``Usage`` is a Pydantic v2 model with ``extra="allow"``. Unknown
+    fields like ``credits`` may sit on the instance as a direct attribute, in
+    ``model_extra``, or only survive in ``model_dump()`` — depending on which
+    code path inside litellm constructed the object. We try all of them.
+    """
+    if usage is None:
+        return None
+    raw: Any = None
+    # 1. Direct attribute (Pydantic v2 with extra="allow" surfaces extras here
+    #    when set via __init__; not always populated when set via field-copy).
+    raw = getattr(usage, "credits", None)
+    # 2. Pydantic v2 model_extra dict.
+    if raw is None:
+        extra = getattr(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            raw = extra.get("credits")
+    # 3. dict-style access (some usage shapes are plain dicts).
+    if raw is None and hasattr(usage, "get"):
+        try:
+            raw = usage.get("credits")
+        except Exception:
+            raw = None
+    if raw is None and hasattr(usage, "__getitem__"):
+        try:
+            raw = usage["credits"]
+        except Exception:
+            raw = None
+    # 4. model_dump round-trip — last resort, but most reliable when extras
+    #    are stored opaquely.
+    if raw is None and hasattr(usage, "model_dump"):
+        try:
+            dumped = usage.model_dump()
+            if isinstance(dumped, dict):
+                raw = dumped.get("credits")
+        except Exception:
+            pass
+    # 5. __dict__ for non-Pydantic shapes.
+    if raw is None:
+        d = getattr(usage, "__dict__", None)
+        if isinstance(d, dict):
+            raw = d.get("credits")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    # Quiet on non-Hive models (where credits absence is expected). Hive-
+    # aliased calls go through ``_patch_litellm_preserve_credits`` which
+    # stashes credits as a direct attribute, so reaching this point on a
+    # hive-* request indicates the patch failed.
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            snapshot: Any
+            if hasattr(usage, "model_dump"):
+                snapshot = usage.model_dump()
+            elif hasattr(usage, "__dict__"):
+                snapshot = dict(getattr(usage, "__dict__", {}) or {})
+            else:
+                snapshot = repr(usage)
+            logger.debug("[credits] not found on usage; shape=%s", snapshot)
+        except Exception:
+            pass
+    return None
+
+
+def _extract_credits(response: Any) -> float | None:
+    """Pull credits from a non-streaming response's usage block."""
+    if response is None:
+        return None
+    return _credits_from_usage(getattr(response, "usage", None))
 
 
 def _cost_from_tokens(
@@ -584,11 +883,7 @@ def _extract_cache_tokens(usage: Any) -> tuple[int, int]:
     if not usage:
         return 0, 0
     _details = getattr(usage, "prompt_tokens_details", None)
-    cache_read = (
-        getattr(_details, "cached_tokens", 0) or 0
-        if _details is not None
-        else getattr(usage, "cache_read_input_tokens", 0) or 0
-    )
+    cache_read = getattr(_details, "cached_tokens", 0) or 0 if _details is not None else getattr(usage, "cache_read_input_tokens", 0) or 0
     cache_creation = (getattr(_details, "cache_write_tokens", 0) or 0 if _details is not None else 0) or (
         getattr(usage, "cache_creation_input_tokens", 0) or 0
     )
@@ -644,6 +939,60 @@ def _is_openrouter_tool_compat_cached(model: str) -> bool:
     return True
 
 
+def _build_failed_request_curl() -> str | None:
+    """Render the current task's last LLM request as a runnable curl command.
+
+    Uses the request captured by :class:`_RequestCaptureLogger`. The body is
+    litellm's exact post-transform payload. On the Anthropic-style path (the
+    Hive proxy included) litellm also exposes the full URL and headers, so the
+    curl is byte-faithful — real API key included. On the OpenAI-SDK path
+    headers aren't visible pre-call, so the endpoint path and auth header are
+    reconstructed from the api_base and api_key.
+
+    Returns None when no request was captured (hook never ran).
+    """
+    req = _last_llm_request.get()
+    if not req:
+        return None
+    # api_base may arrive as a str, a urllib ParseResult, or an httpx.URL
+    # depending on the provider handler — normalize to a plain string.
+    raw_base = req.get("api_base") or ""
+    if isinstance(raw_base, str):
+        api_base = raw_base
+    elif hasattr(raw_base, "geturl"):
+        api_base = raw_base.geturl()
+    else:
+        api_base = str(raw_base)
+    headers = dict(req.get("headers") or {})
+    body = req.get("body")
+    api_key = req.get("api_key")
+
+    # OpenAI-SDK providers pass extra_body as a nested dict the SDK merges
+    # into the JSON body; flatten it so the curl body matches the wire bytes.
+    if isinstance(body, dict) and isinstance(body.get("extra_body"), dict):
+        merged = {k: v for k, v in body.items() if k != "extra_body"}
+        merged.update(body["extra_body"])
+        body = merged
+
+    # Headers present => Anthropic-style path: api_base is already the full
+    # endpoint URL. Headers absent => OpenAI-SDK path: api_base is a bare base,
+    # so append the chat-completions path and synthesize the auth header.
+    if headers:
+        url = api_base
+    else:
+        url = api_base.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+    parts = ["curl -X POST " + shlex.quote(url)]
+    for key, value in headers.items():
+        parts.append("-H " + shlex.quote(f"{key}: {value}"))
+    if body is not None:
+        parts.append("-d " + shlex.quote(json.dumps(body, default=str)))
+    return " \\\n  ".join(parts)
+
+
 def _dump_failed_request(
     model: str,
     kwargs: dict[str, Any],
@@ -677,6 +1026,8 @@ def _dump_failed_request(
             "stream": kwargs.get("stream"),
             "tool_choice": kwargs.get("tool_choice"),
             "response_format": kwargs.get("response_format"),
+            # Runnable curl reproducing the exact request litellm sent.
+            "curl": _build_failed_request_curl(),
         }
 
         with open(filepath, "w", encoding="utf-8") as f:
@@ -793,11 +1144,74 @@ def _summarize_request_for_log(kwargs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _exception_headers(exception: BaseException) -> Any:
+    """Return whatever dict-like headers the exception exposes, or None.
+
+    LiteLLM constructs RateLimitError with a synthetic httpx.Response whose
+    headers are only populated when the upstream response was attached. The
+    Anthropic handler often raises without attaching it, so also check
+    ``exception.headers`` (set directly on some litellm subclasses).
+    """
+    response = getattr(exception, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers:
+            return headers
+    headers = getattr(exception, "headers", None)
+    if headers:
+        return headers
+    return None
+
+
+def _parse_retry_after(headers: Any, max_delay: float) -> float | None:
+    """Parse retry-after-ms / retry-after from a header mapping.
+
+    Returns the delay in seconds clamped to [0, max_delay], or None when no
+    usable header is present.
+    """
+    retry_after_ms = headers.get("retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            return min(max(float(retry_after_ms) / 1000.0, 0), max_delay)
+        except (ValueError, TypeError):
+            pass
+
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 0), max_delay)
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            from email.utils import parsedate_to_datetime
+
+            retry_date = parsedate_to_datetime(retry_after)
+            now = datetime.now(retry_date.tzinfo)
+            return min(max((retry_date - now).total_seconds(), 0), max_delay)
+        except (ValueError, TypeError, OverflowError):
+            pass
+
+    return None
+
+
+# Floor used when the proxy's backpressure error has stripped Retry-After:
+# the Hive proxy's only signal is `{"type":"backpressure"}` so treat it as
+# "try again very soon" rather than falling through to exponential backoff.
+_BACKPRESSURE_RETRY_FLOOR = 1.0
+# Below this threshold we treat a server-provided Retry-After as "short" and
+# add positive jitter so N concurrent retrying clients don't all wake up
+# together. Long upstream values (Anthropic/OpenAI quota windows) are kept
+# verbatim.
+_SHORT_RETRY_AFTER_THRESHOLD = 5.0
+
+
 def _compute_retry_delay(
     attempt: int,
     exception: BaseException | None = None,
     backoff_base: int = RATE_LIMIT_BACKOFF_BASE,
     max_delay: int = RATE_LIMIT_MAX_DELAY,
+    jitter: bool = False,
 ) -> float:
     """Compute retry delay, preferring server-provided Retry-After headers.
 
@@ -805,48 +1219,38 @@ def _compute_retry_delay(
     1. retry-after-ms header (milliseconds, float)
     2. retry-after header as seconds (float)
     3. retry-after header as HTTP-date (RFC 7231)
-    4. Exponential backoff: backoff_base * 2^attempt
+    4. Implicit short retry when the error body identifies as proxy backpressure
+    5. Exponential backoff: backoff_base * 2^attempt
 
-    All values are capped at max_delay seconds.
+    ``jitter`` desynchronizes lockstep retries from concurrent callers: when
+    True, short delays gain positive jitter and the exponential fallback gains
+    bidirectional jitter. Long upstream Retry-After values are kept verbatim.
+    All values are capped at ``max_delay`` seconds.
     """
     if exception is not None:
-        response = getattr(exception, "response", None)
-        if response is not None:
-            headers = getattr(response, "headers", None)
-            if headers is not None:
-                # Priority 1: retry-after-ms (milliseconds)
-                retry_after_ms = headers.get("retry-after-ms")
-                if retry_after_ms is not None:
-                    try:
-                        delay = float(retry_after_ms) / 1000.0
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError):
-                        pass
+        headers = _exception_headers(exception)
+        if headers is not None:
+            delay = _parse_retry_after(headers, max_delay)
+            if delay is not None:
+                if jitter and delay < _SHORT_RETRY_AFTER_THRESHOLD:
+                    delay = delay * random.uniform(1.0, 1.5) + random.uniform(0, 0.5)
+                    delay = min(delay, max_delay)
+                return delay
 
-                # Priority 2: retry-after (seconds or HTTP-date)
-                retry_after = headers.get("retry-after")
-                if retry_after is not None:
-                    # Try as seconds (float)
-                    try:
-                        delay = float(retry_after)
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError):
-                        pass
+        # No headers — check whether this looks like Hive proxy backpressure.
+        # The proxy emits {"type":"error","error":{"type":"backpressure",...}}
+        # with retry-after:1, but LiteLLM may strip headers before raising.
+        if "backpressure" in str(exception).lower():
+            delay = _BACKPRESSURE_RETRY_FLOOR
+            if jitter:
+                delay = delay * random.uniform(1.0, 1.5) + random.uniform(0, 0.5)
+            return min(delay, max_delay)
 
-                    # Try as HTTP-date (e.g., "Fri, 31 Dec 2025 23:59:59 GMT")
-                    try:
-                        from email.utils import parsedate_to_datetime
-
-                        retry_date = parsedate_to_datetime(retry_after)
-                        now = datetime.now(retry_date.tzinfo)
-                        delay = (retry_date - now).total_seconds()
-                        return min(max(delay, 0), max_delay)
-                    except (ValueError, TypeError, OverflowError):
-                        pass
-
-    # Fallback: exponential backoff
     delay = backoff_base * (2**attempt)
-    return min(delay, max_delay)
+    delay = min(delay, max_delay)
+    if jitter:
+        delay *= random.uniform(0.75, 1.25)
+    return delay
 
 
 def _is_stream_transient_error(exc: BaseException) -> bool:
@@ -860,6 +1264,15 @@ def _is_stream_transient_error(exc: BaseException) -> bool:
     same malformed output.  This error is handled at the EventLoopNode level
     where the conversation can be modified before retrying.
     """
+    # Billing/credit errors are permanent — retrying a 0-balance account just
+    # produces the same 402. LiteLLM masks the proxy's 402 as APIConnectionError
+    # (see module note), so check the classification AND the message body.
+    err_type, status = _classify_llm_error(exc)
+    if err_type == "payment_required" or status == 402:
+        return False
+    if "insufficient_credits" in str(exc).lower():
+        return False
+
     try:
         from litellm.exceptions import (
             APIConnectionError,
@@ -881,6 +1294,88 @@ def _is_stream_transient_error(exc: BaseException) -> bool:
         transient_types = (TimeoutError, ConnectionError, OSError)
 
     return isinstance(exc, transient_types)
+
+
+def _classify_llm_error(exc: BaseException) -> tuple[str | None, int | None]:
+    """Classify an LLM-call exception into (error_type, upstream_status).
+
+    The ``error_type`` is a stable, coarse category the desktop client can
+    branch on without parsing free-form messages. ``upstream_status`` is the
+    HTTP status from the LLM provider when available.
+
+    Today we only emit ``"payment_required"`` for 402s (the Hive LLM proxy
+    returns this when the user's team has no active plan / has exhausted
+    credits) and ``"rate_limit"`` for 429s. Extend as new categories surface.
+    """
+    status: int | None = None
+    for attr in ("status_code", "http_status", "code"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            status = v
+            break
+    # LiteLLM wraps the upstream httpx response on .response.status_code.
+    if status is None:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            v = getattr(resp, "status_code", None)
+            if isinstance(v, int):
+                status = v
+    # Fall back to the chained cause (httpx.HTTPStatusError, etc.).
+    if status is None and exc.__cause__ is not None:
+        v = getattr(exc.__cause__, "status_code", None)
+        if isinstance(v, int):
+            status = v
+        else:
+            resp = getattr(exc.__cause__, "response", None)
+            if resp is not None:
+                v = getattr(resp, "status_code", None)
+                if isinstance(v, int):
+                    status = v
+
+    if status == 402:
+        return "payment_required", 402
+    if status == 429 or isinstance(exc, RateLimitError):
+        return "rate_limit", status or 429
+    return None, status
+
+
+def _is_hive_stream_token_invalid(exc: BaseException) -> bool:
+    """Detect the specific failure mode that warrants an in-VM
+    streamToken refresh + LLM retry. The Rust LLM proxy returns
+
+        HTTP 401 Unauthorized
+        {"error":{"type":"hive_stream_token_invalid", ...}}
+
+    when the runtime's ``hive`` credential is past exp or sid-revoked.
+    Without this detector, a stale token kills every LLM call until
+    either the periodic refresh loop ticks (~hours) or the desktop
+    re-pushes — both unacceptable when a queen needs to recover NOW.
+
+    Matches on the error-body marker, not just the status — a 401 from
+    upstream Anthropic/OpenAI is a DIFFERENT problem (real auth
+    failure, not a refreshable token), and we don't want to force-
+    refresh against the wrong provider's key."""
+    msg = str(exc).lower()
+    if "hive_stream_token_invalid" in msg:
+        return True
+    # Cover the case where the marker is in the wrapped response body
+    # but not in str(exc) — e.g. LiteLLM strips it from the message.
+    for attr in ("response", "__cause__", "_cause__"):
+        nested = getattr(exc, attr, None)
+        if nested is None:
+            continue
+        nested_text = ""
+        text_fn = getattr(nested, "text", None)
+        if callable(text_fn):
+            try:
+                nested_text = text_fn() or ""
+            except Exception:
+                nested_text = ""
+        elif isinstance(text_fn, str):
+            nested_text = text_fn
+        if "hive_stream_token_invalid" in nested_text.lower():
+            return True
+    return False
 
 
 def _extract_text_tool_calls(
@@ -979,6 +1474,7 @@ class LiteLLMProvider(LLMProvider):
         api_key: str | None = None,
         api_base: str | None = None,
         api_keys: list[str] | None = None,
+        api_key_resolver: Callable[[], str | None] | None = None,
         **kwargs: Any,
     ):
         """
@@ -994,27 +1490,31 @@ class LiteLLMProvider(LLMProvider):
             api_keys: Optional list of API keys for key-pool rotation. When
                       provided with 2+ keys, a :class:`KeyPool` is created and
                       keys are rotated on rate-limit errors.
+            api_key_resolver: Optional callable invoked before each LLM call
+                      to re-resolve the current api_key (e.g. from the
+                      credential store after a desktop streamToken refresh).
+                      When set, the snapshot in ``self.api_key`` is treated
+                      as a default — actual call sites pull the latest value
+                      via :meth:`_refresh_api_key` so refreshes propagate
+                      without needing ``_hot_swap_sessions`` to visit every
+                      live provider.
             **kwargs: Additional arguments passed to litellm.completion()
         """
-        # Kimi For Coding exposes an Anthropic-compatible endpoint at
-        # https://api.kimi.com/coding (the same format Claude Code uses natively).
-        # Translate kimi/ prefix to anthropic/ so litellm uses the Anthropic
-        # Messages API handler and routes to that endpoint — no special headers needed.
+        self._api_key_resolver = api_key_resolver
+        # Track whether the model uses the Hive LLM proxy. The bearer
+        # header it requires is stamped after api_key resolution below
+        # (we may not have api_key yet — could come from a key pool).
         _original_model = model
-        self._hive_proxy_auth = bool(_original_model.lower().startswith("hive/"))
+        self._hive_proxy_auth = bool(model.lower().startswith("hive/"))
         if _is_ollama_model(model):
             model = _ensure_ollama_chat_prefix(model)
-        elif model.lower().startswith("kimi/"):
-            model = "anthropic/" + model[len("kimi/") :]
-            # Normalise api_base: litellm's Anthropic handler appends /v1/messages,
-            # so the base must be https://api.kimi.com/coding (no /v1 suffix).
-            # Strip a trailing /v1 in case the user's saved config has the old value.
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
-        elif model.lower().startswith("hive/"):
-            model = "anthropic/" + model[len("hive/") :]
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
+        else:
+            # rewrite_proxy_model handles the kimi/ → anthropic/ and
+            # hive/ → anthropic/ rewrites and normalises api_base. We
+            # pass api_key=None because the key pool isn't resolved
+            # yet; the returned extra_headers is therefore empty for
+            # hive — we stamp the bearer below once api_key is known.
+            model, api_base, _ = rewrite_proxy_model(model, None, api_base)
         self.model = model
         # Key pool: when multiple keys are provided, enable rotation.
         self._key_pool: KeyPool | None = None
@@ -1032,6 +1532,9 @@ class LiteLLMProvider(LLMProvider):
             self.api_key = api_key or (api_keys[0] if api_keys else None)
         self.api_base = api_base or self._default_api_base_for_model(_original_model)
         self.extra_kwargs = kwargs
+        if self._hive_proxy_auth and self.api_key:
+            eh = self.extra_kwargs.setdefault("extra_headers", {})
+            eh["Authorization"] = f"Bearer {self.api_key}"
         # Detect Claude Code OAuth subscription by checking the api_key prefix.
         self._claude_code_oauth = bool(self.api_key and self.api_key.startswith("sk-ant-oat"))
         if self._claude_code_oauth:
@@ -1047,6 +1550,28 @@ class LiteLLMProvider(LLMProvider):
         if litellm is None:
             raise ImportError("LiteLLM is not installed. Please install it with: uv pip install litellm")
 
+    def _refresh_api_key(self) -> None:
+        """Re-resolve api_key from the configured resolver before each call.
+
+        Lets desktop streamToken refreshes propagate to every live provider
+        without _hot_swap_sessions needing to visit them. No-op when no
+        resolver was supplied (legacy behavior, snapshot wins).
+        """
+        if not self._api_key_resolver:
+            return
+        try:
+            fresh = self._api_key_resolver()
+        except Exception:
+            return
+        if not fresh or fresh == self.api_key:
+            return
+        self.api_key = fresh
+        if self._hive_proxy_auth:
+            # Keep the Bearer header in sync — initially stamped at
+            # __init__ (lines ~1411–1413) and rewritten by reconfigure().
+            eh = self.extra_kwargs.setdefault("extra_headers", {})
+            eh["Authorization"] = f"Bearer {fresh}"
+
     def reconfigure(self, model: str, api_key: str | None = None, api_base: str | None = None) -> None:
         """Hot-swap the model, API key, and/or base URL on this provider instance.
 
@@ -1055,17 +1580,12 @@ class LiteLLMProvider(LLMProvider):
         these attributes in-place propagates to all callers on the next LLM call.
         """
         _original_model = model
-        self._hive_proxy_auth = bool(_original_model.lower().startswith("hive/"))
+        self._hive_proxy_auth = bool(model.lower().startswith("hive/"))
         if _is_ollama_model(model):
             model = _ensure_ollama_chat_prefix(model)
-        elif model.lower().startswith("kimi/"):
-            model = "anthropic/" + model[len("kimi/") :]
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
-        elif model.lower().startswith("hive/"):
-            model = "anthropic/" + model[len("hive/") :]
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
+            proxy_headers: dict[str, str] = {}
+        else:
+            model, api_base, proxy_headers = rewrite_proxy_model(model, api_key, api_base)
         self.model = model
         self.api_key = api_key
         self.api_base = api_base or self._default_api_base_for_model(_original_model)
@@ -1073,6 +1593,15 @@ class LiteLLMProvider(LLMProvider):
         if self._claude_code_oauth:
             eh = self.extra_kwargs.setdefault("extra_headers", {})
             eh.setdefault("user-agent", CLAUDE_CODE_USER_AGENT)
+        if self._hive_proxy_auth:
+            eh = self.extra_kwargs.setdefault("extra_headers", {})
+            # rewrite_proxy_model fills proxy_headers when api_key is
+            # set; when api_key was cleared we explicitly drop the stale
+            # bearer so the next call doesn't reuse the prior token.
+            if proxy_headers.get("Authorization"):
+                eh["Authorization"] = proxy_headers["Authorization"]
+            else:
+                eh.pop("Authorization", None)
         self._codex_backend = bool(self.api_base and "chatgpt.com/backend-api/codex" in self.api_base)
         self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
 
@@ -1081,6 +1610,39 @@ class LiteLLMProvider(LLMProvider):
         # correctly marks codex models with mode="responses", so we do NOT
         # override the mode.  The responses_api_bridge in litellm handles
         # converting Chat Completions requests to Responses API format.
+
+    def _apply_usage_agent_header(self, kwargs: dict[str, Any]) -> None:
+        """Stamp ``X-Hive-Agent`` / ``X-Hive-Session`` for Hive-LLM-proxy-bound calls.
+
+        The Rust LLM proxy reads these headers and writes them into
+        ``llm_events`` for per-agent / per-session cloud usage
+        attribution. Off for direct Anthropic / Kimi / OpenRouter /
+        Ollama traffic — only the Hive proxy expects (and reads) them.
+
+        We mutate a fresh copy of ``extra_headers`` rather than the dict
+        that came in via ``**self.extra_kwargs`` so the per-call values
+        do not leak into the next call. Reads ``usage_agent_id`` and
+        ``session_id`` from the task-tools execution context (set by
+        queen_orchestrator and worker.py before each agent's iteration).
+        """
+        if not self._hive_proxy_auth:
+            return
+        try:
+            from framework.tasks.tools._context import current_session_id, current_usage_agent_id
+
+            agent_id = current_usage_agent_id()
+            session_id = current_session_id()
+        except Exception:
+            return
+        if not agent_id and not session_id:
+            return
+        existing = kwargs.get("extra_headers") or {}
+        headers = {**existing}
+        if agent_id:
+            headers["X-Hive-Agent"] = agent_id
+        if session_id and "X-Hive-Session" not in headers:
+            headers["X-Hive-Session"] = session_id
+        kwargs["extra_headers"] = headers
 
     @staticmethod
     def _default_api_base_for_model(model: str) -> str | None:
@@ -1103,6 +1665,7 @@ class LiteLLMProvider(LLMProvider):
         automatically so the next attempt uses a different key -- no sleep
         needed between attempts.
         """
+        self._apply_usage_agent_header(kwargs)
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
         for attempt in range(retries + 1):
@@ -1111,7 +1674,22 @@ class LiteLLMProvider(LLMProvider):
             if self._key_pool:
                 current_key = self._key_pool.get_key()
                 kwargs["api_key"] = current_key
+            # Token fingerprint at the moment of the call. When the Hive
+            # proxy rejects a token, we cross-reference this fp against
+            # the most-recent ``configureLocalLlm`` push fp on the
+            # desktop side to tell whether the runtime is holding a
+            # stale spawn-time snapshot.
+            _call_key = kwargs.get("api_key")
+            _call_key_fp = f"len={len(_call_key)} {_call_key[:6]}…{_call_key[-4:]}" if isinstance(_call_key, str) and _call_key else "<empty>"
+            logger.debug(
+                "[hive-auth] LLM call: model=%s api_key=%s hive_proxy=%s",
+                kwargs.get("model"),
+                _call_key_fp,
+                self._hive_proxy_auth,
+            )
             try:
+                _install_request_holder()
+                _log_llm_call(kwargs, attempt=attempt)
                 response = litellm.completion(**kwargs)  # type: ignore[union-attr]
 
                 # Some providers (e.g. Gemini) return 200 with empty content on
@@ -1222,7 +1800,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                 logger.warning(
                     f"[retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -1231,6 +1809,24 @@ class LiteLLMProvider(LLMProvider):
                     f"(attempt {attempt + 1}/{retries})"
                 )
                 time.sleep(wait)
+            except Exception as auth_exc:
+                # Smoking-gun log line on auth rejections (401/403). The
+                # captured fp here is what the runtime actually sent —
+                # cross-reference with the desktop's most-recent
+                # ``[auth] configureLocalLlm pushing streamToken=…`` log
+                # to tell whether the runtime is holding a stale token
+                # snapshot vs. the proxy revoking a token within its TTL.
+                _err_type, _status = _classify_llm_error(auth_exc)
+                if _status in (401, 403):
+                    logger.error(
+                        "[hive-auth] LLM call rejected: model=%s status=%s api_key=%s hive_proxy=%s err=%s",
+                        kwargs.get("model"),
+                        _status,
+                        _call_key_fp,
+                        self._hive_proxy_auth,
+                        str(auth_exc)[:200],
+                    )
+                raise
         # unreachable, but satisfies type checker
         raise RuntimeError("Exhausted rate limit retries")
 
@@ -1245,6 +1841,7 @@ class LiteLLMProvider(LLMProvider):
         max_retries: int | None = None,
     ) -> LLMResponse:
         """Generate a completion using LiteLLM."""
+        self._refresh_api_key()
         # Codex ChatGPT backend requires streaming — delegate to the unified
         # async streaming path which properly handles tool calls.
         if self._codex_backend:
@@ -1265,15 +1862,11 @@ class LiteLLMProvider(LLMProvider):
         if system:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
+        _apply_history_cache_breakpoint(full_messages, self.model)
 
         # Add JSON mode via prompt engineering (works across all providers)
         if json_mode:
-            json_instruction = "\n\nPlease respond with a valid JSON object."
-            # Append to system message if present, otherwise add as system message
-            if full_messages and full_messages[0]["role"] == "system":
-                full_messages[0]["content"] += json_instruction
-            else:
-                full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+            _append_json_instruction(full_messages)
 
         # Build kwargs
         kwargs: dict[str, Any] = {
@@ -1328,6 +1921,7 @@ class LiteLLMProvider(LLMProvider):
         output_tokens = usage.completion_tokens if usage else 0
         cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
         cost_usd = _extract_cost(response, self.model)
+        credits = _extract_credits(response)
 
         return LLMResponse(
             content=content,
@@ -1337,6 +1931,7 @@ class LiteLLMProvider(LLMProvider):
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cost_usd=cost_usd,
+            credits=credits,
             stop_reason=response.choices[0].finish_reason or "",
             raw_response=response,
         )
@@ -1351,6 +1946,7 @@ class LiteLLMProvider(LLMProvider):
         Uses litellm.acompletion and asyncio.sleep instead of blocking calls.
         When a :class:`KeyPool` is configured, rate-limited keys are rotated.
         """
+        self._apply_usage_agent_header(kwargs)
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
         for attempt in range(retries + 1):
@@ -1360,7 +1956,53 @@ class LiteLLMProvider(LLMProvider):
                 current_key = self._key_pool.get_key()
                 kwargs["api_key"] = current_key
             try:
-                response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                _install_request_holder()
+                _log_llm_call(kwargs, attempt=attempt)
+                try:
+                    response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                except Exception as llm_exc:
+                    # Hive streamToken expired/revoked? Force a refresh
+                    # right now and retry this same LLM call ONCE with
+                    # the new token. Guards against the race where the
+                    # background streamtoken_refresh loop hasn't ticked
+                    # yet but the proxy already rejected. Single retry
+                    # so a persistent backend outage doesn't loop.
+                    if (
+                        _is_hive_stream_token_invalid(llm_exc)
+                        and not kwargs.get("_hive_token_refresh_attempted")
+                    ):
+                        kwargs["_hive_token_refresh_attempted"] = True
+                        try:
+                            from framework.server.streamtoken_refresh import (
+                                try_refresh_now,
+                            )
+                            new_token = await try_refresh_now()
+                        except Exception:
+                            logger.warning(
+                                "[hive-auth] try_refresh_now import/call failed",
+                                exc_info=True,
+                            )
+                            new_token = None
+                        if new_token:
+                            logger.info(
+                                "[hive-auth] hive_stream_token_invalid on %s → "
+                                "refreshed token + retrying ONCE",
+                                kwargs.get("model"),
+                            )
+                            kwargs["api_key"] = new_token
+                            response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                        else:
+                            # Refresh failed → bubble the original auth
+                            # error so the queen surfaces it cleanly.
+                            raise
+                    else:
+                        raise
+                # ``_hive_token_refresh_attempted`` is a per-call flag, not
+                # a per-key flag; strip before any subsequent retry so it
+                # doesn't get passed to litellm as an unknown kwarg the
+                # next loop iteration. (litellm.acompletion ignores unknown
+                # kwargs today, but the cleanup is defensive.)
+                kwargs.pop("_hive_token_refresh_attempted", None)
 
                 content = response.choices[0].message.content if response.choices else None
                 has_tool_calls = bool(response.choices and response.choices[0].message.tool_calls)
@@ -1465,7 +2107,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                 logger.warning(
                     f"[async-retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -1495,6 +2137,7 @@ class LiteLLMProvider(LLMProvider):
         block. Otherwise the two strings are concatenated into a single
         system message (legacy behavior).
         """
+        self._refresh_api_key()
         # Codex ChatGPT backend requires streaming — route through stream() which
         # already handles Codex quirks and has proper tool call accumulation.
         if self._codex_backend:
@@ -1517,13 +2160,10 @@ class LiteLLMProvider(LLMProvider):
         if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
+        _apply_history_cache_breakpoint(full_messages, self.model)
 
         if json_mode:
-            json_instruction = "\n\nPlease respond with a valid JSON object."
-            if full_messages and full_messages[0]["role"] == "system":
-                full_messages[0]["content"] += json_instruction
-            else:
-                full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+            _append_json_instruction(full_messages)
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1557,6 +2197,7 @@ class LiteLLMProvider(LLMProvider):
         output_tokens = usage.completion_tokens if usage else 0
         cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
         cost_usd = _extract_cost(response, self.model)
+        credits = _extract_credits(response)
 
         return LLMResponse(
             content=content,
@@ -1566,24 +2207,37 @@ class LiteLLMProvider(LLMProvider):
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cost_usd=cost_usd,
+            credits=credits,
             stop_reason=response.choices[0].finish_reason or "",
             raw_response=response,
         )
 
     def _tool_to_openai_format(self, tool: Tool) -> dict[str, Any]:
-        """Convert Tool to OpenAI function calling format."""
-        return {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": tool.parameters.get("properties", {}),
-                    "required": tool.parameters.get("required", []),
+        """Convert Tool to OpenAI function calling format.
+
+        Tool descriptions and parameter docstrings are sent verbatim to
+        the LLM. Many of them mention ``~/.hive/...`` as the canonical
+        location of colonies/skills/memories, but on the desktop the
+        runtime's HIVE_HOME lives elsewhere — so we rewrite ``~/.hive``
+        to the active HIVE_HOME on the way out, deeply (descriptions
+        nested inside ``parameters.properties`` are common).
+        """
+        from framework.config import resolve_hive_paths_deep
+
+        return resolve_hive_paths_deep(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": tool.parameters.get("properties", {}),
+                        "required": tool.parameters.get("required", []),
+                    },
                 },
-            },
-        }
+            }
+        )
 
     def _is_anthropic_model(self) -> bool:
         """Return True when the configured model targets Anthropic."""
@@ -1618,9 +2272,7 @@ class LiteLLMProvider(LLMProvider):
         if not tools or not self._is_openrouter_model():
             return False
         error_text = str(error).lower()
-        return "openrouter" in error_text and any(
-            snippet in error_text for snippet in OPENROUTER_TOOL_COMPAT_ERROR_SNIPPETS
-        )
+        return "openrouter" in error_text and any(snippet in error_text for snippet in OPENROUTER_TOOL_COMPAT_ERROR_SNIPPETS)
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -1706,9 +2358,7 @@ class LiteLLMProvider(LLMProvider):
 
             function_block = raw_call.get("function")
             function_name = (
-                raw_call.get("name")
-                or raw_call.get("tool_name")
-                or (function_block.get("name") if isinstance(function_block, dict) else None)
+                raw_call.get("name") or raw_call.get("tool_name") or (function_block.get("name") if isinstance(function_block, dict) else None)
             )
             if not isinstance(function_name, str) or function_name not in allowed_tool_names:
                 if function_name:
@@ -1993,6 +2643,7 @@ class LiteLLMProvider(LLMProvider):
         if system_message is not None:
             full_messages.append(system_message)
         full_messages.extend(messages)
+        _apply_history_cache_breakpoint(full_messages, self.model)
         return [
             message
             for message in full_messages
@@ -2042,6 +2693,7 @@ class LiteLLMProvider(LLMProvider):
         output_tokens = usage.completion_tokens if usage else 0
         cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
         cost_usd = _extract_cost(response, self.model)
+        credits = _extract_credits(response)
         stop_reason = "tool_calls" if tool_calls else (response.choices[0].finish_reason or "stop")
 
         return LLMResponse(
@@ -2052,6 +2704,7 @@ class LiteLLMProvider(LLMProvider):
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cost_usd=cost_usd,
+            credits=credits,
             stop_reason=stop_reason,
             raw_response={
                 "compat_mode": "openrouter_tool_emulation",
@@ -2090,7 +2743,13 @@ class LiteLLMProvider(LLMProvider):
                 system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
-            yield StreamErrorEvent(error=str(e), recoverable=False)
+            err_type, upstream = _classify_llm_error(e)
+            yield StreamErrorEvent(
+                error=str(e),
+                recoverable=False,
+                error_type=err_type,
+                upstream_status=upstream,
+            )
             return
 
         raw_response = response.raw_response if isinstance(response.raw_response, dict) else {}
@@ -2114,6 +2773,7 @@ class LiteLLMProvider(LLMProvider):
             cached_tokens=response.cached_tokens,
             cache_creation_tokens=response.cache_creation_tokens,
             cost_usd=response.cost_usd,
+            credits=response.credits,
             model=response.model,
         )
 
@@ -2152,7 +2812,13 @@ class LiteLLMProvider(LLMProvider):
                 system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
-            yield StreamErrorEvent(error=str(e), recoverable=False)
+            err_type, upstream = _classify_llm_error(e)
+            yield StreamErrorEvent(
+                error=str(e),
+                recoverable=False,
+                error_type=err_type,
+                upstream_status=upstream,
+            )
             return
 
         raw = response.raw_response
@@ -2184,6 +2850,7 @@ class LiteLLMProvider(LLMProvider):
             cached_tokens=response.cached_tokens,
             cache_creation_tokens=response.cache_creation_tokens,
             cost_usd=response.cost_usd,
+            credits=response.credits,
             model=response.model,
         )
 
@@ -2210,8 +2877,10 @@ class LiteLLMProvider(LLMProvider):
         ``system_dynamic_suffix`` is an optional per-turn tail. See
         ``acomplete`` docstring for the two-block split semantics.
         """
+        self._refresh_api_key()
         from framework.llm.stream_events import (
             FinishEvent,
+            ReasoningDeltaEvent,
             StreamErrorEvent,
             TextDeltaEvent,
             TextEndEvent,
@@ -2252,6 +2921,7 @@ class LiteLLMProvider(LLMProvider):
         if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
+        _apply_history_cache_breakpoint(full_messages, self.model)
 
         if logger.isEnabledFor(logging.DEBUG) and full_messages:
             import json as _json
@@ -2293,21 +2963,13 @@ class LiteLLMProvider(LLMProvider):
 
         # Add JSON mode via prompt engineering (works across all providers)
         if json_mode:
-            json_instruction = "\n\nPlease respond with a valid JSON object."
-            if full_messages and full_messages[0]["role"] == "system":
-                full_messages[0]["content"] += json_instruction
-            else:
-                full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+            _append_json_instruction(full_messages)
 
         # Remove ghost empty assistant messages (content="" and no tool_calls).
         # These arise when a model returns an empty stream after a tool result
         # (an "expected" no-op turn). Keeping them in history confuses some
         # models (notably Codex/gpt-5.3) and causes cascading empty streams.
-        full_messages = [
-            m
-            for m in full_messages
-            if not (m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls"))
-        ]
+        full_messages = [m for m in full_messages if not (m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls"))]
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -2336,6 +2998,18 @@ class LiteLLMProvider(LLMProvider):
                 kwargs.setdefault("tool_choice", "required")
         if response_format:
             kwargs["response_format"] = response_format
+        if logger.isEnabledFor(logging.DEBUG):
+            _tool_names_sample = sorted(t.name for t in (tools or []))[:8]
+            _has_suggest_colony = any(t.name == "suggest_colony" for t in (tools or []))
+            logger.debug(
+                "[stream] model=%s hive_proxy=%s tool_count=%d tool_choice=%r has_suggest_colony=%s tool_names_sample=%s",
+                self.model,
+                self._hive_proxy_auth,
+                len(tools or []),
+                kwargs.get("tool_choice"),
+                _has_suggest_colony,
+                _tool_names_sample,
+            )
         # The Codex ChatGPT backend (Responses API) rejects several params.
         if self._codex_backend:
             kwargs.pop("max_tokens", None)
@@ -2354,11 +3028,7 @@ class LiteLLMProvider(LLMProvider):
                 self.model,
                 self.api_base,
                 request_summary["tool_count"],
-                sum(
-                    message.get("text_chars", 0)
-                    for message in request_summary["messages"]
-                    if message.get("role") == "system"
-                ),
+                sum(message.get("text_chars", 0) for message in request_summary["messages"] if message.get("role") == "system"),
             )
             if self._is_zai_openai_backend():
                 logger.warning(
@@ -2368,6 +3038,13 @@ class LiteLLMProvider(LLMProvider):
                     self.model,
                 )
 
+        self._apply_usage_agent_header(kwargs)
+
+        # Tracked across the outer loop so an empty stream immediately after a
+        # 429 can adopt the rate-limit backoff instead of the fast 1s retry.
+        last_rate_limit_attempt: int | None = None
+        last_rate_limit_exc: BaseException | None = None
+
         for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
             # Post-stream events (ToolCall, TextEnd, Finish) are buffered
             # because they depend on the full stream.  TextDeltaEvents are
@@ -2376,11 +3053,20 @@ class LiteLLMProvider(LLMProvider):
             accumulated_text = ""
             tool_calls_acc: dict[int, dict[str, str]] = {}
             _last_tool_idx = 0  # tracks most recently opened tool call slot
+            # Reasoning/`thinking` blocks streamed by reasoning models.
+            # ``thinking_acc`` holds blocks whose signature has fully
+            # arrived (safe to echo back); ``_thinking_current`` is the
+            # block still being assembled from deltas.
+            thinking_acc: list[dict[str, Any]] = []
+            _thinking_current: dict[str, Any] | None = None
+            _saw_reasoning = False  # logged once when reasoning deltas first appear
             input_tokens = 0
             output_tokens = 0
             stream_finish_reason: str | None = None
 
             try:
+                _install_request_holder()
+                _log_llm_call(kwargs, stream=True, attempt=attempt)
                 response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
                 async for chunk in response:
@@ -2414,6 +3100,60 @@ class LiteLLMProvider(LLMProvider):
                             content=delta.content,
                             snapshot=accumulated_text,
                         )
+
+                    # --- Reasoning / `thinking` blocks (accumulate across chunks) ---
+                    # Reasoning models (DeepSeek, GLM via the hive-2.1 alias)
+                    # emit `thinking` content blocks that MUST be echoed back
+                    # verbatim — signature included — or the next request 400s.
+                    # litellm streams them as incremental ``thinking_blocks``
+                    # deltas; reassemble each block here and finalise it when
+                    # its ``signature`` arrives.
+                    # ``_reason_chunk`` collects reasoning text that arrived this
+                    # chunk (from either transport below) so we can surface it as
+                    # a ReasoningDeltaEvent — the visible-reasoning path for
+                    # thinking models whose reasoning never lands in ``content``.
+                    _reason_chunk = ""
+                    _tb_delta = getattr(delta, "thinking_blocks", None) if delta else None
+                    if _tb_delta:
+                        for tb in _tb_delta:
+                            if not isinstance(tb, dict):
+                                tb = dict(tb)
+                            btype = tb.get("type") or "thinking"
+                            if btype == "redacted_thinking":
+                                # Self-contained; no incremental signature.
+                                thinking_acc.append({"type": "redacted_thinking", "data": tb.get("data", "")})
+                                continue
+                            if _thinking_current is None:
+                                _thinking_current = {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": "",
+                                }
+                            if tb.get("thinking"):
+                                _thinking_current["thinking"] += tb["thinking"]
+                                _reason_chunk += tb["thinking"]
+                            if tb.get("signature"):
+                                # Signature delta closes the block.
+                                _thinking_current["signature"] = tb["signature"]
+                                thinking_acc.append(_thinking_current)
+                                _thinking_current = None
+                    else:
+                        # Some providers (z.ai GLM, DeepSeek) expose reasoning
+                        # only via the OpenAI-compat ``reasoning_content`` string
+                        # delta rather than Anthropic-style ``thinking_blocks``.
+                        _rc = getattr(delta, "reasoning_content", None) if delta else None
+                        if _rc:
+                            _reason_chunk += _rc
+
+                    if _reason_chunk:
+                        if not _saw_reasoning:
+                            _saw_reasoning = True
+                            logger.info(
+                                "[reasoning] model=%s streaming reasoning deltas "
+                                "(surfacing as ReasoningDeltaEvent)",
+                                self.model,
+                            )
+                        yield ReasoningDeltaEvent(content=_reason_chunk)
 
                     # --- Tool calls (accumulate across chunks) ---
                     # The Codex/Responses API bridge (litellm bug) hardcodes
@@ -2479,7 +3219,21 @@ class LiteLLMProvider(LLMProvider):
                         if accumulated_text:
                             tail_events.append(TextEndEvent(full_text=accumulated_text))
 
+                        # litellm's ``CustomStreamWrapper`` strips ``usage``
+                        # from every chunk it yields to us, so ``chunk.usage``
+                        # is always None at finish time for Anthropic streams.
+                        # The original Usage objects survive on
+                        # ``response.chunks`` (the internal pre-yield stash);
+                        # scan there for the most recent one. This is also
+                        # where ``credits`` (attached by the
+                        # ``calculate_usage`` patch via ``model_extra``) lives.
                         usage = getattr(chunk, "usage", None)
+                        if usage is None:
+                            for _raw in reversed(getattr(response, "chunks", None) or []):
+                                _u = getattr(_raw, "usage", None)
+                                if _u is not None:
+                                    usage = _u
+                                    break
                         logger.debug(
                             "[tokens] finish-chunk raw usage: %r (type=%s)",
                             usage,
@@ -2516,6 +3270,16 @@ class LiteLLMProvider(LLMProvider):
                             cached_tokens,
                             cache_creation_tokens,
                         )
+                        credits = _credits_from_usage(usage)
+                        logger.debug(
+                            "[credits] streaming finish-chunk: model=%s credits=%r usage_type=%s",
+                            self.model,
+                            credits,
+                            type(usage).__name__ if usage is not None else None,
+                        )
+                        # A leftover ``_thinking_current`` with no signature
+                        # cannot be echoed back (the API rejects unsigned
+                        # thinking) — drop it and keep only finalised blocks.
                         tail_events.append(
                             FinishEvent(
                                 stop_reason=choice.finish_reason,
@@ -2524,7 +3288,9 @@ class LiteLLMProvider(LLMProvider):
                                 cached_tokens=cached_tokens,
                                 cache_creation_tokens=cache_creation_tokens,
                                 cost_usd=cost_usd,
+                                credits=credits,
                                 model=self.model,
+                                thinking_blocks=list(thinking_acc),
                             )
                         )
 
@@ -2548,18 +3314,22 @@ class LiteLLMProvider(LLMProvider):
                             # where OpenRouter puts `cached_tokens` and
                             # `cache_write_tokens`. Recover them directly
                             # from the most recent chunk that carries usage.
+                            # Same trick for ``credits`` (Hive proxy field):
+                            # cumulative per-request, last value wins.
                             cached_tokens, cache_creation_tokens = 0, 0
+                            credits: float | None = None
                             for _raw in reversed(_chunks):
                                 _raw_usage = getattr(_raw, "usage", None)
                                 if _raw_usage is None:
                                     continue
+                                if credits is None:
+                                    credits = _credits_from_usage(_raw_usage)
                                 _cr, _cc = _extract_cache_tokens(_raw_usage)
                                 if _cr or _cc:
                                     cached_tokens, cache_creation_tokens = _cr, _cc
                                     break
                             logger.debug(
-                                "[tokens] post-loop chunks fallback: input=%d output=%d "
-                                "cached=%d cache_creation=%d model=%s",
+                                "[tokens] post-loop chunks fallback: input=%d output=%d cached=%d cache_creation=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
@@ -2583,7 +3353,9 @@ class LiteLLMProvider(LLMProvider):
                                         cached_tokens=cached_tokens,
                                         cache_creation_tokens=cache_creation_tokens,
                                         cost_usd=cost_usd,
+                                        credits=credits if credits is not None else _ev.credits,
                                         model=_ev.model,
+                                        thinking_blocks=_ev.thinking_blocks,
                                     )
                                     break
                     except Exception as _e:
@@ -2626,31 +3398,42 @@ class LiteLLMProvider(LLMProvider):
                             self.model,
                             full_messages,
                         )
-                        dump_path = _dump_failed_request(
-                            model=self.model,
-                            kwargs=kwargs,
-                            error_type="empty_stream",
-                            attempt=attempt,
-                        )
+                        # If a 429 just landed in the same loop, the empty
+                        # response is likely backpressure-adjacent — use the
+                        # rate-limit backoff (jittered) instead of 1s.
+                        if last_rate_limit_attempt is not None and attempt - last_rate_limit_attempt <= 1:
+                            wait = _compute_retry_delay(
+                                attempt,
+                                exception=last_rate_limit_exc,
+                                jitter=True,
+                            )
+                        else:
+                            wait = EMPTY_STREAM_RETRY_DELAY
                         logger.warning(
                             f"[stream-retry] {self.model} returned empty stream "
                             f"after {last_role} message — "
                             f"~{token_count} tokens ({token_method}). "
-                            f"Request dumped to: {dump_path}. "
-                            f"Retrying in {EMPTY_STREAM_RETRY_DELAY}s "
+                            f"Retrying in {wait:.1f}s "
                             f"(attempt {attempt + 1}/{EMPTY_STREAM_MAX_RETRIES})"
                         )
-                        await asyncio.sleep(EMPTY_STREAM_RETRY_DELAY)
+                        await asyncio.sleep(wait)
                         continue
 
-                    # All retries exhausted — log and return the empty
-                    # result.  EventLoopNode's empty response guard will
+                    # All retries exhausted — dump the request for postmortem
+                    # and log.  EventLoopNode's empty response guard will
                     # accept if all outputs are set, or handle the ghost
                     # stream case if outputs are still missing.
+                    dump_path = _dump_failed_request(
+                        model=self.model,
+                        kwargs=kwargs,
+                        error_type="empty_stream",
+                        attempt=attempt,
+                    )
                     logger.error(
                         f"[stream] {self.model} returned empty stream after "
                         f"{EMPTY_STREAM_MAX_RETRIES} retries "
-                        f"(last_role={last_role}). Returning empty result."
+                        f"(last_role={last_role}). Request dumped to: "
+                        f"{dump_path}. Returning empty result."
                     )
 
                 # Gemini sometimes outputs tool calls as text in
@@ -2693,20 +3476,28 @@ class LiteLLMProvider(LLMProvider):
 
             except RateLimitError as e:
                 if attempt < RATE_LIMIT_MAX_RETRIES:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                     logger.warning(
                         f"[stream-retry] {self.model} rate limited (429): {e!s}. "
                         f"Retrying in {wait:.1f}s "
                         f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
                     )
+                    last_rate_limit_attempt = attempt
+                    last_rate_limit_exc = e
                     await asyncio.sleep(wait)
                     continue
-                yield StreamErrorEvent(error=str(e), recoverable=False)
+                err_type, upstream = _classify_llm_error(e)
+                yield StreamErrorEvent(
+                    error=str(e),
+                    recoverable=False,
+                    error_type=err_type,
+                    upstream_status=upstream,
+                )
                 return
 
             except Exception as e:
                 # Some providers return non-standard finish_reason values
-                # (e.g., kimi-k2.5 sends 'pause_turn') that LiteLLM's
+                # (e.g., Kimi K2.x sends 'pause_turn') that LiteLLM's
                 # internal stream_chunk_builder rejects via Pydantic
                 # validation.  If we already accumulated content and built
                 # tail_events before the error, the stream was successful —
@@ -2716,9 +3507,7 @@ class LiteLLMProvider(LLMProvider):
                     # APIError with a different message.  Check the full
                     # exception chain (str(e) + str(__cause__)).
                     _err_chain = f"{e} {e.__cause__}" if e.__cause__ else str(e)
-                    _is_finish_reason_err = (
-                        "finish_reason" in _err_chain and "validation error" in _err_chain.lower()
-                    ) or (
+                    _is_finish_reason_err = ("finish_reason" in _err_chain and "validation error" in _err_chain.lower()) or (
                         # Fallback: the APIError wrapper message for chunk-building failures
                         "building chunks" in str(e).lower() and (accumulated_text or tool_calls_acc)
                     )
@@ -2746,7 +3535,7 @@ class LiteLLMProvider(LLMProvider):
                         yield event
                     return
                 if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, jitter=True)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
@@ -2770,7 +3559,13 @@ class LiteLLMProvider(LLMProvider):
                     dump_path,
                 )
                 recoverable = _is_stream_transient_error(e)
-                yield StreamErrorEvent(error=str(e), recoverable=recoverable)
+                err_type, upstream = _classify_llm_error(e)
+                yield StreamErrorEvent(
+                    error=str(e),
+                    recoverable=recoverable,
+                    error_type=err_type,
+                    upstream_status=upstream,
+                )
                 return
 
     async def _collect_stream_to_response(

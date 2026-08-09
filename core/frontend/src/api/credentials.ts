@@ -37,6 +37,31 @@ export interface ResyncResponse {
   accounts_by_provider: Record<string, CredentialAccount[]>;
 }
 
+export interface OAuthStatusResponse {
+  accounts_by_provider: Record<string, CredentialAccount[]>;
+  has_aden_key: boolean;
+  fetched_at: number;
+}
+
+/** One field the agent's secure credential form asks the user to fill in. */
+export interface AgentCredentialField {
+  name: string;
+  label: string;
+  secret: boolean;
+  required: boolean;
+  placeholder: string;
+}
+
+/** Payload carried by the `client_credential_form_requested` SSE event. */
+export interface AgentCredentialFormRequest {
+  credential_id: string;
+  account: string;
+  title: string;
+  instructions: string;
+  fields: AgentCredentialField[];
+  correlation_id: string;
+}
+
 export interface AgentCredentialRequirement {
   credential_name: string;
   credential_id: string;
@@ -56,7 +81,11 @@ export interface AgentCredentialRequirement {
 
 export const credentialsApi = {
   listSpecs: () =>
-    api.get<{ specs: CredentialSpec[]; has_aden_key: boolean }>("/credentials/specs"),
+    api.get<{
+      specs: CredentialSpec[];
+      has_aden_key: boolean;
+      accounts_by_provider?: Record<string, CredentialAccount[]>;
+    }>("/credentials/specs"),
 
   list: () =>
     api.get<{ credentials: CredentialInfo[] }>("/credentials"),
@@ -73,6 +102,32 @@ export const credentialsApi = {
   delete: (credentialId: string) =>
     api.delete<{ deleted: boolean }>(`/credentials/${credentialId}`),
 
+  // Manually add a named local credential (Integrations page "Add credential"
+  // flow): any provider id, optional account alias, one or more key fields.
+  // Stored as a health-checked local account — parity with the agent's form.
+  saveLocal: (
+    credentialId: string,
+    account: string,
+    keys: Record<string, string>,
+  ) =>
+    api.post<{
+      saved: string;
+      status: string;
+      identity: Record<string, string>;
+      valid: boolean | null;
+      message: string | null;
+    }>("/credentials/local", {
+      credential_id: credentialId,
+      account,
+      keys,
+    }),
+
+  // Remove a single named local account.
+  deleteLocal: (credentialId: string, alias: string) =>
+    api.delete<{ deleted: boolean }>(
+      `/credentials/local/${encodeURIComponent(credentialId)}/${encodeURIComponent(alias)}`,
+    ),
+
   checkAgent: (agentPath: string) =>
     api.post<{ required: AgentCredentialRequirement[]; has_aden_key: boolean }>(
       "/credentials/check-agent",
@@ -82,9 +137,31 @@ export const credentialsApi = {
   resync: () =>
     api.post<ResyncResponse>("/credentials/resync", {}),
 
+  oauthStatus: () =>
+    api.get<OAuthStatusResponse>("/credentials/oauth-status"),
+
   validateKey: (providerId: string, apiKey: string) =>
     api.post<{ valid: boolean | null; message: string }>(
       "/credentials/validate-key",
       { provider_id: providerId, api_key: apiKey },
+    ),
+
+  // Submit (or cancel) a secure credential form the agent popped via
+  // credentials(action="collect"). On "saved" the secret values go straight
+  // to the encrypted store and the parked queen loop is resumed; they never
+  // travel back through the chat.
+  submitAgentForm: (
+    sessionId: string,
+    payload: {
+      correlation_id: string;
+      status: "saved" | "cancelled";
+      credential_id: string;
+      account: string;
+      keys?: Record<string, string>;
+    },
+  ) =>
+    api.post<{ saved?: string; resumed?: boolean; status?: string }>(
+      `/sessions/${sessionId}/credential-form`,
+      payload,
     ),
 };

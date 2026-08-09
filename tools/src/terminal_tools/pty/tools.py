@@ -14,6 +14,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from terminal_tools.common.command_guard import check_command
 from terminal_tools.common.limits import ZshRefused
 
 if TYPE_CHECKING:
@@ -33,11 +34,7 @@ class _PtyRegistry:
         """Drop sessions whose idle time exceeded their idle_timeout_sec."""
         with self._lock:
             now = time.monotonic()
-            stale = [
-                sid
-                for sid, sess in self._sessions.items()
-                if not sess.is_alive() or (now - sess._last_activity) > sess.idle_timeout_sec
-            ]
+            stale = [sid for sid, sess in self._sessions.items() if not sess.is_alive() or (now - sess._last_activity) > sess.idle_timeout_sec]
         for sid in stale:
             sess = self._sessions.pop(sid, None)
             if sess is not None:
@@ -54,10 +51,7 @@ class _PtyRegistry:
         with self._lock:
             if len(self._sessions) >= self._max:
                 # Caller should have reaped first; treat as cap.
-                raise RuntimeError(
-                    f"terminal-tools PTY cap reached ({self._max}). "
-                    "Close idle sessions or raise TERMINAL_TOOLS_MAX_PTY."
-                )
+                raise RuntimeError(f"terminal-tools PTY cap reached ({self._max}). Close idle sessions or raise TERMINAL_TOOLS_MAX_PTY.")
             self._sessions[sess.session_id] = sess
 
     def get(self, sid: str):
@@ -125,6 +119,7 @@ def register_pty_tools(mcp: FastMCP) -> None:
         cols: int = 120,
         rows: int = 40,
         idle_timeout_sec: int = 1800,
+        session_cwd: str | None = None,
     ) -> dict:
         """Open a persistent /bin/bash session in a PTY.
 
@@ -140,7 +135,8 @@ def register_pty_tools(mcp: FastMCP) -> None:
         shell="/bin/zsh" overrides are rejected.
 
         Args:
-            cwd: Initial working directory.
+            cwd: Initial working directory. Defaults to the session workdir
+                when omitted; pass an absolute path to override.
             env: Environment override (zsh dotfile vars are stripped).
             cols, rows: Terminal size.
             idle_timeout_sec: Drop the session after this many seconds idle.
@@ -148,8 +144,10 @@ def register_pty_tools(mcp: FastMCP) -> None:
         Returns: {session_id, pid, shell}
         """
         _REGISTRY.reap_idle()
+        # Loose default: omitted cwd falls back to the session workdir.
+        effective_cwd = cwd if cwd is not None else session_cwd
         try:
-            sess = PtySession(cwd=cwd, env=env, cols=cols, rows=rows, idle_timeout_sec=idle_timeout_sec)
+            sess = PtySession(cwd=effective_cwd, env=env, cols=cols, rows=rows, idle_timeout_sec=idle_timeout_sec)
         except ZshRefused as e:
             return {"error": str(e)}
         except Exception as e:
@@ -212,6 +210,12 @@ def register_pty_tools(mcp: FastMCP) -> None:
         if command is None:
             return {"error": "command is required unless read_only=True"}
 
+        # Hard guard applies to BOTH send modes — raw_send types straight
+        # into a live bash, so it is just as capable of a pkill.
+        blocked = check_command(command)
+        if blocked is not None:
+            return {"error": blocked, "blocked": True}
+
         if raw_send:
             n = sess.send_raw(command, add_newline=False)
             return {"bytes_sent": n}
@@ -235,7 +239,9 @@ def register_pty_tools(mcp: FastMCP) -> None:
         sess = _REGISTRY.get(session_id)
         if sess is None:
             return {"error": f"unknown session_id: {session_id}"}
-        result = sess.close(force=force)
+        # When force=True we don't send `exit\n`, so the shell has no reason
+        # to die voluntarily — shorten the pre-signal grace wait accordingly.
+        result = sess.close(force=force, grace_sec=0.1 if force else 1.0)
         _REGISTRY.remove(session_id)
         return result
 

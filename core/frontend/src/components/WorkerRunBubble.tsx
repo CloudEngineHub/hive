@@ -1,8 +1,6 @@
-import { memo, useState, useRef, useEffect } from "react";
-import { ChevronDown, ChevronUp, Cpu } from "lucide-react";
+import { memo } from "react";
+import { Cpu } from "lucide-react";
 import type { ChatMessage } from "@/components/ChatPanel";
-import { ToolActivityRow } from "@/components/ChatPanel";
-import MarkdownContent from "@/components/MarkdownContent";
 import { useColonyWorkers } from "@/context/ColonyWorkersContext";
 import { workerIdFromStreamId } from "@/lib/chat-helpers";
 
@@ -22,6 +20,21 @@ interface WorkerRunBubbleProps {
   label?: string;
 }
 
+type RunPhase = "running" | "completed" | "stopped";
+
+/** Collapse the raw API ``status`` string into the three buckets the
+ *  bubble renders. Synonyms (``claimed``/``in_progress`` for in-flight,
+ *  ``done`` for completed) are folded in so the pill agrees with the
+ *  Workers panel's own status classes regardless of which legacy
+ *  label the runtime emits. Unknown / empty falls into ``stopped``. */
+function runPhaseFromStatus(status: string | undefined | null): RunPhase {
+  const s = (status || "").toLowerCase();
+  if (s === "pending" || s === "running" || s === "claimed" || s === "in_progress")
+    return "running";
+  if (s === "completed" || s === "done") return "completed";
+  return "stopped";
+}
+
 /** Parse a tool_status JSON blob into a list of tool entries. */
 function parseToolStatus(content: string): { name: string; done: boolean }[] {
   try {
@@ -33,16 +46,16 @@ function parseToolStatus(content: string): { name: string; done: boolean }[] {
 }
 
 /**
- * Strip markdown formatting so the collapsed preview is a single
- * readable line instead of a scatter of code pills.
+ * Strip markdown formatting so the head/tail previews are single
+ * readable lines instead of a scatter of code pills.
  *
  * MarkdownContent turns every backtick-wrapped fragment into its own
  * visually-boxed inline-code pill. In a worker text message those
  * pills can be coordinates, UUIDs, selectors, tool names — the
- * collapsed preview ends up looking like confetti. We just want the
- * plain prose, one line, truncated.
+ * preview ends up looking like confetti. We just want the plain
+ * prose, one line, truncated.
  */
-function stripMarkdownToPreview(s: string, maxLen = 160): string {
+function stripMarkdownToPreview(s: string, maxLen = 200): string {
   const cleaned = s
     .replace(/```[\s\S]*?```/g, " [code] ") // fenced code blocks
     .replace(/`([^`]+)`/g, "$1") // inline code — keep the text, drop the backticks
@@ -55,22 +68,26 @@ function stripMarkdownToPreview(s: string, maxLen = 160): string {
     .replace(/\s+/g, " ") // collapse whitespace
     .trim();
   if (cleaned.length <= maxLen) return cleaned;
-  return cleaned.slice(0, maxLen - 1).trimEnd() + "\u2026";
+  return cleaned.slice(0, maxLen - 1).trimEnd() + "…";
 }
 
 /**
- * Collapsible card that groups all worker messages from a single run
- * (the span between the queen's `run_agent_with_input` call and the
- * worker's final `set_output`/`escalate`/idle).
+ * Compact, single-state worker run bubble.
  *
- * Collapsed (default): header bar with tool count + latest text snippet.
- * Expanded: scrollable list of every message and tool status in order.
+ * Shows the worker's first text (head) so you can see what it started
+ * on, a wrap-row of tool pills so you can see what it's been doing,
+ * and the latest text (tail) so you can see where it currently is.
+ * Together those three rows tell you the worker is alive and roughly
+ * what it's doing without revealing the full transcript inline.
+ *
+ * Clicking anywhere on the bubble (avatar, header, or body) opens the
+ * Colony side panel scoped to this worker, where the full transcript
+ * lives. Tool pills retain their in-line drill-down for args/result;
+ * their click is stopped from also opening the panel.
  */
 const WorkerRunBubble = memo(
   function WorkerRunBubble({ group, label }: WorkerRunBubbleProps) {
-    const [expanded, setExpanded] = useState(false);
-    const bodyRef = useRef<HTMLDivElement>(null);
-    const { openColonyWorkers } = useColonyWorkers();
+    const { openColonyWorkers, workers } = useColonyWorkers();
 
     // Derive the colony worker id from the first message that carries
     // a parallel-worker streamId (``worker:{uuid}``). Legacy single-worker
@@ -83,68 +100,93 @@ const WorkerRunBubble = memo(
       }
       return null;
     })();
+    const openPanel = () => openColonyWorkers(workerId ?? undefined);
 
-    // Separate text messages from tool status
+    // Match to the polled worker record so the pill mirrors the
+    // Workers panel exactly. Legacy bubbles with no parseable
+    // worker_id (workerId=null) fall through to "stopped" —
+    // historically-correct for the single-worker-no-uuid case
+    // where these bubbles only appear after the run has ended.
+    const workerRecord = workerId
+      ? workers.find((w) => w.worker_id === workerId)
+      : undefined;
+    const runPhase = runPhaseFromStatus(workerRecord?.status);
+
+    const pillClass =
+      runPhase === "running"
+        ? "bg-amber-500/15 text-amber-400"
+        : runPhase === "completed"
+          ? "bg-emerald-500/15 text-emerald-500"
+          : "bg-muted text-muted-foreground";
+    const cardClass =
+      runPhase === "running"
+        ? "border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15"
+        : runPhase === "completed"
+          ? "border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15"
+          : "border-border bg-muted/60 hover:bg-muted/80";
+
     const textMsgs = group.messages.filter(
-      (m) => m.type !== "tool_status" && m.content?.trim()
+      (m) => m.type !== "tool_status" && m.content?.trim(),
     );
     const toolStatusMsgs = group.messages.filter(
-      (m) => m.type === "tool_status"
+      (m) => m.type === "tool_status",
     );
 
-    // Count total tool calls from tool_status messages
-    const allTools: { name: string; done: boolean }[] = [];
-    for (const m of toolStatusMsgs) {
-      for (const t of parseToolStatus(m.content)) {
-        allTools.push(t);
-      }
-    }
+    const allTools = toolStatusMsgs.flatMap((m) => parseToolStatus(m.content));
     const toolCount = allTools.length;
     const doneCount = allTools.filter((t) => t.done).length;
-    const isFinished = toolCount > 0 && doneCount === toolCount;
 
-    // Latest text from the worker (the last non-empty text message)
-    const latestText = textMsgs.length > 0
-      ? textMsgs[textMsgs.length - 1].content
-      : "";
-
-    // Status label. We prefer concrete states over the vague
-    // "starting" fallback — if the worker has emitted any text or
-    // any tool, it's past the startup phase.
-    const statusLabel = isFinished
-      ? "done"
-      : toolCount > 0
-        ? "running"
-        : textMsgs.length > 0
-          ? "active"
-          : "starting";
-
-    // Unique tool names for the summary (deduplicated, ordered by first appearance)
-    const uniqueToolNames: string[] = [];
+    // Unique tool names in first-appearance order — the chain is a
+    // glanceable shape-of-the-run, not a full per-call list.
+    const uniqueNames: string[] = [];
     const seen = new Set<string>();
     for (const t of allTools) {
       if (!seen.has(t.name)) {
         seen.add(t.name);
-        uniqueToolNames.push(t.name);
+        uniqueNames.push(t.name);
       }
     }
+    const HEAD = 2;
+    const TAIL = 2;
+    const isLong = uniqueNames.length > HEAD + TAIL;
+    const chainParts = isLong
+      ? [...uniqueNames.slice(0, HEAD), "⋯", ...uniqueNames.slice(-TAIL)]
+      : uniqueNames;
+    const hiddenCount = isLong ? uniqueNames.length - HEAD - TAIL : 0;
 
-    // Auto-scroll body when expanded
-    useEffect(() => {
-      if (expanded && bodyRef.current) {
-        bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
-      }
-    }, [expanded, group.messages.length]);
+    // Head: the queen-authored `goal` wins when present — it's the plain-
+    // language "what is this worker doing" seeded at spawn, present from t=0
+    // even for unwatched workers, and spares non-technical users the raw
+    // task prompt (username lists, bindings, protocol text). Watched workers
+    // fall back to their streamed prose, then to the raw task string —
+    // scraping only llm_text_delta would leave every unwatched bubble blank,
+    // while `task` and `result.summary` are already in the 2s workers poll.
+    const headText =
+      workerRecord?.goal?.trim() ||
+      textMsgs[0]?.content?.trim() ||
+      (workerRecord?.task ?? "");
+    const streamedTail = textMsgs[textMsgs.length - 1]?.content?.trim() ?? "";
+    const tailText = streamedTail || (workerRecord?.result?.summary ?? "");
+    const showTail = !!tailText && tailText !== headText;
+
+    // Progress: prefer the worker's own task list (from the poll) over the
+    // tool-call count, which is only observable while watching.
+    const taskSummary = workerRecord?.task_summary ?? null;
+    const progressLabel =
+      taskSummary && taskSummary.total > 0
+        ? `${taskSummary.completed}/${taskSummary.total} tasks`
+        : toolCount > 0
+          ? `${doneCount}/${toolCount} tools`
+          : null;
 
     return (
       <div className="flex gap-3">
-        {/* Left icon — clicking opens the Colony Workers sidebar and
-            pre-selects this worker if we can derive its id. */}
+        {/* Avatar — opens the Colony side panel for this worker. */}
         <button
           type="button"
-          onClick={() => openColonyWorkers(workerId ?? undefined)}
-          aria-label="Open worker in colony sidebar"
-          title="Open worker in colony sidebar"
+          onClick={openPanel}
+          aria-label="Open worker session"
+          title="Open worker session"
           className="flex-shrink-0 w-7 h-7 rounded-xl flex items-center justify-center mt-1 transition-opacity hover:opacity-80 cursor-pointer"
           style={{
             backgroundColor: `${workerColor}18`,
@@ -155,12 +197,17 @@ const WorkerRunBubble = memo(
         </button>
 
         <div className="flex-1 min-w-0 max-w-[90%]">
-          {/* Clickable header */}
+          {/* Header — same click target as the body. */}
           <button
-            onClick={() => setExpanded((v) => !v)}
-            className="w-full flex items-center gap-2 mb-1 text-left cursor-pointer group"
+            type="button"
+            onClick={openPanel}
+            className="w-full flex items-center gap-2 mb-1 text-left cursor-pointer"
+            title="Open worker session"
           >
-            <span className="font-medium text-xs" style={{ color: workerColor }}>
+            <span
+              className="font-medium text-xs"
+              style={{ color: workerColor }}
+            >
               Worker
             </span>
             {label && (
@@ -169,138 +216,57 @@ const WorkerRunBubble = memo(
               </span>
             )}
             <span
-              className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${
-                isFinished
-                  ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-                  : "bg-muted text-muted-foreground"
-              }`}
+              className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${pillClass}`}
             >
-              {statusLabel}
+              {runPhase}
             </span>
-            {toolCount > 0 && (
+            {progressLabel && (
               <span className="text-[10px] text-muted-foreground tabular-nums">
-                {doneCount}/{toolCount} tools
+                {progressLabel}
               </span>
             )}
-            <span className="ml-auto text-muted-foreground/60 group-hover:text-muted-foreground transition-colors p-0.5 rounded">
-              {expanded ? (
-                <ChevronUp className="w-3.5 h-3.5" />
-              ) : (
-                <ChevronDown className="w-3.5 h-3.5" />
-              )}
-            </span>
           </button>
 
-          {/* Card body — use Tailwind theme tokens so dark mode
-              gets a proper dark background instead of a glaring
-              near-white hardcoded hsl. Finished runs get a subtle
-              green tint that also respects theme. */}
           <div
-            className={`rounded-2xl rounded-tl-md overflow-hidden border ${
-              isFinished
-                ? "border-green-300/50 bg-green-50/50 dark:border-green-900/40 dark:bg-green-950/20"
-                : "border-border bg-muted/60"
-            }`}
+            role="button"
+            tabIndex={0}
+            onClick={openPanel}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                openPanel();
+              }
+            }}
+            className={`rounded-2xl rounded-tl-md border cursor-pointer transition-colors ${cardClass}`}
           >
-            {/* Collapsed: single-line plain-text preview of the
-                latest worker text, OR a tool-name chain when the
-                worker hasn't emitted any prose yet. MarkdownContent
-                is intentionally NOT used here — its inline-code
-                rendering turns every backtick-wrapped fragment into
-                a floating pill, which wrecks the preview. */}
-            {!expanded && (
-              <div className="px-4 py-2.5 text-sm text-muted-foreground">
-                {latestText ? (
-                  <div className="truncate">
-                    {stripMarkdownToPreview(latestText)}
-                  </div>
-                ) : uniqueToolNames.length > 0 ? (
-                  <span className="text-xs font-mono truncate block">
-                    {uniqueToolNames.slice(0, 5).join(" \u2192 ")}
-                    {uniqueToolNames.length > 5 &&
-                      ` + ${uniqueToolNames.length - 5} more`}
-                  </span>
-                ) : (
-                  <span className="text-xs text-muted-foreground/60 italic">
-                    {"waiting for first action\u2026"}
-                  </span>
-                )}
-              </div>
-            )}
+            <div className="px-4 py-3 space-y-2">
+              {headText ? (
+                <div className="text-sm text-muted-foreground truncate">
+                  {stripMarkdownToPreview(headText)}
+                </div>
+              ) : toolCount === 0 ? (
+                <div className="text-xs text-muted-foreground/60 italic">
+                  {"waiting for first action…"}
+                </div>
+              ) : null}
 
-            {/* Expanded: chronological stream with tool bursts
-                coalesced into a single ToolActivityRow each.
-                Consecutive tool_status messages (no text between)
-                collapse to the LATEST snapshot — each snapshot is
-                cumulative within its turn, so the latest one tells
-                the whole story for that burst. Text messages break
-                the burst and render as markdown. */}
-            {expanded && (
-              <div
-                ref={bodyRef}
-                className="max-h-[400px] overflow-y-auto px-4 py-3 space-y-3"
-              >
-                {(() => {
-                  type RenderRow =
-                    | { kind: "tools"; content: string; key: string }
-                    | { kind: "text"; msg: ChatMessage; key: string };
-                  const rows: RenderRow[] = [];
-                  let pendingTool: { content: string; id: string } | null = null;
-                  const flushTool = () => {
-                    if (pendingTool) {
-                      rows.push({
-                        kind: "tools",
-                        content: pendingTool.content,
-                        key: `tools-${pendingTool.id}`,
-                      });
-                      pendingTool = null;
-                    }
-                  };
-                  for (let i = 0; i < group.messages.length; i++) {
-                    const m = group.messages[i];
-                    if (m.type === "tool_status") {
-                      // Overwrite — latest snapshot in the burst wins
-                      pendingTool = {
-                        content: m.content,
-                        id: m.id || `ts-${i}`,
-                      };
-                      continue;
-                    }
-                    if (m.content?.trim()) {
-                      flushTool();
-                      rows.push({
-                        kind: "text",
-                        msg: m,
-                        key: m.id || `txt-${i}`,
-                      });
-                    }
-                  }
-                  flushTool();
+              {chainParts.length > 0 && (
+                <div className="text-xs font-mono text-muted-foreground truncate">
+                  {chainParts.join(" · ")}
+                  {hiddenCount > 0 && (
+                    <span className="text-muted-foreground/60 ml-1 font-sans not-italic">
+                      (+{hiddenCount})
+                    </span>
+                  )}
+                </div>
+              )}
 
-                  return rows.map((row) => {
-                    if (row.kind === "tools") {
-                      // ToolActivityRow groups by tool name (×N), shows
-                      // running pills (spinner) before done pills (check),
-                      // and uses the per-tool color hash that matches
-                      // the rest of the chat.
-                      return (
-                        <div key={row.key} className="-ml-10">
-                          <ToolActivityRow content={row.content} />
-                        </div>
-                      );
-                    }
-                    return (
-                      <div
-                        key={row.key}
-                        className="text-sm leading-relaxed"
-                      >
-                        <MarkdownContent content={row.msg.content} />
-                      </div>
-                    );
-                  });
-                })()}
-              </div>
-            )}
+              {showTail && (
+                <div className="text-sm text-foreground/85 truncate">
+                  {stripMarkdownToPreview(tailText)}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -311,7 +277,7 @@ const WorkerRunBubble = memo(
     prev.label === next.label &&
     prev.group.messages.length === next.group.messages.length &&
     prev.group.messages[prev.group.messages.length - 1]?.content ===
-      next.group.messages[next.group.messages.length - 1]?.content
+      next.group.messages[next.group.messages.length - 1]?.content,
 );
 
 export default WorkerRunBubble;

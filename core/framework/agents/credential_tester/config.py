@@ -9,10 +9,7 @@ from framework.config import RuntimeConfig
 class AgentMetadata:
     name: str = "Credential Tester"
     version: str = "1.0.0"
-    description: str = (
-        "Test connected accounts by making real API calls. "
-        "Pick an account, verify credentials work, and explore available tools."
-    )
+    description: str = "Test connected accounts by making real API calls. Pick an account, verify credentials work, and explore available tools."
 
 
 metadata = AgentMetadata()

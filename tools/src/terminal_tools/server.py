@@ -81,6 +81,29 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[dict]:
 
 
 def _is_alive(pid: int) -> bool:
+    """Return True iff the process is still running.
+
+    Implementation note: on Windows, ``os.kill(pid, 0)`` is NOT a safe
+    alive-check. Because ``CTRL_C_EVENT == 0``, CPython first tries
+    ``GenerateConsoleCtrlEvent`` and silently falls through to
+    ``OpenProcess(PROCESS_ALL_ACCESS) + TerminateProcess(handle, 0)``
+    when the target isn't in the same console — actually killing the
+    parent. We use the Win32 API directly (same approach as
+    ``session_manager._is_pid_alive``) to avoid that landmine.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000 — minimal access, no terminate.
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            # ERROR_ACCESS_DENIED (5) means the process exists but is protected.
+            return kernel32.GetLastError() == 5
+        exit_code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return exit_code.value == 259  # STILL_ACTIVE
     try:
         os.kill(pid, 0)
         return True

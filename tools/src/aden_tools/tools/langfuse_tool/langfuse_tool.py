@@ -38,10 +38,7 @@ def _get_creds(
     if not public_key or not secret_key:
         return {
             "error": "Langfuse credentials not configured",
-            "help": (
-                "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY environment "
-                "variables or configure via credential store"
-            ),
+            "help": ("Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY environment variables or configure via credential store"),
         }
     host = host.rstrip("/")
     return public_key, secret_key, host

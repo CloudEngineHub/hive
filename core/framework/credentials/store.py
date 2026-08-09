@@ -564,10 +564,7 @@ class CredentialStore:
             if raise_on_failure:
                 raise CredentialExpiredError(
                     credential_id=credential.id,
-                    message=(
-                        f"OAuth token for '{credential.id}' is expired and "
-                        f"refresh failed: {e}. Reauthorization required."
-                    ),
+                    message=(f"OAuth token for '{credential.id}' is expired and refresh failed: {e}. Reauthorization required."),
                     provider=credential.provider_type,
                     alias=credential.alias,
                 ) from e
@@ -754,23 +751,56 @@ class CredentialStore:
 
             local_path = str(HIVE_HOME / "credentials")
 
+        # Check if Aden is configured
+        if not os.environ.get("ADEN_API_KEY"):
+            logger.info("ADEN_API_KEY not set, using local-only credential storage")
+            return cls(storage=EncryptedFileStorage(base_path=local_path), **kwargs)
+
+        built = cls._build_aden_backend(base_url, cache_ttl_seconds, local_path)
+        if built is None:
+            logger.warning("Aden components unavailable, using local storage")
+            return cls(storage=EncryptedFileStorage(base_path=local_path), **kwargs)
+
+        cached_storage, provider = built
+        store = cls(
+            storage=cached_storage,
+            providers=[provider],
+            auto_refresh=True,
+            **kwargs,
+        )
+
+        # Initial sync
+        if auto_sync:
+            synced = provider.sync_all(store)
+            logger.info(f"Synced {synced} credentials from Aden server")
+
+        return store
+
+    @staticmethod
+    def _build_aden_backend(
+        base_url: str | None,
+        cache_ttl_seconds: int,
+        local_path: str,
+    ) -> tuple[Any, CredentialProvider] | None:
+        """Build the ``(AdenCachedStorage, AdenSyncProvider)`` pair.
+
+        Shared by :meth:`with_aden_sync` (build-time) and
+        :meth:`enable_aden_sync` (in-place upgrade). Returns ``None`` when
+        the Aden components can't be constructed.
+        """
+        import os
+
+        from .storage import EncryptedFileStorage
+
         local_storage = EncryptedFileStorage(base_path=local_path)
 
-        # Check if Aden is configured
-        api_key = os.environ.get("ADEN_API_KEY")
-        if not api_key:
-            logger.info("ADEN_API_KEY not set, using local-only credential storage")
-            return cls(storage=local_storage, **kwargs)
-
         # Honor ADEN_API_URL when no explicit base_url was passed. The
-        # legacy default (https://api.adenhq.com) was a stale brand
-        # alias; the new canonical host is app.open-hive.com (matches
-        # cloud-deployed hive-backend) but local dev typically points
-        # at http://localhost:8889 via this env var.
+        # legacy default (https://api.adenhq.com) was a stale brand alias;
+        # the canonical host is app.open-hive.com, and local dev points
+        # this at http://localhost:8889.
         if base_url is None:
             base_url = os.environ.get("ADEN_API_URL", "https://app.open-hive.com")
 
-        # Try to setup Aden sync
         try:
             from .aden import (
                 AdenCachedStorage,
@@ -779,37 +809,64 @@ class CredentialStore:
                 AdenSyncProvider,
             )
 
-            # Create Aden client
             client = AdenCredentialClient(AdenClientConfig(base_url=base_url))
-
-            # Create sync provider
             provider = AdenSyncProvider(client=client)
-
-            # Use cached storage for offline resilience
             cached_storage = AdenCachedStorage(
                 local_storage=local_storage,
                 aden_provider=provider,
                 cache_ttl_seconds=cache_ttl_seconds,
             )
-
-            store = cls(
-                storage=cached_storage,
-                providers=[provider],
-                auto_refresh=True,
-                **kwargs,
-            )
-
-            # Initial sync
-            if auto_sync:
-                synced = provider.sync_all(store)
-                logger.info(f"Synced {synced} credentials from Aden server")
-
-            return store
-
+            return cached_storage, provider
         except ImportError:
-            logger.warning("Aden components not available, using local storage")
-            return cls(storage=local_storage, **kwargs)
-
+            logger.warning("Aden components not available")
+            return None
         except Exception as e:
-            logger.warning(f"Failed to setup Aden sync: {e}. Using local storage.")
-            return cls(storage=local_storage, **kwargs)
+            logger.warning(f"Failed to build Aden backend: {e}")
+            return None
+
+    def enable_aden_sync(
+        self,
+        base_url: str | None = None,
+        cache_ttl_seconds: int | None = None,
+        local_path: str | None = None,
+    ) -> int:
+        """Upgrade this store in place to sync credentials from Aden.
+
+        The desktop runtime is spawned before the user's ``ADEN_API_KEY``
+        exists, so the store is first built local-only. When the key
+        later arrives (``POST /api/credentials``), this swaps an
+        ``AdenCachedStorage`` backend + ``AdenSyncProvider`` onto the
+        *existing* instance — so every component already holding this
+        store (SessionManager, tool registries) gains Aden sync without a
+        process restart — then runs a full initial sync.
+
+        No-op (returns 0) when ``ADEN_API_KEY`` is unset or the Aden
+        components can't be built. Safe to call repeatedly.
+
+        Returns the number of credentials synced.
+        """
+        import os
+
+        if not os.environ.get("ADEN_API_KEY"):
+            logger.info("enable_aden_sync: ADEN_API_KEY not set; staying local-only")
+            return 0
+
+        if local_path is None:
+            from framework.config import HIVE_HOME
+
+            local_path = str(HIVE_HOME / "credentials")
+
+        built = self._build_aden_backend(base_url, cache_ttl_seconds or self._cache_ttl, local_path)
+        if built is None:
+            return 0
+
+        cached_storage, provider = built
+        with self._lock:
+            self._storage = cached_storage
+            self.register_provider(provider)
+            self._auto_refresh = True
+            self._cache.clear()
+
+        synced = provider.sync_all(self)
+        logger.info("enable_aden_sync: Aden sync activated, synced %d credential(s)", synced)
+        return synced

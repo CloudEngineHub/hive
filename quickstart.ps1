@@ -561,6 +561,31 @@ try {
         exit 1
     }
 
+    # Check for tesseract binary (required for OCR on scanned PDFs/images via pytesseract)
+    Write-Host "  Checking for tesseract... " -NoNewline
+    $tesseractCmd = Get-Command tesseract -ErrorAction SilentlyContinue
+    if ($tesseractCmd) {
+        Write-Ok "ok"
+    } else {
+        $tesseractInstalled = $false
+        # Try winget first (built into Windows 10/11), then chocolatey as fallback
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "installing via winget... " -NoNewline
+            $null = & winget install --id UB-Mannheim.TesseractOCR --silent --accept-package-agreements --accept-source-agreements 2>&1
+            if ($LASTEXITCODE -eq 0) { $tesseractInstalled = $true }
+        } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+            Write-Host "installing via choco... " -NoNewline
+            $null = & choco install tesseract -y --no-progress 2>&1
+            if ($LASTEXITCODE -eq 0) { $tesseractInstalled = $true }
+        }
+        if ($tesseractInstalled) {
+            Write-Ok "ok"
+        } else {
+            Write-Warn "not found - install Tesseract OCR for scanned-PDF/image OCR"
+            Write-Color -Text "    Install manually: winget install UB-Mannheim.TesseractOCR (or https://github.com/UB-Mannheim/tesseract/wiki)" -Color DarkGray
+        }
+    }
+
     # Keep browser setup scoped to detecting the system browser used by GCU.
     Write-Host "  Checking for Chrome/Edge browser... " -NoNewline
     $null = & $UvCmd run python -c "from gcu.browser.chrome_finder import find_chrome; assert find_chrome()" 2>&1
@@ -1824,7 +1849,7 @@ if ($SubscriptionMode -eq "hive_llm") {
         } else {
             Write-Host ""
             Write-Host "  Get your API key from: " -NoNewline
-            Write-Color -Text "https://discord.com/invite/MXE49hrKDk" -Color Cyan
+            Write-Color -Text "https://discord.com/invite/hQdU7QDkgR" -Color Cyan
             Write-Host ""
             $apiKey = Read-Host "Paste your Hive API key (or press Enter to skip)"
         }

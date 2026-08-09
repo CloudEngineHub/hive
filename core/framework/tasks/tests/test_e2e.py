@@ -2,7 +2,6 @@
 
 - Session task tools fire EventBus events
 - REST routes return correct snapshots
-- run_parallel_workers-style flow stamps assigned_session
 - Durability: store survives a process boundary (subprocess)
 """
 
@@ -22,10 +21,10 @@ from aiohttp.test_utils import TestClient, TestServer
 from framework.host.event_bus import AgentEvent, EventBus, EventType
 from framework.llm.provider import ToolUse
 from framework.loader.tool_registry import ToolRegistry
-from framework.tasks import TaskListRole, TaskStore
+from framework.tasks import TaskStore
 from framework.tasks.events import set_default_event_bus
 from framework.tasks.hooks import clear_hooks
-from framework.tasks.tools import register_colony_template_tools, register_task_tools
+from framework.tasks.tools import register_task_tools
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +43,6 @@ def store(tmp_path: Path) -> TaskStore:
 def registry(store: TaskStore) -> ToolRegistry:
     reg = ToolRegistry()
     register_task_tools(reg, store=store)
-    register_colony_template_tools(reg, colony_id="abc", store=store)
     return reg
 
 
@@ -72,9 +70,9 @@ async def test_task_created_emits_event(registry: ToolRegistry) -> None:
 
     bus.subscribe([EventType.TASK_CREATED], handler)
 
-    token = ToolRegistry.set_execution_context(agent_id="alice", task_list_id="session:alice:s1")
+    token = ToolRegistry.set_execution_context(agent_id="alice", session_id="s1")
     try:
-        await _invoke(registry, "task_create", subject="hello")
+        await _invoke(registry, "task_create", goal="test goal", tasks=[{"subject": "hello"}])
     finally:
         ToolRegistry.reset_execution_context(token)
 
@@ -83,6 +81,7 @@ async def test_task_created_emits_event(registry: ToolRegistry) -> None:
     assert len(received) == 1
     assert received[0].type == EventType.TASK_CREATED
     assert received[0].data["task"]["subject"] == "hello"
+    assert received[0].data["session_id"] == "s1"
     set_default_event_bus(None)
 
 
@@ -97,9 +96,9 @@ async def test_task_updated_emits_event(registry: ToolRegistry) -> None:
 
     bus.subscribe([EventType.TASK_UPDATED], handler)
 
-    token = ToolRegistry.set_execution_context(agent_id="alice", task_list_id="session:alice:s1")
+    token = ToolRegistry.set_execution_context(agent_id="alice", session_id="s1")
     try:
-        await _invoke(registry, "task_create", subject="x")
+        await _invoke(registry, "task_create", goal="test goal", tasks=[{"subject": "x"}])
         await _invoke(registry, "task_update", id=1, status="in_progress")
     finally:
         ToolRegistry.reset_execution_context(token)
@@ -137,10 +136,10 @@ async def http_client(tmp_path: Path) -> TestClient:
 
 @pytest.mark.asyncio
 async def test_rest_get_task_list_404(http_client: TestClient) -> None:
-    resp = await http_client.get("/api/tasks/session:nope:nope")
+    resp = await http_client.get("/api/sessions/nope/tasks")
     assert resp.status == 404
     body = await resp.json()
-    assert body["task_list_id"] == "session:nope:nope"
+    assert body["session_id"] == "nope"
 
 
 @pytest.mark.asyncio
@@ -150,25 +149,124 @@ async def test_rest_get_task_list_after_create(http_client: TestClient) -> None:
     from framework.tasks import get_task_store
 
     store = get_task_store()
-    await store.ensure_task_list("session:alice:s1", role=TaskListRole.SESSION)
-    await store.create_task("session:alice:s1", subject="abc")
+    await store.ensure_task_list("s1")
+    await store.create_task("s1", subject="abc")
 
-    resp = await http_client.get("/api/tasks/session:alice:s1")
+    resp = await http_client.get("/api/sessions/s1/tasks")
     assert resp.status == 200
     body = await resp.json()
-    assert body["task_list_id"] == "session:alice:s1"
+    assert body["session_id"] == "s1"
     assert body["role"] == "session"
     assert len(body["tasks"]) == 1
     assert body["tasks"][0]["subject"] == "abc"
 
 
 @pytest.mark.asyncio
-async def test_rest_colony_lists(http_client: TestClient) -> None:
-    resp = await http_client.get("/api/colonies/test_colony/task_lists?queen_session_id=sess123")
+async def test_rest_clear_completed_archives_and_reports_ids(http_client: TestClient) -> None:
+    """POST clear-completed (the "Clear done" button): completed tasks are
+    archived and reported; open work is untouched; the GET snapshot then
+    shows the archived statuses (History reads them from the same list)."""
+    from framework.tasks import TaskStatus, get_task_store
+
+    store = get_task_store()
+    await store.ensure_task_list("s1")
+    await store.create_tasks_batch(
+        "s1", [{"subject": "done-1"}, {"subject": "done-2"}, {"subject": "open"}]
+    )
+    await store.update_task("s1", 1, status=TaskStatus.COMPLETED)
+    await store.update_task("s1", 2, status=TaskStatus.COMPLETED)
+
+    resp = await http_client.post("/api/sessions/s1/tasks/clear-completed")
     assert resp.status == 200
     body = await resp.json()
-    assert body["template_task_list_id"] == "colony:test_colony"
-    assert body["queen_session_task_list_id"] == "session:queen:sess123"
+    assert body["session_id"] == "s1"
+    assert sorted(body["archived"]) == [1, 2]
+
+    snap = await (await http_client.get("/api/sessions/s1/tasks")).json()
+    by_id = {t["id"]: t for t in snap["tasks"]}
+    assert by_id[1]["status"] == "archived"
+    assert by_id[2]["status"] == "archived"
+    assert by_id[3]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_rest_clear_completed_noop_and_unknown_session(http_client: TestClient) -> None:
+    """Nothing completed → archived: []. Unknown session → archived: [] too
+    (not an error — the button is harmless to mash)."""
+    from framework.tasks import get_task_store
+
+    store = get_task_store()
+    await store.ensure_task_list("s1")
+    await store.create_task("s1", subject="open")
+
+    resp = await http_client.post("/api/sessions/s1/tasks/clear-completed")
+    assert resp.status == 200
+    assert (await resp.json())["archived"] == []
+
+    resp = await http_client.post("/api/sessions/never-existed/tasks/clear-completed")
+    assert resp.status == 200
+    assert (await resp.json())["archived"] == []
+
+
+@pytest.mark.asyncio
+async def test_rest_clear_completed_emits_task_updated_per_record(
+    http_client: TestClient,
+) -> None:
+    """One task_updated event per archived record — open panels drop the
+    tasks from the live plan without a refetch."""
+    from framework.tasks import TaskStatus, get_task_store
+
+    store = get_task_store()
+    await store.ensure_task_list("s1")
+    await store.create_tasks_batch("s1", [{"subject": "a"}, {"subject": "b"}])
+    await store.update_task("s1", 1, status=TaskStatus.COMPLETED)
+    await store.update_task("s1", 2, status=TaskStatus.COMPLETED)
+
+    bus = EventBus()
+    set_default_event_bus(bus)
+    received: list[AgentEvent] = []
+
+    async def handler(ev: AgentEvent) -> None:
+        received.append(ev)
+
+    bus.subscribe([EventType.TASK_UPDATED], handler)
+    try:
+        resp = await http_client.post("/api/sessions/s1/tasks/clear-completed")
+        assert resp.status == 200
+        await asyncio.sleep(0.05)  # let the publishes fan out
+    finally:
+        set_default_event_bus(None)
+
+    assert sorted(ev.data["task_id"] for ev in received) == [1, 2]
+    for ev in received:
+        assert ev.data["after"]["status"] == "archived"
+        assert ev.data["fields"] == ["status"]
+
+
+@pytest.mark.asyncio
+async def test_rest_clear_completed_then_unarchive_round_trip(
+    http_client: TestClient,
+) -> None:
+    """History "remove" after "Clear done": unarchive restores the tasks to
+    COMPLETED (their archived_from), not pending."""
+    from framework.tasks import TaskStatus, get_task_store
+
+    store = get_task_store()
+    await store.ensure_task_list("s1")
+    await store.create_task("s1", subject="finished work")
+    await store.update_task("s1", 1, status=TaskStatus.COMPLETED)
+
+    cleared = await (await http_client.post("/api/sessions/s1/tasks/clear-completed")).json()
+    assert cleared["archived"] == [1]
+
+    resp = await http_client.post(
+        "/api/sessions/s1/tasks/unarchive", json={"task_ids": [1]}
+    )
+    assert resp.status == 200
+    assert (await resp.json())["restored"] == [1]
+
+    snap = await (await http_client.get("/api/sessions/s1/tasks")).json()
+    assert snap["tasks"][0]["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +282,12 @@ def test_durability_across_subprocesses(tmp_path: Path) -> None:
 
     write_script = """
 import asyncio
-from framework.tasks import TaskStore, TaskListRole
+from framework.tasks import TaskStore
 
 async def main():
     s = TaskStore()
-    await s.ensure_task_list('session:a:b', role=TaskListRole.SESSION)
-    rec = await s.create_task('session:a:b', subject='persisted')
+    await s.ensure_task_list('sess_dur')
+    rec = await s.create_task('sess_dur', subject='persisted')
     print(rec.id)
 
 asyncio.run(main())
@@ -210,7 +308,7 @@ from framework.tasks import TaskStore
 
 async def main():
     s = TaskStore()
-    rs = await s.list_tasks('session:a:b')
+    rs = await s.list_tasks('sess_dur')
     print(len(rs), rs[0].subject if rs else '')
 
 asyncio.run(main())
@@ -228,36 +326,6 @@ asyncio.run(main())
 
 
 # ---------------------------------------------------------------------------
-# "run_parallel_workers" style flow at the storage level.
-# Validates plan-and-spawn pattern: queen publishes templates, then stamps
-# assigned_session per spawned worker.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_template_assignment_flow(store: TaskStore) -> None:
-    template_id = "colony:swarm"
-    await store.ensure_task_list(template_id, role=TaskListRole.TEMPLATE)
-    rec1 = await store.create_task(template_id, subject="crawl A")
-    rec2 = await store.create_task(template_id, subject="crawl B")
-
-    # Simulate run_parallel_workers stamping after spawn.
-    await store.update_task(
-        template_id,
-        rec1.id,
-        metadata_patch={"assigned_session": "session:w1:w1", "assigned_worker_id": "w1"},
-    )
-    await store.update_task(
-        template_id,
-        rec2.id,
-        metadata_patch={"assigned_session": "session:w2:w2", "assigned_worker_id": "w2"},
-    )
-
-    rs = await store.list_tasks(template_id)
-    assert all(r.metadata.get("assigned_worker_id") for r in rs)
-
-
-# ---------------------------------------------------------------------------
 # Reset preserves byte-equivalence semantics (durability under graceful op)
 # ---------------------------------------------------------------------------
 
@@ -265,9 +333,9 @@ async def test_template_assignment_flow(store: TaskStore) -> None:
 @pytest.mark.asyncio
 async def test_graceful_no_op_preserves_files(store: TaskStore, tmp_path: Path) -> None:
     """The store has no shutdown hook — touching it never deletes files."""
-    list_id = "session:a:b"
-    await store.ensure_task_list(list_id, role=TaskListRole.SESSION)
-    rec = await store.create_task(list_id, subject="x")
+    session_id = "sess_g"
+    await store.ensure_task_list(session_id)
+    rec = await store.create_task(session_id, subject="x")
     pre = sorted((tmp_path).rglob("*.json"))
     pre_bytes = {p.name: p.read_bytes() for p in pre}
 

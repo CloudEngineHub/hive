@@ -8,7 +8,7 @@ with its own credential aliases (e.g. one profile pinned to Slack workspace
 
 Layout::
 
-    {COLONIES_DIR}/{colony_name}/
+    {COLONIES_DIR}/{colony_id}/
         worker.json                       # legacy / "default" profile
         profiles/
             slack-work/worker.json
@@ -58,6 +58,11 @@ class WorkerProfile:
     concurrency_hint: int | None = None
     prompt_override: str | None = None
     tool_filter: list[str] | None = None
+    # Chrome browser-profile label this worker's browser tools target (the
+    # label set in the extension side panel). Empty -> the logical "default"
+    # profile, preserving single-browser behaviour. Lets one colony drive
+    # several Chrome profiles / social accounts (one per worker profile).
+    browser_profile: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -68,6 +73,8 @@ class WorkerProfile:
             d.pop("tool_filter", None)
         if d.get("concurrency_hint") is None:
             d.pop("concurrency_hint", None)
+        if not d.get("browser_profile"):
+            d.pop("browser_profile", None)
         return d
 
     @classmethod
@@ -78,46 +85,42 @@ class WorkerProfile:
             skill_name=str(data.get("skill_name", "")),
             integrations={str(k): str(v) for k, v in (data.get("integrations") or {}).items() if str(k) and str(v)},
             concurrency_hint=(
-                int(data["concurrency_hint"])
-                if isinstance(data.get("concurrency_hint"), int) and data["concurrency_hint"] > 0
-                else None
+                int(data["concurrency_hint"]) if isinstance(data.get("concurrency_hint"), int) and data["concurrency_hint"] > 0 else None
             ),
             prompt_override=(data.get("prompt_override") or None),
             tool_filter=list(data["tool_filter"]) if isinstance(data.get("tool_filter"), list) else None,
+            browser_profile=str(data.get("browser_profile", "")).strip(),
         )
 
 
 def validate_profile_name(name: str) -> str | None:
     """Return an error message if ``name`` is invalid, else ``None``."""
     if not isinstance(name, str) or not _PROFILE_NAME_RE.match(name):
-        return (
-            "profile name must be lowercase alphanumeric (with - or _), "
-            "start with a letter/digit, and be ≤64 characters"
-        )
+        return "profile name must be lowercase alphanumeric (with - or _), start with a letter/digit, and be ≤64 characters"
     return None
 
 
-def worker_spec_path(colony_name: str, profile_name: str | None = None) -> Path:
+def worker_spec_path(colony_id: str, profile_name: str | None = None) -> Path:
     """Return the on-disk path to a profile's ``worker.json``.
 
     The default / unnamed profile lives at ``{colony_dir}/worker.json``
     (legacy location). Named profiles live at
     ``{colony_dir}/profiles/{profile_name}/worker.json``.
     """
-    colony_dir = COLONIES_DIR / colony_name
+    colony_dir = COLONIES_DIR / colony_id
     if not profile_name or profile_name == DEFAULT_PROFILE_NAME:
         return colony_dir / "worker.json"
     return colony_dir / "profiles" / profile_name / "worker.json"
 
 
-def list_worker_profiles(colony_name: str) -> list[WorkerProfile]:
+def list_worker_profiles(colony_id: str) -> list[WorkerProfile]:
     """Return the colony's declared worker profiles.
 
     Legacy colonies (no ``worker_profiles`` field in metadata.json) get a
     synthetic single-entry list with the default profile, so dispatch logic
     elsewhere can treat the profile registry as always non-empty.
     """
-    metadata = load_colony_metadata(colony_name)
+    metadata = load_colony_metadata(colony_id)
     raw = metadata.get("worker_profiles")
     if not isinstance(raw, list) or not raw:
         return [WorkerProfile(name=DEFAULT_PROFILE_NAME)]
@@ -133,7 +136,7 @@ def list_worker_profiles(colony_name: str) -> list[WorkerProfile]:
             logger.warning(
                 "worker_profiles: skipping invalid profile name %r in colony %s",
                 profile.name,
-                colony_name,
+                colony_id,
             )
             continue
         seen.add(profile.name)
@@ -143,23 +146,23 @@ def list_worker_profiles(colony_name: str) -> list[WorkerProfile]:
     return profiles
 
 
-def get_worker_profile(colony_name: str, profile_name: str) -> WorkerProfile | None:
+def get_worker_profile(colony_id: str, profile_name: str) -> WorkerProfile | None:
     """Return one profile by name, or ``None`` if not declared."""
-    for profile in list_worker_profiles(colony_name):
+    for profile in list_worker_profiles(colony_id):
         if profile.name == profile_name:
             return profile
     return None
 
 
-def save_worker_profiles(colony_name: str, profiles: list[WorkerProfile]) -> list[WorkerProfile]:
+def save_worker_profiles(colony_id: str, profiles: list[WorkerProfile]) -> list[WorkerProfile]:
     """Persist ``profiles`` to the colony's metadata.json.
 
     Validates names, deduplicates, and refuses to write an empty list (use
     the default profile representation instead). Returns the canonicalized
     list as written.
     """
-    if not colony_metadata_path(colony_name).parent.exists():
-        raise FileNotFoundError(f"Colony '{colony_name}' not found")
+    if not colony_metadata_path(colony_id).parent.exists():
+        raise FileNotFoundError(f"Colony '{colony_id}' not found")
 
     canonical: list[WorkerProfile] = []
     seen: set[str] = set()
@@ -173,31 +176,31 @@ def save_worker_profiles(colony_name: str, profiles: list[WorkerProfile]) -> lis
         canonical.append(profile)
     if not canonical:
         canonical = [WorkerProfile(name=DEFAULT_PROFILE_NAME)]
-    update_colony_metadata(colony_name, {"worker_profiles": [p.to_dict() for p in canonical]})
+    update_colony_metadata(colony_id, {"worker_profiles": [p.to_dict() for p in canonical]})
     return canonical
 
 
-def upsert_worker_profile(colony_name: str, profile: WorkerProfile) -> list[WorkerProfile]:
+def upsert_worker_profile(colony_id: str, profile: WorkerProfile) -> list[WorkerProfile]:
     """Insert or replace a single profile, preserving siblings."""
     err = validate_profile_name(profile.name)
     if err is not None:
         raise ValueError(err)
-    existing = list_worker_profiles(colony_name)
+    existing = list_worker_profiles(colony_id)
     out = [p for p in existing if p.name != profile.name]
     out.append(profile)
-    return save_worker_profiles(colony_name, out)
+    return save_worker_profiles(colony_id, out)
 
 
-def delete_worker_profile(colony_name: str, profile_name: str) -> bool:
+def delete_worker_profile(colony_id: str, profile_name: str) -> bool:
     """Remove a profile by name. Returns True if a profile was removed.
 
     Refuses to remove the default profile so dispatch always has a fallback.
     """
     if profile_name == DEFAULT_PROFILE_NAME:
         raise ValueError("cannot delete the default worker profile")
-    existing = list_worker_profiles(colony_name)
+    existing = list_worker_profiles(colony_id)
     out = [p for p in existing if p.name != profile_name]
     if len(out) == len(existing):
         return False
-    save_worker_profiles(colony_name, out)
+    save_worker_profiles(colony_id, out)
     return True

@@ -185,7 +185,7 @@ async def _make_colony(
         tools=[],
         tool_executor=_stub_tool_executor,
         event_bus=event_bus,
-        colony_id="test_colony",
+        stream_id="test_colony",
         pipeline_stages=[],  # skip pipeline initialisation in tests
     )
     await colony.start()
@@ -220,7 +220,7 @@ class TestStartOverseer:
             assert colony.overseer is overseer
             assert overseer.is_persistent is True
             assert overseer._context.stream_id == "overseer"
-            assert overseer.id == f"overseer:{colony.colony_id}"
+            assert overseer.id == f"overseer:{colony.stream_id}"
             # Give the background task a moment to start
             await asyncio.sleep(0.05)
             assert overseer.is_active
@@ -496,5 +496,165 @@ class TestReportToParentGatingByStream:
             worker_tools = llm.stream_calls[0]["tools"]
             tool_names = [t.name for t in (worker_tools or [])]
             assert "report_to_parent" in tool_names
+        finally:
+            await colony.stop()
+
+    @pytest.mark.asyncio
+    async def test_worker_with_non_worker_colon_stream_id_does_not_terminate(self, tmp_path, agent_spec, goal, event_bus):
+        """Diagnostic: confirm a worker whose stream_id lacks the ``worker:``
+        prefix is NOT given the report_to_parent tool, and that if its LLM
+        somehow calls it, the worker fails to terminate.
+
+        ``run_agent_with_input`` passes ``stream_id="worker"`` (no colon) so
+        the loaded primary worker's deltas stream to the queen DM. agent_loop
+        gates report_to_parent on stream_id.startswith("worker:"), so:
+        - the tool is hidden from the prompt entirely (no worker:* match)
+        - even a forged call would hit the error branch at agent_loop.py:3329
+          and the loop would keep running
+        """
+        # First scenario: the LLM forges a report_to_parent call. Second:
+        # any subsequent turn (so the test can observe whether the loop
+        # ended after the forged report).
+        llm = MockStreamingLLM(
+            scenarios=[
+                _report_scenario("success", "I'm trying to report"),
+                _text_scenario("still alive"),
+            ]
+        )
+        colony = await _make_colony(tmp_path, llm, agent_spec, goal, event_bus)
+        try:
+            # Spawn with stream_id="worker" (no colon) — same shape
+            # run_agent_with_input uses.
+            ids = await colony.spawn(task="diagnostic", count=1, stream_id="worker")
+            worker = colony.get_worker(ids[0])
+            assert worker is not None
+
+            # Wait for at least the first LLM call.
+            for _ in range(100):
+                if llm.stream_calls:
+                    break
+                await asyncio.sleep(0.05)
+            assert llm.stream_calls, "Worker never called the LLM"
+
+            # Verify report_to_parent is NOT in the tool list — that's the
+            # gating in agent_loop.py:653.
+            first_tools = llm.stream_calls[0]["tools"]
+            tool_names = [t.name for t in (first_tools or [])]
+            assert "report_to_parent" not in tool_names, (
+                f"report_to_parent was offered to a stream_id='worker' (non-parallel) worker. Tools: {tool_names}"
+            )
+
+            # Give the worker a moment to do its thing. With no
+            # report_to_parent tool in the schema, the forged ToolCallEvent
+            # would be a phantom tool — agent_loop will execute it via the
+            # generic tool executor (stub returns "ok") and keep going.
+            await asyncio.sleep(0.5)
+
+            # The worker should still be active because no real termination
+            # path was triggered. (Eventually it'll time out via max_iterations,
+            # but not from report_to_parent.)
+            # In contrast, the worker:* case would have hit _report_terminated
+            # and exited at the top of iteration 2.
+            # We allow either: (a) still active, or (b) completed via some
+            # other path — but it MUST NOT be the report_to_parent fast-exit.
+            # Check by inspecting whether an explicit_report was recorded.
+            assert worker._explicit_report is None, "Worker recorded an explicit_report despite stream_id not matching worker:* — the gating broke"
+        finally:
+            await colony.stop()
+
+    @pytest.mark.asyncio
+    async def test_report_to_parent_with_extra_tools_in_same_batch_still_terminates(self, tmp_path, agent_spec, goal, event_bus):
+        """Realistic scenario: the LLM emits ``report_to_parent`` alongside
+        another tool in the same turn (e.g. a final write_skill save) AND
+        the second LLM call (if it happened) would emit yet another tool
+        call. Verify the worker stops after exactly one LLM call regardless.
+
+        Without the inner-loop early-return, the loop would:
+          turn 1: [other_tool, report_to_parent] → ack both → re-stream
+          turn 2: emits another tool → ack → re-stream
+          turn 3: emits another tool → ... runaway
+
+        With the fix, turn 1's batch completes (including the trailing tool
+        call) and the inner loop bails out before re-streaming.
+        """
+        # Scenario 1: report_to_parent first, plus a "filler" tool the LLM
+        # might piggyback on the final turn. Scenario 2+: keep emitting
+        # tool calls forever if we ever re-stream.
+        runaway_tool = ToolCallEvent(
+            tool_use_id="runaway_1",
+            tool_name="some_other_tool",
+            tool_input={"x": 1},
+        )
+        report_call = ToolCallEvent(
+            tool_use_id="report_1",
+            tool_name="report_to_parent",
+            tool_input={"status": "success", "summary": "done", "data": {}},
+        )
+        scenario_with_report = [
+            runaway_tool,
+            report_call,
+            FinishEvent(stop_reason="tool_calls", input_tokens=10, output_tokens=5, model="mock"),
+        ]
+        scenario_runaway = [
+            ToolCallEvent(
+                tool_use_id=f"runaway_{i}",
+                tool_name="some_other_tool",
+                tool_input={"x": i},
+            )
+            for i in range(2, 12)
+        ]
+        scenario_runaway.append(FinishEvent(stop_reason="tool_calls", input_tokens=10, output_tokens=5, model="mock"))
+
+        llm = MockStreamingLLM(
+            scenarios=[
+                scenario_with_report,
+                scenario_runaway,  # this should NEVER execute
+                scenario_runaway,
+                scenario_runaway,
+            ]
+        )
+        colony = await _make_colony(tmp_path, llm, agent_spec, goal, event_bus)
+        try:
+            ids = await colony.spawn(task="report+filler", count=1)
+            worker = colony.get_worker(ids[0])
+            assert worker is not None
+
+            deadline = asyncio.get_event_loop().time() + 5.0
+            while worker.is_active and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+
+            assert not worker.is_active, "worker failed to terminate"
+            assert worker._explicit_report is not None
+            assert worker._explicit_report["status"] == "success"
+            # CRITICAL: exactly one LLM call. If the inner loop re-streamed,
+            # we'd see scenario_runaway scenarios consumed and the count
+            # would climb.
+            assert len(llm.stream_calls) == 1, (
+                f"Worker made {len(llm.stream_calls)} LLM calls — expected 1. Inner loop re-streamed after report_to_parent."
+            )
+        finally:
+            await colony.stop()
+
+    @pytest.mark.asyncio
+    async def test_worker_with_worker_colon_stream_id_terminates_via_report(self, tmp_path, agent_spec, goal, event_bus):
+        """Positive control: a worker:* worker DOES terminate after report_to_parent."""
+        llm = MockStreamingLLM(scenarios=[_report_scenario("success", "done"), _text_scenario("zombie")])
+        colony = await _make_colony(tmp_path, llm, agent_spec, goal, event_bus)
+        try:
+            # Default spawn → stream_id = f"worker:{worker_id}"
+            ids = await colony.spawn(task="positive control", count=1)
+            worker = colony.get_worker(ids[0])
+            assert worker is not None
+
+            deadline = asyncio.get_event_loop().time() + 5.0
+            while worker.is_active and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+
+            assert not worker.is_active, "worker:* worker failed to terminate after report_to_parent"
+            assert worker._explicit_report is not None
+            assert worker._explicit_report["status"] == "success"
+            # Confirm the second scenario was NOT consumed — i.e., the loop
+            # exited before a second LLM call would have run.
+            assert len(llm.stream_calls) == 1, f"Worker made {len(llm.stream_calls)} LLM calls — expected 1. Loop didn't exit on _report_terminated."
         finally:
             await colony.stop()

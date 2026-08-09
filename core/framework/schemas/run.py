@@ -167,9 +167,7 @@ class Run(BaseModel):
 
         # Decision summary
         parts.append(
-            f"Made {self.metrics.total_decisions} decisions: "
-            f"{self.metrics.successful_decisions} succeeded, "
-            f"{self.metrics.failed_decisions} failed."
+            f"Made {self.metrics.total_decisions} decisions: {self.metrics.successful_decisions} succeeded, {self.metrics.failed_decisions} failed."
         )
 
         # Problems

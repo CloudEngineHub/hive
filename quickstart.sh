@@ -313,6 +313,47 @@ else
     fi
 fi
 
+# Check for tesseract CLI (required for OCR on scanned PDFs/images via pytesseract)
+echo -n "  Checking for tesseract... "
+if command -v tesseract &> /dev/null; then
+    echo -e "${GREEN}ok${NC}"
+else
+    echo -e "${YELLOW}not found${NC}"
+    TESSERACT_INSTALLED=false
+    if command -v apt-get &> /dev/null; then
+        echo -n "  Installing tesseract via apt... "
+        if sudo apt-get install -y tesseract-ocr > /dev/null 2>&1; then
+            TESSERACT_INSTALLED=true
+        fi
+    elif command -v brew &> /dev/null; then
+        echo -n "  Installing tesseract via brew... "
+        if brew install tesseract > /dev/null 2>&1; then
+            TESSERACT_INSTALLED=true
+        fi
+    elif command -v apk &> /dev/null; then
+        echo -n "  Installing tesseract via apk... "
+        if apk add tesseract-ocr > /dev/null 2>&1; then
+            TESSERACT_INSTALLED=true
+        fi
+    elif command -v dnf &> /dev/null; then
+        echo -n "  Installing tesseract via dnf... "
+        if sudo dnf install -y tesseract > /dev/null 2>&1; then
+            TESSERACT_INSTALLED=true
+        fi
+    elif command -v pacman &> /dev/null; then
+        echo -n "  Installing tesseract via pacman... "
+        if sudo pacman -S --noconfirm tesseract > /dev/null 2>&1; then
+            TESSERACT_INSTALLED=true
+        fi
+    fi
+    if [ "$TESSERACT_INSTALLED" = true ]; then
+        echo -e "${GREEN}ok${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Could not install tesseract automatically${NC}"
+        echo -e "${DIM}    Install manually: apt install tesseract-ocr / brew install tesseract / apk add tesseract-ocr${NC}"
+    fi
+fi
+
 # Check for Chrome/Edge (required for GCU browser tools)
 echo -n "  Checking for Chrome/Edge browser... "
 # Check common browser locations
@@ -1469,14 +1510,14 @@ case $choice in
         SIGNUP_URL="https://www.kimi.com/code"
         echo ""
         echo -e "${GREEN}⬢${NC} Using Kimi Code subscription"
-        echo -e "  ${DIM}Model: kimi-k2.5 | API: api.kimi.com/coding${NC}"
+        echo -e "  ${DIM}Model: kimi-k2.6 | API: api.kimi.com/coding${NC}"
         ;;
     6)
         # Hive LLM
         SUBSCRIPTION_MODE="hive_llm"
         apply_preset "hive_llm"
         PROVIDER_NAME="Hive"
-        SIGNUP_URL="https://discord.com/invite/MXE49hrKDk"
+        SIGNUP_URL="https://discord.com/invite/hQdU7QDkgR"
         echo ""
         echo -e "${GREEN}⬢${NC} Using Hive LLM"
         echo ""

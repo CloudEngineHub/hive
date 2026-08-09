@@ -554,9 +554,7 @@ class TestConversationTools:
 
     @patch("aden_tools.tools.intercom_tool.intercom_tool.httpx.get")
     def test_get_conversation(self, mock_get):
-        mock_get.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"})
-        )
+        mock_get.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"}))
         result = self._fn("intercom_get_conversation")(conversation_id="1")
         assert result["id"] == "1"
 
@@ -650,9 +648,7 @@ class TestNoteTagAssignTools:
     def test_add_note(self, mock_post, mock_get):
         # Mock /me for admin_id
         mock_get.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"id": "admin-1"}))
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"}))
         result = self._fn("intercom_add_note")(conversation_id="1", body="Triage note")
         assert result["type"] == "conversation"
 
@@ -685,9 +681,7 @@ class TestNoteTagAssignTools:
     @patch("aden_tools.tools.intercom_tool.intercom_tool.httpx.post")
     def test_assign_conversation(self, mock_post, mock_get):
         mock_get.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"id": "admin-1"}))
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"})
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"}))
         result = self._fn("intercom_assign_conversation")(conversation_id="1", assignee_id="admin-2")
         assert result["type"] == "conversation"
 
@@ -695,12 +689,8 @@ class TestNoteTagAssignTools:
     @patch("aden_tools.tools.intercom_tool.intercom_tool.httpx.post")
     def test_assign_conversation_team_type(self, mock_post, mock_get):
         mock_get.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"id": "admin-1"}))
-        mock_post.return_value = MagicMock(
-            status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"})
-        )
-        result = self._fn("intercom_assign_conversation")(
-            conversation_id="1", assignee_id="team-1", assignee_type="team"
-        )
+        mock_post.return_value = MagicMock(status_code=200, json=MagicMock(return_value={"type": "conversation", "id": "1"}))
+        result = self._fn("intercom_assign_conversation")(conversation_id="1", assignee_id="team-1", assignee_type="team")
         assert result["type"] == "conversation"
         # Verify assignee_type reached the API payload
         call_payload = mock_post.call_args.kwargs["json"]

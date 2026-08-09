@@ -120,10 +120,7 @@ class _VisionClient:
         if "error" in result:
             return result
 
-        labels = [
-            {"description": label["description"], "score": round(label["score"], 3)}
-            for label in result.get("labelAnnotations", [])
-        ]
+        labels = [{"description": label["description"], "score": round(label["score"], 3)} for label in result.get("labelAnnotations", [])]
         return {"labels": labels}
 
     def detect_text(self, image_source: str) -> dict[str, Any]:
@@ -307,10 +304,7 @@ class _VisionClient:
 
         similar_images = [img.get("url", "") for img in web.get("visuallySimilarImages", [])[:5]]
 
-        pages_with_image = [
-            {"url": page.get("url", ""), "title": page.get("pageTitle", "")}
-            for page in web.get("pagesWithMatchingImages", [])[:5]
-        ]
+        pages_with_image = [{"url": page.get("url", ""), "title": page.get("pageTitle", "")} for page in web.get("pagesWithMatchingImages", [])[:5]]
 
         return {
             "web_entities": web_entities,

@@ -43,10 +43,7 @@ The key is pre-injected into the session environment and tools read it automatic
     return NodeSpec(
         id="tester",
         name="Credential Tester",
-        description=(
-            f"Interactive testing node for {provider}/{alias}. "
-            f"Has access to all {provider} tools to verify the credential works."
-        ),
+        description=(f"Interactive testing node for {provider}/{alias}. Has access to all {provider} tools to verify the credential works."),
         node_type="event_loop",
         client_facing=True,
         max_node_visits=0,

@@ -392,8 +392,7 @@ class TestImportError:
 
         with patch("aden_tools.tools.bigquery_tool.bigquery_tool._create_bigquery_client") as mock_create_client:
             mock_create_client.side_effect = ImportError(
-                "google-cloud-bigquery is required for BigQuery tools. "
-                "Install it with: pip install google-cloud-bigquery"
+                "google-cloud-bigquery is required for BigQuery tools. Install it with: pip install google-cloud-bigquery"
             )
             result = tool.fn(sql="SELECT 1")
 

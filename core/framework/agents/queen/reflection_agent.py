@@ -49,10 +49,7 @@ logger = logging.getLogger(__name__)
 _REFLECTION_TOOLS: list[Tool] = [
     Tool(
         name="list_memory_files",
-        description=(
-            "List memory files with their type, name, and description. "
-            "When scope is omitted, returns all scopes grouped by scope."
-        ),
+        description=("List memory files with their type, name, and description. When scope is omitted, returns all scopes grouped by scope."),
         parameters={
             "type": "object",
             "properties": {
@@ -112,9 +109,7 @@ _REFLECTION_TOOLS: list[Tool] = [
     ),
     Tool(
         name="delete_memory_file",
-        description=(
-            "Delete a memory file by filename.  Use during long reflection to prune stale or redundant memories."
-        ),
+        description=("Delete a memory file by filename.  Use during long reflection to prune stale or redundant memories."),
         parameters={
             "type": "object",
             "properties": {
@@ -364,6 +359,22 @@ async def _reflection_loop(
             )
         except asyncio.CancelledError:
             logger.warning("reflect: LLM call cancelled (task cancelled)")
+            # Persist a turn record so the timeline viewer shows what
+            # the reflection was sent before being cancelled. No partial
+            # assistant output to capture — acomplete is non-streaming.
+            try:
+                _log_reflection_turn(
+                    reflection_id=reflection_id,
+                    iteration=_turn,
+                    system_prompt=system,
+                    messages=messages,
+                    assistant_text="",
+                    tool_calls=[],
+                    tool_results=[],
+                    token_counts={**token_counts, "stop_reason": "cancelled"},
+                )
+            except Exception:
+                logger.debug("reflect cancel log failed", exc_info=True)
             return False, changed_files, last_text
         except Exception:
             logger.warning("reflect: LLM call failed", exc_info=True)
@@ -408,8 +419,7 @@ async def _reflection_loop(
                     "model": getattr(raw, "model", ""),
                     "input": getattr(raw_usage, "prompt_tokens", 0) or 0,
                     "output": getattr(raw_usage, "completion_tokens", 0) or 0,
-                    "cached": getattr(raw_usage, "prompt_tokens_details", None)
-                    and getattr(raw_usage.prompt_tokens_details, "cached_tokens", 0),
+                    "cached": getattr(raw_usage, "prompt_tokens_details", None) and getattr(raw_usage.prompt_tokens_details, "cached_tokens", 0),
                     "stop_reason": getattr(raw.choices[0], "finish_reason", "") if raw else "",
                 }
         except Exception:
@@ -475,11 +485,7 @@ _CATEGORIES_STR = ", ".join(GLOBAL_MEMORY_CATEGORIES)
 
 def _build_unified_short_reflect_system(queen_id: str | None = None) -> str:
     """Build the unified short reflection prompt across memory scopes."""
-    queen_scope = (
-        f"- `queen`: durable learnings specific to how queen '{queen_id}' should work with this user\n"
-        if queen_id
-        else ""
-    )
+    queen_scope = f"- `queen`: durable learnings specific to how queen '{queen_id}' should work with this user\n" if queen_id else ""
     return f"""\
 You are a reflection agent that distills durable knowledge about the USER
 into persistent memory files. You run in the background after each
@@ -538,9 +544,7 @@ Rules:
 
 def _build_unified_long_reflect_system(queen_id: str | None = None) -> str:
     """Build the unified housekeeping prompt across memory scopes."""
-    queen_scope = (
-        f"- `queen`: memories specific to how queen '{queen_id}' should work with this user\n" if queen_id else ""
-    )
+    queen_scope = f"- `queen`: memories specific to how queen '{queen_id}' should work with this user\n" if queen_id else ""
     return f"""\
 You are a reflection agent performing a periodic housekeeping pass over the
 memory system for this user.
@@ -682,11 +686,7 @@ async def _run_short_reflection_with_prompt(
         return
 
     transcript = "\n".join(transcript_lines)
-    user_msg = (
-        f"## Recent conversation ({len(messages)} messages total)\n\n"
-        f"{transcript}\n\n"
-        f"Timestamp: {datetime.now().isoformat(timespec='minutes')}"
-    )
+    user_msg = f"## Recent conversation ({len(messages)} messages total)\n\n{transcript}\n\nTimestamp: {datetime.now().isoformat(timespec='minutes')}"
 
     _, changed, reason = await _reflection_loop(
         llm,
@@ -721,11 +721,7 @@ async def run_long_reflection(
         return
 
     manifest = format_memory_manifest(files)
-    user_msg = (
-        f"## Current memory manifest ({len(files)} files)\n\n"
-        f"{manifest}\n\n"
-        f"Timestamp: {datetime.now().isoformat(timespec='minutes')}"
-    )
+    user_msg = f"## Current memory manifest ({len(files)} files)\n\n{manifest}\n\nTimestamp: {datetime.now().isoformat(timespec='minutes')}"
 
     _, changed, reason = await _reflection_loop(
         llm,
@@ -764,11 +760,7 @@ async def run_unified_long_reflection(
         memory_dirs["queen"] = queen_memory_dir
 
     manifest = _format_multi_scope_manifest(memory_dirs, queen_id=queen_id if "queen" in memory_dirs else None)
-    user_msg = (
-        "## Current memory manifest across scopes\n\n"
-        f"{manifest}\n\n"
-        f"Timestamp: {datetime.now().isoformat(timespec='minutes')}"
-    )
+    user_msg = f"## Current memory manifest across scopes\n\n{manifest}\n\nTimestamp: {datetime.now().isoformat(timespec='minutes')}"
 
     _, changed, reason = await _reflection_loop(
         llm,

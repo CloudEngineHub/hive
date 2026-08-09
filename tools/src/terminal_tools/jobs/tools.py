@@ -12,6 +12,7 @@ from __future__ import annotations
 import signal
 from typing import TYPE_CHECKING, Any
 
+from terminal_tools.common.command_guard import check_command
 from terminal_tools.common.limits import coerce_limits, make_preexec_fn, sanitized_env
 from terminal_tools.jobs.manager import JobLimitExceeded, get_manager
 
@@ -20,12 +21,16 @@ if TYPE_CHECKING:
 
 
 _SIGNAL_ALIASES = {
-    "signal_term": signal.SIGTERM,
-    "signal_kill": signal.SIGKILL,
-    "signal_int": signal.SIGINT,
-    "signal_hup": signal.SIGHUP,
-    "signal_usr1": signal.SIGUSR1,
-    "signal_usr2": signal.SIGUSR2,
+    alias: sig
+    for alias, name in (
+        ("signal_term", "SIGTERM"),
+        ("signal_kill", "SIGKILL"),
+        ("signal_int", "SIGINT"),
+        ("signal_hup", "SIGHUP"),
+        ("signal_usr1", "SIGUSR1"),
+        ("signal_usr2", "SIGUSR2"),
+    )
+    if (sig := getattr(signal, name, None)) is not None
 }
 
 
@@ -41,6 +46,8 @@ def register_job_tools(mcp: FastMCP) -> None:
         shell: bool = False,
         name: str | None = None,
         limits: dict[str, int] | None = None,
+        session_cwd: str | None = None,
+        crm_principal: str | None = None,
     ) -> dict:
         """Spawn a background process. Returns a job_id you poll with terminal_job_logs.
 
@@ -53,7 +60,8 @@ def register_job_tools(mcp: FastMCP) -> None:
             command: Shell command to run. With shell=False, pass argv via the
                 command string and we'll split on whitespace; for complex
                 quoting use shell=True.
-            cwd: Working directory. Default: server's cwd.
+            cwd: Working directory. Defaults to the session workdir when
+                omitted; pass an absolute path to override.
             env: Environment override. Merged into a sanitized base env (with
                 zsh dotfile vars stripped).
             merge_stderr: When True, stderr is interleaved into stdout in a
@@ -66,6 +74,10 @@ def register_job_tools(mcp: FastMCP) -> None:
 
         Returns: {job_id, pid, started_at}
         """
+        blocked = check_command(command)
+        if blocked is not None:
+            return {"error": blocked, "blocked": True}
+
         try:
             # Build argv: for shell=False, naive split is fine for the common case;
             # the foundational skill steers complex commands toward shell=True.
@@ -77,11 +89,18 @@ def register_job_tools(mcp: FastMCP) -> None:
                 if not argv:
                     return {"error": "command was empty"}
 
+            # Framework-injected acting identity for `hive-crm` — same contract
+            # as terminal_exec (see the note there); a CRM command backgrounded
+            # here must not silently run as the user.
+            if crm_principal:
+                env = {**(env or {}), "HIVE_CRM_PRINCIPAL": crm_principal}
             full_env = sanitized_env(env) if env is not None else None
             preexec = make_preexec_fn(coerce_limits(limits))
+            # Loose default: omitted cwd falls back to the session workdir.
+            effective_cwd = cwd if cwd is not None else session_cwd
             record = manager.start(
                 argv,
-                cwd=cwd,
+                cwd=effective_cwd,
                 env=full_env,
                 shell=shell,
                 merge_stderr=merge_stderr,

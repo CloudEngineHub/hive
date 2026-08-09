@@ -1,11 +1,12 @@
 """Track fork-compaction status for freshly-forked colony queen sessions.
 
-When ``create_colony`` forks a queen session into a colony, the
-inherited DM transcript is compacted via an LLM call that can legitimately
-exceed the default tool-call timeout (60s). To keep ``create_colony``
-responsive we run that compaction in the background and record its
-status on disk so a subsequent colony session-load can wait for it to
-settle before reading the conversation files.
+When the "Create Colony" popup confirms a fork (POST /api/sessions with
+colony_id + source_session_id, which calls ``fork_session_into_colony``),
+the inherited DM transcript is compacted via an LLM call that can
+legitimately exceed the default tool-call timeout (60s). To keep the
+HTTP response responsive we run that compaction in the background and
+record its status on disk so a subsequent colony session-load can wait
+for it to settle before reading the conversation files.
 
 The status lives at ``<queen_dir>/compaction_status.json``:
 

@@ -27,9 +27,7 @@ def resolve_safe_path(path: str) -> str:
         if resolved.startswith(real_root + os.sep) or resolved == real_root:
             return resolved
 
-    raise ValueError(
-        f"Access denied: '{path}' is outside allowed directories. Use absolute paths under ~/.hive/ or exports/."
-    )
+    raise ValueError(f"Access denied: '{path}' is outside allowed directories. Use absolute paths under ~/.hive/ or exports/.")
 
 
 # Keep the old API for backward compatibility with non-CSV tools.

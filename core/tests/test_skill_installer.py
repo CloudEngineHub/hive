@@ -228,7 +228,7 @@ class TestForkSkill:
 class TestInstallNotice:
     def test_shown_on_first_call(self, tmp_path, monkeypatch, capsys):
         sentinel = tmp_path / ".install_notice_shown"
-        monkeypatch.setattr("framework.skills.installer.INSTALL_NOTICE_SENTINEL", sentinel)
+        monkeypatch.setattr("framework.skills.installer._install_notice_sentinel", lambda: sentinel)
 
         maybe_show_install_notice()
 
@@ -240,7 +240,7 @@ class TestInstallNotice:
         sentinel = tmp_path / ".install_notice_shown"
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.touch()
-        monkeypatch.setattr("framework.skills.installer.INSTALL_NOTICE_SENTINEL", sentinel)
+        monkeypatch.setattr("framework.skills.installer._install_notice_sentinel", lambda: sentinel)
 
         maybe_show_install_notice()
 

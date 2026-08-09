@@ -20,9 +20,7 @@ def tool_fns(mcp: FastMCP):
 class TestGscSearchAnalytics:
     def test_missing_token(self, tool_fns):
         with patch.dict("os.environ", {}, clear=True):
-            result = tool_fns["gsc_search_analytics"](
-                site_url="https://example.com", start_date="2024-01-01", end_date="2024-01-31"
-            )
+            result = tool_fns["gsc_search_analytics"](site_url="https://example.com", start_date="2024-01-01", end_date="2024-01-31")
         assert "error" in result
 
     def test_missing_params(self, tool_fns):
@@ -48,9 +46,7 @@ class TestGscSearchAnalytics:
         ):
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = mock_resp
-            result = tool_fns["gsc_search_analytics"](
-                site_url="https://example.com", start_date="2024-01-01", end_date="2024-01-31"
-            )
+            result = tool_fns["gsc_search_analytics"](site_url="https://example.com", start_date="2024-01-01", end_date="2024-01-31")
 
         assert len(result["rows"]) == 1
         assert result["rows"][0]["clicks"] == 150

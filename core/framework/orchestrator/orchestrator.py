@@ -158,8 +158,6 @@ class Orchestrator:
         skills_catalog_prompt: str = "",
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
-        context_warn_ratio: float | None = None,
-        batch_init_nudge: str | None = None,
     ):
         """
         Initialize the executor.
@@ -190,8 +188,6 @@ class Orchestrator:
             skills_catalog_prompt: Available skills catalog for system prompt
             protocols_prompt: Default skill operational protocols for system prompt
             skill_dirs: Skill base directories for Tier 3 resource access
-            context_warn_ratio: Token usage ratio to trigger DS-13 preservation warning
-            batch_init_nudge: System prompt nudge for DS-12 batch auto-detection
         """
         self.runtime = runtime
         self.llm = llm
@@ -224,8 +220,6 @@ class Orchestrator:
         self.skills_catalog_prompt = skills_catalog_prompt
         self.protocols_prompt = protocols_prompt
         self.skill_dirs: list[str] = skill_dirs or []
-        self.context_warn_ratio: float | None = context_warn_ratio
-        self.batch_init_nudge: str | None = batch_init_nudge
         if protocols_prompt:
             self.logger.info(
                 "GraphExecutor[%s] received protocols_prompt (%d chars)",
@@ -406,11 +400,7 @@ class Orchestrator:
             target_tokens = max_tokens // 2
             target_chars = target_tokens * 4
 
-            prompt = (
-                "You are compacting an AI agent's conversation history "
-                "at a phase boundary.\n\n"
-                f"NEXT PHASE: {next_spec.name}\n"
-            )
+            prompt = f"You are compacting an AI agent's conversation history at a phase boundary.\n\nNEXT PHASE: {next_spec.name}\n"
             if next_spec.description:
                 prompt += f"NEXT PHASE PURPOSE: {next_spec.description}\n"
             prompt += (
@@ -426,10 +416,7 @@ class Orchestrator:
             try:
                 response = await self._llm.acomplete(
                     messages=[{"role": "user", "content": prompt}],
-                    system=(
-                        "You are a conversation compactor. Write a detailed "
-                        "summary preserving context for the next phase."
-                    ),
+                    system=("You are a conversation compactor. Write a detailed summary preserving context for the next phase."),
                     max_tokens=summary_budget,
                 )
                 summary = response.content
@@ -526,10 +513,7 @@ class Orchestrator:
                 self.logger.error(f"   • {err}")
             return ExecutionResult(
                 success=False,
-                error=(
-                    f"Missing tools: {'; '.join(tool_errors)}. "
-                    "Register tools via ToolRegistry or remove tool declarations from nodes."
-                ),
+                error=(f"Missing tools: {'; '.join(tool_errors)}. Register tools via ToolRegistry or remove tool declarations from nodes."),
             )
 
         # Initialize execution state
@@ -558,9 +542,7 @@ class Orchestrator:
             buffer_data = session_state.get("data_buffer", session_state.get("memory"))
             # [RESTORED] Type safety check
             if not isinstance(buffer_data, dict):
-                self.logger.warning(
-                    f"⚠️ Invalid data buffer type in session state: {type(buffer_data).__name__}, expected dict"
-                )
+                self.logger.warning(f"⚠️ Invalid data buffer type in session state: {type(buffer_data).__name__}, expected dict")
             else:
                 # Restore buffer from previous session.
                 # Skip validation — this data was already validated when
@@ -582,9 +564,7 @@ class Orchestrator:
         # Skip when resuming from a paused session — restored buffer already
         # contains all state including the original input, and re-writing
         # input_data would overwrite intermediate results with stale values.
-        _is_resuming = bool(
-            session_state and (session_state.get("paused_at") or session_state.get("resume_from_checkpoint"))
-        )
+        _is_resuming = bool(session_state and (session_state.get("paused_at") or session_state.get("resume_from_checkpoint")))
         if input_data and not _is_resuming:
             for key, value in input_data.items():
                 buffer.write(key, value)
@@ -611,10 +591,7 @@ class Orchestrator:
                 if paused_at and paused_at in node_visit_counts and node_visit_counts[paused_at] > 0:
                     old_count = node_visit_counts[paused_at]
                     node_visit_counts[paused_at] -= 1
-                    self.logger.info(
-                        f"📥 Decremented visit count for paused node '{paused_at}': "
-                        f"{old_count} -> {node_visit_counts[paused_at]}"
-                    )
+                    self.logger.info(f"📥 Decremented visit count for paused node '{paused_at}': {old_count} -> {node_visit_counts[paused_at]}")
 
         # Determine entry point (may differ if resuming)
         # Check if resuming from checkpoint
@@ -638,10 +615,7 @@ class Orchestrator:
                     # Restore execution path
                     path.extend(checkpoint.execution_path)
 
-                    self.logger.info(
-                        f"📥 Restored buffer with {len(checkpoint.data_buffer)} keys, "
-                        f"resuming at node: {current_node_id}"
-                    )
+                    self.logger.info(f"📥 Restored buffer with {len(checkpoint.data_buffer)} keys, resuming at node: {current_node_id}")
                 else:
                     self.logger.warning(f"Checkpoint {checkpoint_id} not found, resuming from normal entry point")
                     current_node_id = graph.get_entry_point(session_state)
@@ -694,6 +668,7 @@ class Orchestrator:
             _ctx_token = ToolRegistry.set_execution_context(
                 data_dir=str(self._storage_path / "data"),
                 agent_id=graph.id,
+                session_cwd=str(self._storage_path),
             )
         else:
             from framework.loader.tool_registry import ToolRegistry
@@ -758,8 +733,7 @@ class Orchestrator:
         # Validate node type
         if node_spec.node_type not in self.VALID_NODE_TYPES:
             raise RuntimeError(
-                f"Invalid node type '{node_spec.node_type}' for node '{node_spec.id}'. "
-                f"Must be one of: {sorted(self.VALID_NODE_TYPES)}."
+                f"Invalid node type '{node_spec.node_type}' for node '{node_spec.id}'. Must be one of: {sorted(self.VALID_NODE_TYPES)}."
             )
 
         # Create based on type
@@ -779,7 +753,7 @@ class Orchestrator:
             # Auto-configure spillover directory for large tool results.
             # When a tool result exceeds max_tool_result_chars, the full
             # content is written to spillover_dir and the agent gets a
-            # truncated preview with instructions to use read_file().
+            # truncated preview with instructions to read it via terminal_exec.
             # Uses storage_path/data which is session-scoped, matching the
             # data_dir set via execution context for data tools.
             spillover = None
@@ -797,8 +771,8 @@ class Orchestrator:
                 judge=None,  # implicit judge: accept when output_keys are filled
                 config=LoopConfig(
                     max_iterations=lc.get("max_iterations", default_max_iter),
-                    max_tool_calls_per_turn=lc.get("max_tool_calls_per_turn", 30),
-                    tool_call_overflow_margin=lc.get("tool_call_overflow_margin", 0.5),
+                    tool_call_budget=lc.get("tool_call_budget", 30),
+                    tool_call_hard_multiple=lc.get("tool_call_hard_multiple", 5),
                     stall_detection_threshold=lc.get("stall_detection_threshold", 3),
                     max_context_tokens=lc.get("max_context_tokens", _default_max_context_tokens()),
                     max_tool_result_chars=lc.get("max_tool_result_chars", 30_000),
@@ -893,9 +867,7 @@ class Orchestrator:
             conditionals = [e for e in traversable if e.condition == EdgeCondition.CONDITIONAL]
             if len(conditionals) > 1:
                 max_prio = max(e.priority for e in conditionals)
-                traversable = [
-                    e for e in traversable if e.condition != EdgeCondition.CONDITIONAL or e.priority == max_prio
-                ]
+                traversable = [e for e in traversable if e.condition != EdgeCondition.CONDITIONAL or e.priority == max_prio]
 
         return traversable
 
@@ -1044,8 +1016,6 @@ class Orchestrator:
                         skills_catalog_prompt=self.skills_catalog_prompt,
                         protocols_prompt=self.protocols_prompt,
                         skill_dirs=self.skill_dirs,
-                        default_skill_warn_ratio=self.context_warn_ratio,
-                        default_skill_batch_nudge=self.batch_init_nudge,
                     )
                     node_impl = self._get_node_implementation(node_spec, graph.cleanup_llm_model)
 
@@ -1096,26 +1066,17 @@ class Orchestrator:
                                             f"conflicting write from '{branch.branch_id}'"
                                         )
                                     elif conflict_strategy == "first_wins":
-                                        self.logger.debug(
-                                            f"      ⚠ Skipping write to '{key}' "
-                                            f"(first_wins: already set by {prior_branch})"
-                                        )
+                                        self.logger.debug(f"      ⚠ Skipping write to '{key}' (first_wins: already set by {prior_branch})")
                                         continue
                                     else:
                                         # last_wins (default): write and log
-                                        self.logger.debug(
-                                            f"      ⚠ Key '{key}' overwritten "
-                                            f"(last_wins: {prior_branch} -> {branch.branch_id})"
-                                        )
+                                        self.logger.debug(f"      ⚠ Key '{key}' overwritten (last_wins: {prior_branch} -> {branch.branch_id})")
                                 fanout_written_keys[key] = branch.branch_id
                             await buffer.write_async(key, value)
 
                         branch.result = result
                         branch.status = "completed"
-                        self.logger.info(
-                            f"      ✓ Branch {node_spec.name}: success "
-                            f"(tokens: {result.tokens_used}, latency: {result.latency_ms}ms)"
-                        )
+                        self.logger.info(f"      ✓ Branch {node_spec.name}: success (tokens: {result.tokens_used}, latency: {result.latency_ms}ms)")
                         return branch, result
 
                     self.logger.warning(f"      ↻ Branch {node_spec.name}: retry {attempt + 1}/{effective_max_retries}")
@@ -1305,8 +1266,6 @@ class Orchestrator:
             skills_catalog_prompt=self.skills_catalog_prompt,
             protocols_prompt=self.protocols_prompt,
             skill_dirs=self.skill_dirs,
-            context_warn_ratio=self.context_warn_ratio,
-            batch_init_nudge=self.batch_init_nudge,
             dynamic_tools_provider=self.dynamic_tools_provider,
             dynamic_prompt_provider=self.dynamic_prompt_provider,
             dynamic_memory_provider=self.dynamic_memory_provider,
@@ -1325,10 +1284,7 @@ class Orchestrator:
         entry_worker_ids = [graph.entry_node]
         terminal_worker_ids = set(graph.terminal_nodes or [])
 
-        self.logger.info(
-            f"🚀 Worker execution: {len(workers)} workers, "
-            f"{len(entry_worker_ids)} entry, {len(terminal_worker_ids)} terminal"
-        )
+        self.logger.info(f"🚀 Worker execution: {len(workers)} workers, {len(entry_worker_ids)} entry, {len(terminal_worker_ids)} terminal")
 
         # Completion tracking
         completed_terminals: set[str] = set()
@@ -1440,9 +1396,7 @@ class Orchestrator:
                     # Fan-out branch: wrap with timeout
                     is_fanout_branch = any(tag.via_branch == activation.target_id for tag in activation.fan_out_tags)
                     if is_fanout_branch and branch_timeout > 0:
-                        timed_task = asyncio.ensure_future(
-                            asyncio.wait_for(target_worker._task, timeout=branch_timeout)
-                        )
+                        timed_task = asyncio.ensure_future(asyncio.wait_for(target_worker._task, timeout=branch_timeout))
                         _fanout_branch_tasks[activation.target_id] = timed_task
                         pending_tasks_map[activation.target_id] = timed_task
                     else:
@@ -1561,28 +1515,20 @@ class Orchestrator:
                 await completion_event.wait()
             else:
                 # No event bus: wait on worker tasks directly and route completions inline.
-                pending_tasks: dict[str, asyncio.Task] = {
-                    wid: w._task for wid, w in workers.items() if w._task is not None
-                }
+                pending_tasks: dict[str, asyncio.Task] = {wid: w._task for wid, w in workers.items() if w._task is not None}
                 while True:
                     if _check_graph_done():
                         break
 
                     if not pending_tasks:
                         unresolved_terminals = sorted(
-                            tid
-                            for tid in terminal_worker_ids
-                            if tid not in completed_terminals and tid not in failed_workers
+                            tid for tid in terminal_worker_ids if tid not in completed_terminals and tid not in failed_workers
                         )
                         if unresolved_terminals:
-                            execution_error = (
-                                f"Worker execution ended before terminal nodes completed: {unresolved_terminals}"
-                            )
+                            execution_error = f"Worker execution ended before terminal nodes completed: {unresolved_terminals}"
                             self.logger.error(execution_error)
                         else:
-                            execution_error = (
-                                "Worker execution ended before all workers reached a terminal lifecycle state"
-                            )
+                            execution_error = "Worker execution ended before all workers reached a terminal lifecycle state"
                             self.logger.error(execution_error)
                         break
 
@@ -1666,9 +1612,7 @@ class Orchestrator:
                                 if completion_conversation is not None:
                                     gc.continuous_conversation = completion_conversation
 
-                            self.logger.info(
-                                f"  ✓ Worker completed: {wid} ({len(outgoing_activations)} outgoing activation(s))"
-                            )
+                            self.logger.info(f"  ✓ Worker completed: {wid} ({len(outgoing_activations)} outgoing activation(s))")
 
                             # Route activations
                             for activation in outgoing_activations:
@@ -1711,9 +1655,7 @@ class Orchestrator:
                         elif task_error is not None:
                             error = str(task_error)
                         else:
-                            error = (
-                                f"Worker task completed without publishing a completion (lifecycle={worker.lifecycle})"
-                            )
+                            error = f"Worker task completed without publishing a completion (lifecycle={worker.lifecycle})"
 
                         failed_workers[wid] = error
                         self.logger.error(f"  ✗ Worker failed: {wid} - {error}")

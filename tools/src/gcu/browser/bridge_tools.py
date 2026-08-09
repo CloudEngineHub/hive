@@ -1,72 +1,58 @@
-"""Tool schemas for the bridge remote HTTP API (port 9230)."""
+"""Tool schemas for the bridge remote HTTP API (status port — 14830, legacy 9230)."""
 
 TOOL_SCHEMAS: dict[str, dict] = {
-    "browser_click": {
-        "description": "Click an element on the page.",
-        "params": {
-            "selector": {"type": "string", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "button": {"type": "string", "default": "left", "enum": ["left", "right", "middle"]},
-            "double_click": {"type": "boolean", "default": False},
-            "timeout_ms": {"type": "integer", "default": 5000},
-        },
-    },
-    "browser_click_coordinate": {
-        "description": "Click at specific viewport coordinates (CSS pixels).",
-        "params": {
-            "x": {"type": "number", "required": True},
-            "y": {"type": "number", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "button": {"type": "string", "default": "left"},
-        },
-    },
-    "browser_type": {
-        "description": "Type text into an input element.",
-        "params": {
-            "selector": {"type": "string", "required": True},
-            "text": {"type": "string", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "delay_ms": {"type": "integer", "default": 1},
-            "clear_first": {"type": "boolean", "default": True},
-            "timeout_ms": {"type": "integer", "default": 30000},
-            "use_insert_text": {"type": "boolean", "default": True},
-        },
-    },
-    "browser_type_focused": {
+    "browser_interact": {
         "description": (
-            "Type text into the already-focused element. Use after browser_click_coordinate "
-            "has focused the target. Faster than browser_press for multi-character input."
+            "Unified browser interaction — click / type / key / hover / scroll / "
+            "drag / screenshot / zoom / wait, dispatched by `action`. Coordinates "
+            "are viewport fractions (0..1), not pixels."
         ),
         "params": {
-            "text": {"type": "string", "required": True},
+            "action": {
+                "type": "string",
+                "required": True,
+                "enum": [
+                    "left_click",
+                    "right_click",
+                    "middle_click",
+                    "double_click",
+                    "triple_click",
+                    "hover",
+                    "type",
+                    "key",
+                    "scroll",
+                    "drag",
+                    "screenshot",
+                    "zoom",
+                    "wait",
+                ],
+            },
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
-            "delay_ms": {"type": "integer", "default": 1},
-            "clear_first": {"type": "boolean", "default": True},
-            "use_insert_text": {"type": "boolean", "default": True},
-        },
-    },
-    "browser_press": {
-        "description": "Press a keyboard key, optionally with modifiers.",
-        "params": {
-            "key": {"type": "string", "required": True},
             "selector": {"type": "string"},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "modifiers": {"type": "array", "items": "string"},
-        },
-    },
-    "browser_press_at": {
-        "description": "Move mouse to coordinates then press a key.",
-        "params": {
-            "x": {"type": "number", "required": True},
-            "y": {"type": "number", "required": True},
-            "key": {"type": "string", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
+            "coordinate": {"type": "array", "items": "number"},
+            "start_selector": {"type": "string"},
+            "start_coordinate": {"type": "array", "items": "number"},
+            "text": {"type": "string"},
+            "clear_first": {"type": "boolean", "default": True},
+            "modifiers": {"type": "string"},
+            "repeat": {"type": "integer", "default": 1},
+            "scroll_direction": {"type": "string", "default": "down", "enum": ["up", "down", "left", "right"]},
+            "scroll_amount": {"type": "integer", "default": 500},
+            "intent": {"type": "string"},
+            "full_page": {"type": "boolean", "default": False},
+            "annotate": {"type": "boolean", "default": True},
+            "region": {"type": "array", "items": "number"},
+            "duration": {"type": "number"},
+            "wait_for_selector": {"type": "string"},
+            "wait_for_text": {"type": "string"},
+            "timeout_ms": {"type": "integer"},
+            "auto_snapshot_mode": {
+                "type": "string",
+                "default": "simple",
+                "enum": ["default", "simple", "interactive", "off"],
+            },
+            "wait_after_ms": {"type": "integer", "default": 0},
         },
     },
     "browser_navigate": {
@@ -78,51 +64,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "wait_until": {"type": "string", "default": "load"},
         },
     },
-    "browser_go_back": {
-        "description": "Navigate back in browser history.",
-        "params": {
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-        },
-    },
-    "browser_go_forward": {
-        "description": "Navigate forward in browser history.",
-        "params": {
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-        },
-    },
     "browser_reload": {
         "description": "Reload the current page.",
         "params": {
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-        },
-    },
-    "browser_scroll": {
-        "description": "Scroll the page or a specific scrollable container.",
-        "params": {
-            "direction": {"type": "string", "default": "down", "enum": ["up", "down", "left", "right"]},
-            "amount": {"type": "integer", "default": 500},
-            "selector": {"type": "string"},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-        },
-    },
-    "browser_hover": {
-        "description": "Hover over an element.",
-        "params": {
-            "selector": {"type": "string", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000},
-        },
-    },
-    "browser_hover_coordinate": {
-        "description": "Hover at CSS pixel coordinates.",
-        "params": {
-            "x": {"type": "number", "required": True},
-            "y": {"type": "number", "required": True},
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
         },
@@ -139,6 +83,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "browser_screenshot": {
         "description": "Take a screenshot of the page (returns base64 PNG).",
         "params": {
+            "intent": {"type": "string", "required": True},
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
             "full_page": {"type": "boolean", "default": False},
@@ -165,16 +110,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "selector": {"type": "string", "required": True},
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
-        },
-    },
-    "browser_wait": {
-        "description": "Wait for an element or text to appear on the page.",
-        "params": {
-            "selector": {"type": "string"},
-            "text": {"type": "string"},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000},
         },
     },
 }

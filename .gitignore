@@ -82,3 +82,5 @@ screenshots/*
 
 .gemini/*
 .coverage
+
+temp/

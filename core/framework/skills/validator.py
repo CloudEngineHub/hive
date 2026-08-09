@@ -81,9 +81,7 @@ def validate_strict(path: Path) -> ValidationResult:
     try:
         frontmatter = yaml.safe_load(raw_yaml)
     except yaml.YAMLError as exc:
-        errors.append(
-            f'YAML parse error: {exc}. Wrap values containing colons in quotes, e.g. description: "Use for: research".'
-        )
+        errors.append(f'YAML parse error: {exc}. Wrap values containing colons in quotes, e.g. description: "Use for: research".')
         return ValidationResult(passed=False, errors=errors, warnings=warnings)
 
     if not isinstance(frontmatter, dict):
@@ -107,15 +105,12 @@ def validate_strict(path: Path) -> ValidationResult:
 
         # 7. name length <= 64 chars
         if len(name) > _MAX_NAME_LENGTH:
-            errors.append(
-                f"Skill name '{name}' is {len(name)} characters — maximum is {_MAX_NAME_LENGTH}. Shorten the name."
-            )
+            errors.append(f"Skill name '{name}' is {len(name)} characters — maximum is {_MAX_NAME_LENGTH}. Shorten the name.")
 
         # 8. name matches parent directory (dot-namespace prefix allowed: hive.X with dir X)
         if name != parent_dir_name and not name.endswith(f".{parent_dir_name}"):
             errors.append(
-                f"Name '{name}' does not match directory '{parent_dir_name}'. "
-                f"Rename the directory to '{name}' or set name to '{parent_dir_name}'."
+                f"Name '{name}' does not match directory '{parent_dir_name}'. Rename the directory to '{name}' or set name to '{parent_dir_name}'."
             )
 
     # 9. body non-empty

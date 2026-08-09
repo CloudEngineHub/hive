@@ -216,9 +216,7 @@ def register_tools(mcp: FastMCP, credentials: Any = None) -> None:
                     "id": g.get("consumer_group_id"),
                     "is_simple": g.get("is_simple"),
                     "state": g.get("state"),
-                    "coordinator_id": g.get("coordinator", {}).get("related")
-                    if isinstance(g.get("coordinator"), dict)
-                    else None,
+                    "coordinator_id": g.get("coordinator", {}).get("related") if isinstance(g.get("coordinator"), dict) else None,
                 }
                 for g in groups
             ],

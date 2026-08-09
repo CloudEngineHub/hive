@@ -852,10 +852,7 @@ class TestSlackOpenModal:
             }
             mock_post.return_value = mock_response
 
-            blocks_json = (
-                '[{"type": "input", "element": {"type": "plain_text_input"},'
-                ' "label": {"type": "plain_text", "text": "Name"}}]'
-            )
+            blocks_json = '[{"type": "input", "element": {"type": "plain_text_input"}, "label": {"type": "plain_text", "text": "Name"}}]'
             result = fn(trigger_id="12345.67890.abcdef", title="My Modal", blocks=blocks_json)
 
         assert result["success"] is True

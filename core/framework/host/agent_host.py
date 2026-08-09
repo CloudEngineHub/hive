@@ -200,8 +200,7 @@ class AgentHost:
             import warnings
 
             warnings.warn(
-                "Passing pre-rendered skills_catalog_prompt/protocols_prompt "
-                "is deprecated. Pass skills_manager_config instead.",
+                "Passing pre-rendered skills_catalog_prompt/protocols_prompt is deprecated. Pass skills_manager_config instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -212,8 +211,6 @@ class AgentHost:
             self._skills_manager.load()
 
         self.skill_dirs: list[str] = self._skills_manager.allowlisted_dirs
-        self.context_warn_ratio: float | None = self._skills_manager.context_warn_ratio
-        self.batch_init_nudge: str | None = self._skills_manager.batch_init_nudge
 
         # Primary graph identity
         self._graph_id: str = graph_id or "primary"
@@ -372,8 +369,6 @@ class AgentHost:
                     skills_catalog_prompt=self.skills_catalog_prompt,
                     protocols_prompt=self.protocols_prompt,
                     skill_dirs=self.skill_dirs,
-                    context_warn_ratio=self.context_warn_ratio,
-                    batch_init_nudge=self.batch_init_nudge,
                     dynamic_memory_provider_factory=self._dynamic_memory_provider_factory,
                 )
                 await stream.start()
@@ -414,9 +409,7 @@ class AgentHost:
                 tc = spec.trigger_config
                 event_types = [_ET(et) for et in tc.get("event_types", [])]
                 if not event_types:
-                    logger.warning(
-                        f"Entry point '{ep_id}' has trigger_type='event' but no event_types in trigger_config"
-                    )
+                    logger.warning(f"Entry point '{ep_id}' has trigger_type='event' but no event_types in trigger_config")
                     continue
 
                 # Capture ep_id and config in closure
@@ -497,9 +490,7 @@ class AgentHost:
                 try:
                     from croniter import croniter
                 except ImportError as e:
-                    raise RuntimeError(
-                        "croniter is required for cron-based entry points. Install it with: uv pip install croniter"
-                    ) from e
+                    raise RuntimeError("croniter is required for cron-based entry points. Install it with: uv pip install croniter") from e
 
                 try:
                     if not croniter.is_valid(cron_expr):
@@ -759,8 +750,7 @@ class AgentHost:
 
             else:
                 logger.warning(
-                    "Entry point '%s' has trigger_type='timer' "
-                    "but no 'cron' or valid 'interval_minutes' in trigger_config",
+                    "Entry point '%s' has trigger_type='timer' but no 'cron' or valid 'interval_minutes' in trigger_config",
                     ep_id,
                 )
 
@@ -1508,7 +1498,7 @@ class AgentHost:
     async def stop_all_workers(self) -> bool:
         """Alias for ``cancel_all_tasks_async`` used by queen-lifecycle tools.
 
-        Queen tools (``stop_worker``, ``switch_to_reviewing``, etc.) call
+        Queen tools (``stop_worker``, etc.) call
         ``runtime.stop_all_workers()`` which is the :class:`ColonyRuntime`
         idiom. In the current architecture the session's runtime is an
         :class:`AgentHost`, which stops workers by cancelling their
@@ -1557,9 +1547,7 @@ class AgentHost:
         # Look up the entry node from the correct graph
         src_graph_id = source_graph_id or self._graph_id
         src_reg = self._graphs.get(src_graph_id)
-        ep_spec = (
-            src_reg.entry_points.get(exclude_entry_point) if src_reg else self._entry_points.get(exclude_entry_point)
-        )
+        ep_spec = src_reg.entry_points.get(exclude_entry_point) if src_reg else self._entry_points.get(exclude_entry_point)
         if ep_spec:
             graph = src_reg.graph if src_reg else self.graph
             entry_node = graph.get_node(ep_spec.entry_node)
@@ -1641,9 +1629,7 @@ class AgentHost:
         target = graph_id or self._active_graph_id
         if target in self._graphs:
             for stream in self._graphs[target].streams.values():
-                if await stream.inject_input(
-                    node_id, content, is_client_input=is_client_input, image_content=image_content
-                ):
+                if await stream.inject_input(node_id, content, is_client_input=is_client_input, image_content=image_content):
                     return True
 
         # Then search all other graphs
@@ -1651,9 +1637,7 @@ class AgentHost:
             if gid == target:
                 continue
             for stream in reg.streams.values():
-                if await stream.inject_input(
-                    node_id, content, is_client_input=is_client_input, image_content=image_content
-                ):
+                if await stream.inject_input(node_id, content, is_client_input=is_client_input, image_content=image_content):
                     return True
         return False
 

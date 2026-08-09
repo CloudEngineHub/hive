@@ -2,7 +2,7 @@
 """
 Test #7: ContentEditable / Rich Text Editors
 
-Symptom: browser_type() doesn't insert text
+Symptom: browser_interact(action="type") doesn't insert text
 Root Cause: Element is contenteditable, not an <input> or <textarea>
 Detection: element.contentEditable === 'true'
 Fix: Focus via JavaScript, use execCommand('insertText') or Input.dispatchKeyEvent
@@ -117,9 +117,7 @@ async def test_contenteditable():
         print("\n--- Test 1: Regular input ---")
         await bridge.click(tab_id, "#input1")
         await bridge.type_text(tab_id, "#input1", "Hello input")
-        input_result = await bridge.evaluate(
-            tab_id, "(function() { return document.getElementById('input1').value; })()"
-        )
+        input_result = await bridge.evaluate(tab_id, "(function() { return document.getElementById('input1').value; })()")
         print(f"Input value: {input_result.get('result', '')}")
 
         # Test 2: Type into contenteditable div

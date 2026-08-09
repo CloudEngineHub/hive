@@ -34,15 +34,28 @@ def test_queen_stream_events_pass_through() -> None:
 
 
 def test_worker_llm_and_tool_events_are_filtered() -> None:
-    """Worker chatter is noise on both the singular and fan-out tags."""
-    # Parallel fan-out tag
+    """A FAN-OUT worker's chatter is noise on the queen's default feed.
+
+    Note this used to also cover the singular ``"worker"`` tag. It no longer
+    does — see ``test_singular_worker_chatter_still_passes`` for why.
+    """
     assert _is_worker_noise(_make_evt("worker:abc123", EventType.LLM_TEXT_DELTA.value))
     assert _is_worker_noise(_make_evt("worker:abc123", EventType.TOOL_CALL_STARTED.value))
     assert _is_worker_noise(_make_evt("worker:xyz", EventType.TOOL_CALL_COMPLETED.value))
     assert _is_worker_noise(_make_evt("worker:xyz", EventType.NODE_LOOP_ITERATION.value))
-    # Singular primary-worker tag
-    assert _is_worker_noise(_make_evt("worker", EventType.LLM_TEXT_DELTA.value))
-    assert _is_worker_noise(_make_evt("worker", EventType.TOOL_CALL_STARTED.value))
+
+
+def test_singular_worker_chatter_still_passes() -> None:
+    """The bare ``"worker"`` tag (run_agent_with_input) is a SINGLE spawn, not
+    a fan-out, so it is not the bandwidth problem the watch-gate exists to fix.
+
+    It is also the only thing that can render its own bubble: a singular worker
+    has no worker directory and no row in the workers poll, so unlike a fan-out
+    worker there is no META+poll fallback. Gating it would make its bubble
+    disappear from the transcript entirely.
+    """
+    assert not _is_worker_noise(_make_evt("worker", EventType.LLM_TEXT_DELTA.value))
+    assert not _is_worker_noise(_make_evt("worker", EventType.TOOL_CALL_STARTED.value))
 
 
 def test_worker_lifecycle_and_report_events_pass_through() -> None:

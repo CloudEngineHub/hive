@@ -10,7 +10,7 @@ export interface ColonySummary {
 }
 
 export interface ColonyToolsResponse {
-  colony_name: string;
+  colony_id: string;
   enabled_mcp_tools: string[] | null;
   stale: boolean;
   lifecycle: ToolMeta[];
@@ -19,29 +19,25 @@ export interface ColonyToolsResponse {
 }
 
 export interface ColonyToolsUpdateResult {
-  colony_name: string;
+  colony_id: string;
   enabled_mcp_tools: string[] | null;
   refreshed_runtimes: number;
   note?: string;
-}
-
-/** A worker template within a colony. ``integrations`` maps provider
- *  id (``slack``, ``google``, etc.) to the alias of the connected
- *  account this profile pins by default for MCP tool calls. */
-export interface WorkerProfile {
-  name: string;
-  task?: string;
-  skill_name?: string;
-  integrations?: Record<string, string>;
-  concurrency_hint?: number;
-  prompt_override?: string;
-  tool_filter?: string[];
 }
 
 export const coloniesApi = {
   /** List every colony on disk with a summary of its tool allowlist. */
   list: () =>
     api.get<{ colonies: ColonySummary[] }>(`/colonies/tools-index`),
+
+  /** Create a colony folder (metadata + minimal worker) WITHOUT booting its
+   *  queen — no MCP, no LLM. Used by the free-user flow so the colony persists
+   *  + shows in the sidebar; the queen boots only when they upgrade. */
+  scaffold: (colonyName: string, queenName: string) =>
+    api.post<{ colony_id: string; scaffolded: boolean }>(
+      `/colonies/${encodeURIComponent(colonyName)}/scaffold`,
+      { queen_name: queenName },
+    ),
 
   /** Enumerate a colony's tool surface (lifecycle + synthetic + MCP). */
   getTools: (colonyName: string) =>
@@ -61,27 +57,27 @@ export const coloniesApi = {
       { enabled_mcp_tools: enabled },
     ),
 
-  /** List the colony's worker profiles. Always returns at least one
-   *  entry — legacy colonies materialise a synthetic ``default``. */
-  listWorkerProfiles: (colonyName: string) =>
-    api.get<{ worker_profiles: WorkerProfile[] }>(
-      `/colonies/${encodeURIComponent(colonyName)}/worker_profiles`,
+  /** Rename a colony on disk. Runtime moves both ``colonies/<name>`` and
+   *  ``agents/<name>`` together and stops any sessions bound to the old
+   *  path so the move can't corrupt in-flight work. */
+  rename: (oldName: string, newName: string) =>
+    api.post<{ renamed: boolean; old_name: string; new_name: string }>(
+      `/colonies/${encodeURIComponent(oldName)}/rename`,
+      { new_name: newName },
     ),
 
-  /** Insert or replace a single worker profile. Existing siblings are
-   *  preserved. The desktop uses this for both add and edit. */
-  upsertWorkerProfile: (colonyName: string, profile: WorkerProfile) =>
-    api.post<{ worker_profiles: WorkerProfile[] }>(
-      `/colonies/${encodeURIComponent(colonyName)}/worker_profiles`,
-      profile,
+  /** Open the colony's folder in the OS file manager. */
+  revealFolder: (colonyName: string) =>
+    api.post<{ path: string }>(
+      `/colonies/${encodeURIComponent(colonyName)}/reveal`,
     ),
 
-  /** Delete a worker profile. Returns 409 with ``bound_workers`` when a
-   *  live worker is still using it; the UI should prompt the user to
-   *  stop those workers first. The synthetic ``default`` profile cannot
-   *  be deleted. */
-  deleteWorkerProfile: (colonyName: string, profileName: string) =>
-    api.delete<{ deleted: boolean; profile_name: string }>(
-      `/colonies/${encodeURIComponent(colonyName)}/worker_profiles/${encodeURIComponent(profileName)}`,
+  /** Delete a colony. Soft by default (hidden from discovery, data kept on
+   *  disk); ``purge=true`` permanently removes its files. Path-based, so the
+   *  request routes to the workspace VM for pushed colonies and to the local
+   *  runtime otherwise — deleting whichever copy owns the colony. */
+  delete: (colonyName: string, purge = false) =>
+    api.delete<{ deleted: string; purged: boolean }>(
+      `/colonies/${encodeURIComponent(colonyName)}${purge ? "?purge=true" : ""}`,
     ),
 };

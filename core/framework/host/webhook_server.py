@@ -88,9 +88,7 @@ class WebhookServer:
             self._config.port,
         )
         await self._site.start()
-        logger.info(
-            f"Webhook server started on {self._config.host}:{self._config.port} with {len(self._routes)} route(s)"
-        )
+        logger.info(f"Webhook server started on {self._config.host}:{self._config.port} with {len(self._routes)} route(s)")
 
     async def stop(self) -> None:
         """Stop the HTTP server gracefully."""

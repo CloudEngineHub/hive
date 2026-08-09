@@ -136,16 +136,12 @@ PORT_FINDINGS = {
     },
     "admin": {
         "severity": "high",
-        "remediation": (
-            "Restrict remote admin ports to VPN or trusted IP ranges. Never expose RDP/VNC directly to the internet."
-        ),
+        "remediation": ("Restrict remote admin ports to VPN or trusted IP ranges. Never expose RDP/VNC directly to the internet."),
     },
     "legacy": {
         "severity": "medium",
         "remediation": (
-            "Replace legacy protocols with secure alternatives. "
-            "Use SFTP instead of FTP, SSH instead of Telnet, "
-            "IMAPS/POP3S instead of IMAP/POP3."
+            "Replace legacy protocols with secure alternatives. Use SFTP instead of FTP, SSH instead of Telnet, IMAPS/POP3S instead of IMAP/POP3."
         ),
     },
 }

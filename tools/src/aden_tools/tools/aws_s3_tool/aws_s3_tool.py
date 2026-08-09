@@ -68,9 +68,7 @@ def _sign_request(
 
     # Canonical query string
     sorted_params = sorted(query_params.items())
-    canonical_qs = "&".join(
-        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_params
-    )
+    canonical_qs = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_params)
 
     # Canonical headers
     signed_header_names = sorted(headers.keys())
@@ -80,17 +78,12 @@ def _sign_request(
     canonical_request = f"{method}\n{path}\n{canonical_qs}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
 
     credential_scope = f"{datestamp}/{region}/s3/aws4_request"
-    string_to_sign = (
-        f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
-    )
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
 
     signing_key = _get_signing_key(secret_key, datestamp, region)
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    headers["Authorization"] = (
-        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope},"
-        f"SignedHeaders={signed_headers},Signature={signature}"
-    )
+    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope},SignedHeaders={signed_headers},Signature={signature}"
     return headers
 
 
@@ -449,16 +442,11 @@ def register_tools(mcp: FastMCP, credentials: Any = None) -> None:
         }
 
         sorted_params = sorted(query_params.items())
-        canonical_qs = "&".join(
-            f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_params
-        )
+        canonical_qs = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_params)
 
         canonical_request = f"GET\n{path}\n{canonical_qs}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD"
 
-        string_to_sign = (
-            f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n"
-            f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
-        )
+        string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
 
         signing_key = _get_signing_key(secret_key, datestamp, region)
         signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
