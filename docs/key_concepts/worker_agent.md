@@ -1,51 +1,53 @@
 # The Worker Agent
 
-## What a Worker Agent Is
+A **worker** is a single agent the [Queen](./queen.md) spawns to do one unit of work inside a [colony](./colony.md). Workers are how a colony does things in parallel: when the Queen has 50 prospects to research, she doesn't do them one at a time — she fans out workers and each takes a share.
 
-A worker agent is a specialized AI agent built to perform a specific business process. It's not a general-purpose assistant — it's purpose-built, like hiring someone for a defined role. A sales outreach agent knows how to research prospects, craft personalized messages, and follow up. A support triage agent knows how to categorize tickets, pull customer context, and route to the right team.
+A worker is not a different kind of program from the Queen. It's a **clone** of her [agent loop](./the_loop.md) — same tools, same model — with a tighter budget and one task injected. What makes a worker a *worker* is what it deliberately lacks.
 
-In Hive, a **Coding Agent** (like Claude Code or Cursor) generates worker agents from a natural language goal description. You describe what you want the agent to do, and the coding agent produces the graph, nodes, edges, and configuration. The worker agent is the thing that actually runs.
+## What a worker is
 
-## Sessions
+A worker is **focused, ephemeral, and fail-fast**:
 
-A session is a single execution of a worker agent against a specific input. If your outreach agent processes 50 prospects, that's 50 sessions.
+- **Focused** — it gets one task and stays strictly in scope. If it notices work outside its lane, it mentions it in its report and moves on; it doesn't chase it. (Broadening scope is how parallel workers collide.)
+- **Ephemeral** — it has no memory of prior runs and no persona. It starts fresh, does the work, and terminates.
+- **No escalation** — it has no live audience. It can't ask the Queen or the user a question mid-run, so it never blocks waiting for an answer.
+- **Can't delegate** — a worker can't spawn its own workers. Fan-out belongs to the Queen; nesting is blocked.
+- **Fail-fast** — when a tool call fails, it classifies the error (transient → retry once; structural → fix and retry once; unfixable → stop). It doesn't loop on workarounds.
 
-Each session is isolated — it has its own shared buffer, its own execution state, and its own history. This matters because sessions can be long-running. An agent might start researching a prospect, pause for human approval, wait hours or days, and then resume to send the message. The session preserves everything across that gap.
+## How a worker reports back
 
-Sessions also make debugging straightforward. Every decision the agent made, every tool it called, every retry it attempted — it's all captured in the session. When something goes wrong, you can trace exactly what happened.
+A worker's terminal action is `report_to_parent(status, summary, data)`:
 
-## Iterations
+- `success` — task complete, result in the summary/data;
+- `partial` — some progress, but it couldn't finish;
+- `failed` — couldn't make meaningful progress.
 
-Within a session, nodes (especially `event_loop` nodes) work in iterations. An iteration is one turn of the loop: the LLM reasons about the current state, possibly calls tools, observes results, and produces output. Then the judge evaluates: is this good enough?
+That report is delivered to the Queen as a `[WORKER_REPORT]` turn in her conversation. The worker's loop ends after it reports.
 
-If not, the node iterates again. The LLM sees what went wrong and adjusts its approach. This is how agents self-correct without human intervention — through rapid iteration within a single node, not by restarting the whole process.
+To guarantee a worker always reports — even if it runs out of iterations — its loop includes a **grace iteration**: a final wrap-up turn where the only tools available are `report_to_parent`, `task_update`, and `tracker_upsert`. Without it, a worker that hit its budget would die silently; with it, the Queen always hears back.
 
-Iterations have limits. You set a maximum per node to prevent runaway loops. If a node can't produce acceptable output within its iteration budget, it fails and the graph's error-handling edges take over.
+## How workers share results
 
-## Headless Execution
+Workers can't see or message each other, so they coordinate entirely through the colony's shared substrates:
 
-A lot of business processes need to run continuously — monitoring inboxes, processing incoming leads, watching for events. These agents run **headless**: no UI, no human sitting at a terminal, just the agent doing its job in the background.
+- **The tracker** — a worker records structured findings by upserting rows into the colony's shared `tracker.db`. The Queen reads those rows directly with SQL. This is the primary channel for results — one row per unit of work, not prose.
+- **Its own task list** — a worker can break its assignment into steps and track them, which also protects working memory across context pruning.
 
-Headless doesn't mean unsupervised. HITL (human-in-the-loop) nodes still pause execution and wait for human input when the agent hits a decision it shouldn't make alone. The difference is that instead of a live conversation, the agent sends a notification, waits for a response through whatever channel you've configured, and resumes when the human weighs in.
+See [Coordination](./coordination.md) for how the tracker and plan tie the colony together.
 
-This is the operational model Hive is designed for: agents that run 24/7 as part of your business infrastructure, with humans stepping in only when needed. The goal is to automate the routine and escalate the exceptions.
+## Sessions, headless execution, and resume
 
-## The Runtime
+A **session** is one run of an agent against a specific input. Sessions are isolated — each has its own state and history — and they're **crash-safe**: state is persisted to disk, so a process crash, deploy, or restart resumes exactly where it left off rather than starting over.
 
-The worker agent runtime manages the lifecycle: starting sessions, executing the graph, handling pauses and resumes, tracking costs, and collecting metrics. It coordinates everything the agent needs — LLM access, tool execution, shared buffer state, credential management — so individual nodes can focus on their specific job.
+A lot of colony work runs **headless** — no UI, no human at a terminal — monitoring inboxes, processing leads, watching for events around the clock. Headless doesn't mean unsupervised: when the colony hits a decision a human should make, the Queen escalates out-of-band via [Sentinel](./coordination.md#human-in-the-loop-sentinel) and the loop parks until they respond. Automate the routine; escalate the exceptions.
 
-Key things the runtime handles:
+## The big picture
 
-**Cost tracking** — Every LLM call is metered. You set budget constraints on the goal, and the runtime enforces them. An agent can't silently burn through your API credits.
+The worker model is Hive's answer to "how do you run agents like you'd run a team?" The Queen is the lead who takes the brief, does the first one herself, and then hands out well-scoped pieces to as many workers as the job needs — each doing its part, reporting results into a shared ledger, and stepping aside. When the process needs to get better, you don't debug workers line by line — the colony [improves](./improvement.md) through reflexion, memory, and systematization.
 
-**Decision logging** — Every meaningful choice the agent makes is recorded: what it was trying to do, what options it considered, what it chose, and what happened. This isn't just for debugging — it's the raw material that evolution uses to improve future generations.
+## Learn more
 
-**Event streaming** — The runtime emits events as the agent works. You can wire these up to dashboards, logs, or alerting systems to monitor agents in real time.
-
-**Crash recovery** — If execution is interrupted (process crash, deployment, anything), the runtime can resume from the last checkpoint. Conversation state and buffer state are persisted, so the agent picks up where it left off rather than starting over.
-
-## The Big Picture
-
-The worker agent model is Hive's answer to a simple question: how do you run AI agents like you'd run a team?
-
-You hire for a role (define the goal), you onboard them with context (provide tools, credentials, domain knowledge), you set expectations (success criteria and constraints), you let them work independently (headless execution), and you check in when something unusual comes up (HITL). When they're not performing well, you don't debug them line by line — you evolve them (see [Evolution](./evolution.md)).
+- [The Colony](./colony.md) — the whole that workers are part of.
+- [The Queen](./queen.md) — who spawns and coordinates them.
+- [The Loop](./the_loop.md) — the primitive a worker is a clone of.
+- [Coordination](./coordination.md) — the tracker, plan, and event bus.

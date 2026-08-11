@@ -92,10 +92,17 @@ Goals carry context — domain knowledge, preferences, background information th
 
 When you define goals with weighted criteria and constraints, three things happen:
 
-1. **The agent can self-correct.** Goals are injected into every LLM call, so the agent is always reasoning against its success criteria. Within a [graph execution](./graph.md), nodes use these criteria to decide whether to accept their output, retry, or escalate — self-correction in real time.
+1. **The agent can self-correct.** Goals are injected into every LLM call, so the agent is always reasoning against its success criteria. Within [the loop](./the_loop.md), the judge uses these criteria to decide whether to accept the output, retry with feedback, or escalate — self-correction in real time.
 
-2. **Evolution has a target.** When an agent fails, the framework knows *which criteria* it fell short on, which gives the coding agent specific information to improve the next generation (see [Evolution](./evolution.md)).
+2. **Improvement has a target.** When an agent falls short, the framework knows *which criteria* it missed. That precise signal is what drives [how a colony improves](./improvement.md) — the feedback the judge injects, the notes a Queen reflects into memory, and the results workers write to the [tracker](./coordination.md#the-tracker).
 
 3. **Humans stay in control.** Constraints define the boundaries. The agent has freedom to find creative solutions within those boundaries, but it can't cross the lines you've drawn.
 
 The goal lifecycle flows through `DRAFT → READY → ACTIVE → COMPLETED / FAILED / SUSPENDED`, giving you visibility into where each objective stands at any point during execution.
+
+## Learn more
+
+- [The Colony](./colony.md) — what you point a goal at.
+- [The Queen](./queen.md) — who takes the goal and grows a colony around it.
+- [The Loop](./the_loop.md) — how the judge evaluates output against your success criteria.
+- [How a Colony Improves](./improvement.md) — how missed criteria drive improvement.

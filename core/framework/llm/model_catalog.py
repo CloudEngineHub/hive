@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -159,10 +160,28 @@ def load_model_catalog() -> dict[str, Any]:
     return _validate_model_catalog(_require_mapping(raw, "root"))
 
 
+# Providers usable only through Hive's managed cloud LLM proxy: their models
+# route via the ``hive/`` prefix and need HIVE_CLOUD_BASE + a cloud-provisioned
+# key. A self-hosted / OSS runtime has no proxy, so they're hidden from the
+# BYOK model surface — the user picks a real provider and brings their own key
+# instead of being stuck on ``hive-2.1``. Set HIVE_CLOUD_BASE to surface them.
+_MANAGED_CLOUD_PROVIDERS = frozenset({"hive"})
+
+
+def _hide_managed_providers() -> bool:
+    """True when managed cloud providers should be hidden (no cloud proxy)."""
+    return not os.environ.get("HIVE_CLOUD_BASE", "").strip()
+
+
 def get_models_catalogue() -> dict[str, list[dict[str, Any]]]:
-    """Return provider -> model list."""
+    """Return provider -> model list (managed cloud providers hidden in OSS)."""
     providers = load_model_catalog()["providers"]
-    return {provider_id: copy.deepcopy(provider_info["models"]) for provider_id, provider_info in providers.items()}
+    hide = _hide_managed_providers()
+    return {
+        provider_id: copy.deepcopy(provider_info["models"])
+        for provider_id, provider_info in providers.items()
+        if not (hide and provider_id in _MANAGED_CLOUD_PROVIDERS)
+    }
 
 
 def get_default_models() -> dict[str, str]:

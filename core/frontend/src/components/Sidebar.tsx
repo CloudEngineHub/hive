@@ -322,10 +322,6 @@ export default function Sidebar() {
             className="w-8 h-8 rounded-md flex items-center justify-center text-foreground/60 hover:text-foreground hover:bg-sidebar-item-hover transition-colors">
             <Network className="w-4 h-4" />
           </button>
-          <button onClick={() => navigate("/crm")} title="CRM"
-            className="w-8 h-8 rounded-md flex items-center justify-center text-foreground/60 hover:text-foreground hover:bg-sidebar-item-hover transition-colors">
-            <Contact className="w-4 h-4" />
-          </button>
           <button onClick={() => setLibraryExpanded((v) => !v)} title="Configuration"
             className="w-8 h-8 rounded-md flex items-center justify-center text-foreground/60 hover:text-foreground hover:bg-sidebar-item-hover transition-colors">
             <Settings className="w-4 h-4" />
@@ -420,16 +416,6 @@ export default function Sidebar() {
         >
           <Network className="w-[15px] h-[15px] opacity-70" />
           <span>Org Chart</span>
-        </button>
-        {/* CRM — the shared cloud team global DB (cross-colony GTM data).
-            Always visible: it's a production feature. Unconfigured workspaces
-            land on the setup prompt at /crm (see useCrmConfigured). */}
-        <button
-          onClick={() => navigate("/crm")}
-          className="flex items-center gap-2 px-3 py-[5px] rounded-md text-[12.5px] text-foreground/65 hover:bg-sidebar-item-hover hover:text-foreground transition-all duration-150"
-        >
-          <Contact className="w-[15px] h-[15px] opacity-70" />
-          <span className="flex-1 text-left">CRM</span>
         </button>
         <button
           onClick={() => setLibraryExpanded((v) => !v)}

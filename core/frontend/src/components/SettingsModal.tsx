@@ -276,15 +276,6 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
             </button>
           </div>
           <div className="flex flex-col gap-0.5">
-            <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Cloud</p>
-            <button
-              onClick={() => setActiveSection("cloud")}
-              className={`text-left text-xs px-2.5 py-1.5 rounded-md transition-colors ${activeSection === "cloud" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
-            >
-              Dashboard
-            </button>
-          </div>
-          <div className="flex flex-col gap-0.5">
             <p className="text-[9.5px] font-semibold text-muted-foreground/50 uppercase tracking-wider px-2.5 mb-0.5">Help</p>
             <button
               onClick={() => setActiveSection("help")}
@@ -633,28 +624,119 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
                 <div>
                   <h3 className="text-base font-semibold text-foreground">AI Model</h3>
                   <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-                    Choose the model that powers your hive. Each is optimized for a different part of the workflow.
+                    Connect an LLM provider with your own API key, then choose the model that powers your hive.
+                    {currentModel
+                      ? ` Currently using ${currentProviderName} · ${currentModelLabel}.`
+                      : " No model configured yet."}
                   </p>
                 </div>
 
-                <div className="flex-shrink-0 flex flex-col gap-3">
-                  <p className="text-[9.5px] font-semibold text-muted-foreground/60 uppercase tracking-wider -mb-1">
-                    Hive lineup
-                  </p>
-                  <HiveModelCard
-                    name="Hive 2.1"
-                    badge="Default"
-                    description="The core reasoning model behind every Queen Bee. Optimized for strategic planning, conversation, tool orchestration, and long-context decision-making. Best for single-agent tasks that require depth and nuance."
-                    selected={!modelDropdownOpen}
-                    onSelect={() => setModelDropdownOpen(false)}
-                  />
-                  <HiveModelCard
-                    name="Hive-Swarm"
-                    badge="Multi-Agent"
-                    description="Purpose-built for colony operations where multiple Worker Bees run in parallel. Tuned for fast, focused sub-tasks — code generation, data extraction, web scraping — with lower latency and efficient token usage across swarms."
-                    selected={modelDropdownOpen}
-                    onSelect={() => setModelDropdownOpen(true)}
-                  />
+                <div className="flex flex-col gap-2">
+                  {LLM_PROVIDERS.map((provider) => {
+                    const connected = connectedProviders.has(provider.id);
+                    const editing = editingProvider === provider.id;
+                    const models = availableModels[provider.id] || [];
+                    const isActiveProvider = currentProvider === provider.id;
+                    const v = validation[provider.id];
+                    return (
+                      <div key={provider.id} className="rounded-lg border border-border/60 bg-card p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-[13px] font-semibold text-foreground">{provider.name}</span>
+                              {connected && (
+                                <span className="text-[9.5px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 inline-flex items-center gap-1">
+                                  <Check className="w-2.5 h-2.5" /> Connected
+                                </span>
+                              )}
+                              {isActiveProvider && (
+                                <span className="text-[9.5px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-primary/15 text-primary">
+                                  Active
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11.5px] leading-relaxed text-muted-foreground mt-0.5">{provider.description}</p>
+                          </div>
+                          <button
+                            onClick={() => (editing ? setEditingProvider(null) : startEditing(provider.id))}
+                            className="flex-shrink-0 text-[11px] font-medium px-2 py-1 rounded-md border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors inline-flex items-center gap-1"
+                          >
+                            <KeyRound className="w-3 h-3" />
+                            {connected ? "Update key" : "Add key"}
+                          </button>
+                        </div>
+
+                        {editing && (
+                          <div className="mt-2.5 flex items-center gap-1.5">
+                            <div className="relative flex-1">
+                              <input
+                                type={showKey ? "text" : "password"}
+                                value={keyInput}
+                                onChange={(e) => setKeyInput(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") handleSaveKey(provider.id);
+                                }}
+                                placeholder={`Paste your ${provider.envVar} key`}
+                                autoFocus
+                                className="w-full text-xs rounded-md border border-border/60 bg-background px-2.5 py-1.5 pr-8 outline-none focus:border-primary/40"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setShowKey((s) => !s)}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                              >
+                                {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              </button>
+                            </div>
+                            <button
+                              onClick={() => handleSaveKey(provider.id)}
+                              disabled={saving || !keyInput.trim()}
+                              className="text-[11px] font-medium px-2.5 py-1.5 rounded-md bg-primary text-primary-foreground disabled:opacity-50 inline-flex items-center gap-1"
+                            >
+                              {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                              Save
+                            </button>
+                          </div>
+                        )}
+
+                        {v === "validating" && (
+                          <p className="mt-1.5 text-[11px] text-muted-foreground inline-flex items-center gap-1">
+                            <Loader2 className="w-3 h-3 animate-spin" /> Validating…
+                          </p>
+                        )}
+                        {v && typeof v === "object" && (
+                          <p
+                            className={`mt-1.5 text-[11px] inline-flex items-center gap-1 ${
+                              v.valid === false ? "text-red-500" : "text-emerald-500"
+                            }`}
+                          >
+                            <AlertCircle className="w-3 h-3" /> {v.message}
+                          </p>
+                        )}
+
+                        {connected && models.length > 0 && (
+                          <div className="mt-2.5 flex flex-wrap gap-1.5">
+                            {models.map((m) => {
+                              const selected = isActiveProvider && currentModel === m.id;
+                              return (
+                                <button
+                                  key={m.id}
+                                  onClick={() => handleSelectModel(provider.id, m.id)}
+                                  className={`text-[11px] px-2 py-1 rounded-md border transition-colors ${
+                                    selected
+                                      ? "border-primary/40 bg-primary/[0.08] text-primary font-medium"
+                                      : "border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/20"
+                                  }`}
+                                >
+                                  {m.label || m.id}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </>
             )}
@@ -665,41 +747,4 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
   );
 }
 
-function HiveModelCard({
-  name,
-  badge,
-  description,
-  selected,
-  onSelect,
-}: {
-  name: string;
-  badge: string;
-  description: string;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      onClick={onSelect}
-      className={`w-full text-left rounded-lg border p-3 transition-all duration-150 ${
-        selected
-          ? "border-primary/40 bg-primary/[0.05] ring-1 ring-primary/20"
-          : "border-border/60 bg-card hover:border-border hover:bg-muted/20"
-      }`}
-    >
-      <div className="flex items-center gap-2 mb-1.5">
-        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${selected ? "bg-primary shadow-[0_0_6px] shadow-primary/40" : "bg-muted-foreground/30"}`} />
-        <span className="text-[13px] font-semibold text-foreground">{name}</span>
-        <span className={`text-[9.5px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded ${
-          selected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
-        }`}>
-          {badge}
-        </span>
-      </div>
-      <p className="text-[11.5px] leading-relaxed text-muted-foreground pl-[14px]">
-        {description}
-      </p>
-    </button>
-  );
-}
 

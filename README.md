@@ -40,15 +40,19 @@
 
 ## Overview
 
-OpenHive is a zero-setup, model-agnostic execution harness that dynamically generates multi-agent topologies to tackle complex, long-running business workflows without requiring any orchestration boilerplate. By simply defining your objective, the runtime compiles a strict, graph-based execution DAG that safely coordinates specialized agents to execute concurrent tasks in parallel. Backed by persistent, role-based memory that intelligently evolves with your project's context, OpenHive ensures deterministic fault tolerance, deep state observability, and seamless asynchronous execution across whichever underlying LLMs you choose to plug in.
+OpenHive is a zero-setup, model-agnostic runtime for **colonies of agents**. A colony is a group of specialized agents that work together to run one business process: a **Queen** — the persistent, client-facing lead — plus however many **worker** agents the job needs. You describe the outcome; the Queen does the work, then grows a colony around it to run that work reliably and at scale.
+
+The mechanism underneath is **one loop controlling many loops**. Hive has a single execution primitive: the Queen *is* an agent loop, and every worker is a **clone** of it — same tools, same model, its own task. There is no graph to compile and no orchestration boilerplate to write. The colony coordinates through a shared ledger and a persistent plan, with crash-safe state, deep observability, and human oversight built into the one primitive every agent shares. See the **[Architecture Overview](docs/architecture/README.md)** for how it works.
 
 ## Features
 
-- ✅ Multi-Agent Coordination for parallel task execution 
-- ✅ Graph-based execution for recurring and complex processes 
-- ✅ Role-based memory that evolves with your projects 
-- ✅ Zero Setup - No technical configuration required
-- ✅ General Compute Use and Browser Use with Native Extension 
+- ✅ Colonies of agents — a Queen spawns worker clones on demand for parallel, long-running work
+- ✅ One primitive, many loops — no graph to wire; the Queen grows the colony at runtime
+- ✅ Shared tracker ledger + persistent task plan for coordination without a data buffer
+- ✅ Queen personas with CEO-style routing and evolving, scoped memory
+- ✅ Crash-safe park/resume, cost enforcement, and out-of-band human-in-the-loop (Sentinel)
+- ✅ Zero Setup — no technical configuration required
+- ✅ General Compute Use and Browser Use with Native Extension
 - ✅ Custom Model Support
 
 Visit [adenhq.com](https://adenhq.com) for complete documentation, examples, and guides.
@@ -78,8 +82,8 @@ Use Hive when the bottleneck is no longer the model but the harness around it:
 
 - Long-running agents that need **state persistence and crash recovery**
 - Production workloads requiring **cost enforcement, observability, and audit trails**
-- Agents that **self-heal** through failure capture and graph evolution
-- Multi-agent coordination with **session isolation and shared buffers**
+- Agents that **improve over time** through reflexion, scoped memory, and learned skills
+- Parallel, multi-agent work coordinated through a **shared tracker ledger and persistent plan**
 - A framework that **scales with model improvements** rather than fighting them
 
 ## Quick Links
@@ -158,32 +162,32 @@ Hive is built to be model-agnostic and system-agnostic.
 
 ## Why Hive
 
-As models improve, the upper bound of what agents can do rises — but their reliability and production value are determined by the harness. Hive focuses on generating agents that run real business processes rather than generic agents. Instead of requiring you to manually design workflows, define agent interactions, and handle failures reactively, Hive flips the paradigm: **you describe outcomes, and the system builds itself**—delivering an outcome-driven, adaptive experience with an easy-to-use set of tools and integrations.
+As models improve, the upper bound of what agents can do rises — but their reliability and production value are determined by the harness. Hive focuses on running real business processes rather than generic agents. Instead of making you hand-wire a workflow graph, define every agent interaction, and handle failures reactively, Hive flips the paradigm: **you describe the outcome, the Queen does the work first, then grows a colony to scale it** — an outcome-driven, adaptive experience with an easy-to-use set of tools and integrations.
 
 ```mermaid
 flowchart LR
-    GOAL["Define Goal"] --> GEN["Auto-Generate Graph"]
-    GEN --> EXEC["Execute Agents"]
-    EXEC --> MON["Monitor & Observe"]
-    MON --> CHECK{{"Pass?"}}
+    GOAL["Describe Outcome"] --> PILOT["Queen Pilots\n(does one unit herself)"]
+    PILOT --> SYS["Systematize\n(skill + playbook)"]
+    SYS --> FAN["Fan Out\n(spawn worker clones)"]
+    FAN --> CONV["Converge\n(shared tracker ledger)"]
+    CONV --> CHECK{{"Done?"}}
     CHECK -- "Yes" --> DONE["Deliver Result"]
-    CHECK -- "No" --> EVOLVE["Evolve Graph"]
-    EVOLVE --> EXEC
+    CHECK -- "No" --> FAN
 
     GOAL -.- V1["Natural Language"]
-    GEN -.- V2["Instant Architecture"]
-    EXEC -.- V3["Easy Integrations"]
-    MON -.- V4["Full visibility"]
-    EVOLVE -.- V5["Adaptability"]
+    PILOT -.- V2["Prove the path"]
+    SYS -.- V3["Repeatable process"]
+    FAN -.- V4["Parallel at scale"]
+    CONV -.- V5["Resume by construction"]
     DONE -.- V6["Reliable outcomes"]
 
     style GOAL fill:#ffbe42,stroke:#cc5d00,stroke-width:2px,color:#333
-    style GEN fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
-    style EXEC fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
-    style MON fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style PILOT fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
+    style SYS fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style FAN fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style CONV fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
     style CHECK fill:#fff59d,stroke:#ed8c00,stroke-width:2px,color:#333
     style DONE fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-    style EVOLVE fill:#e8763d,stroke:#cc5d00,stroke-width:2px,color:#fff
     style V1 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V2 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V3 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
@@ -194,11 +198,11 @@ flowchart LR
 
 ### How It Works
 
-1. **[Define Your Goal](docs/key_concepts/goals_outcome.md)** → Describe what you want to achieve in plain English
-2. **Coding Agent Generates** → Creates the [agent graph](docs/key_concepts/graph.md), connection code, and test cases
-3. **[Workers Execute](docs/key_concepts/worker_agent.md)** → SDK-wrapped nodes run with full observability and tool access
-4. **Control Plane Monitors** → Real-time metrics, budget enforcement, policy management
-5. **[Adaptiveness](docs/key_concepts/evolution.md)** → On failure, the system evolves the graph and redeploys automatically
+1. **[Describe the outcome](docs/key_concepts/goals_outcome.md)** → Say what you want in plain English; a CEO-style router picks the right [Queen](docs/key_concepts/queen.md)
+2. **Queen pilots** → She does one unit of the work herself, proving the path and recording it in the shared tracker
+3. **[Systematize](docs/key_concepts/improvement.md)** → She factors the proven protocol into a skill + playbook — a repeatable process
+4. **[Fan out](docs/key_concepts/colony.md)** → `run_worker` spawns [worker clones](docs/key_concepts/worker_agent.md) that run in parallel and report back
+5. **Converge & monitor** → Workers write results to the tracker; the Queen validates via SQL, with real-time metrics, budget enforcement, and crash-safe resume
 
 ## Documentation
 
@@ -253,7 +257,7 @@ Yes! Hive supports local models through LiteLLM. Simply use the model name forma
 
 **Q: What makes Hive different from other agent frameworks?**
 
-Hive is an agent harness, not just an orchestration framework. It provides the production runtime layer — session isolation, checkpoint-based crash recovery, cost enforcement, real-time observability, and human-in-the-loop controls — that makes agents reliable enough to run real workloads. On top of that, Hive generates your entire agent system from natural language goals and automatically [evolves the graph](docs/key_concepts/evolution.md) when agents fail. The combination of a robust harness with self-improving generation is what sets Hive apart.
+Hive runs **colonies of agents**, not single agents or hand-wired agent graphs. Most frameworks make you compile a graph of distinct nodes and edges; Hive has one execution primitive — the Queen *is* an agent loop, and every worker is a [clone](docs/key_concepts/the_loop.md) of it. Orchestration is a runtime `run_worker` fan-out, not a compiled DAG, and the colony coordinates through a [shared tracker ledger](docs/key_concepts/coordination.md) instead of a data buffer. On top of that "one loop, many loops" core, Hive is a production harness — crash-safe park/resume, cost enforcement, real-time observability, and out-of-band human-in-the-loop — inherited by every agent because there is only one kind of agent. See the [Architecture Overview](docs/architecture/README.md).
 
 **Q: Is Hive open-source?**
 
@@ -261,7 +265,7 @@ Yes, Hive is fully open-source under the Apache License 2.0. We actively encoura
 
 **Q: Does Hive support human-in-the-loop workflows?**
 
-Yes, Hive fully supports [human-in-the-loop](docs/key_concepts/graph.md#human-in-the-loop) workflows through intervention nodes that pause execution for human input. These include configurable timeouts and escalation policies, allowing seamless collaboration between human experts and AI agents.
+Yes. A Queen escalates to a human out-of-band through **Sentinel** — an account-bound Slack/Telegram channel. The agent loop parks (persisting its state to disk), notifies the human, and resumes exactly where it left off when they reply. Because escalation isn't a node in a graph, any agent in a colony can pause for human judgment at any point, with configurable timeouts and escalation policies. See the [Architecture Overview](docs/architecture/README.md#reliability-is-in-the-primitive).
 
 **Q: What programming languages does Hive support?**
 
@@ -269,7 +273,7 @@ The Hive framework is built in Python. A JavaScript/TypeScript SDK is on the roa
 
 **Q: Can Hive agents interact with external tools and APIs?**
 
-Yes. Aden's SDK-wrapped nodes provide built-in tool access, and the framework supports flexible tool ecosystems. Agents can integrate with external APIs, databases, and services through the node architecture.
+Yes. Every agent in a colony has built-in tool access, and Hive connects to external APIs, databases, and services through MCP — including 100+ integration tools plus General Compute Use and Browser Use via the native extension. Because the Queen and her workers share one tool surface, a capability you add is available to the whole colony.
 
 **Q: How does cost control work in Hive?**
 

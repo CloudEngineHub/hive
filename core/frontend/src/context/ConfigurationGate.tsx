@@ -27,11 +27,12 @@ export function ConfigurationGate({ children }: { children: ReactNode }) {
   const refresh = useCallback(async () => {
     try {
       const config = await configApi.getLLMConfig();
-      // When the provider is "hive" (managed LLM proxy), skip the BYOK
-      // gate even if has_api_key is false — the key is provisioned by the
-      // cloud auth flow and may just need a token refresh. Showing the
-      // BYOK wizard for managed keys confuses users.
-      if (config.has_api_key || config.provider === "hive") {
+      // A working BYOK provider (a real API key in the credential store or an
+      // env var) is required. The managed "hive" cloud proxy isn't available
+      // in a self-hosted runtime, so — unlike the desktop build — we do NOT
+      // treat provider === "hive" as ready; a fresh install lands on the
+      // provider picker instead of being stuck on hive-2.1.
+      if (config.has_api_key) {
         setState({ kind: "ready", config });
       } else {
         setState({ kind: "needs-setup", config });
