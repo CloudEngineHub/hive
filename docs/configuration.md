@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Aden Hive is a Python-based agent framework. Configuration is handled through environment variables and agent-level config files. There is no centralized `config.yaml` or Docker Compose setup.
+Hive is a Python-based agent framework. Configuration is handled through environment variables and agent-level config files. There is no centralized `config.yaml` or Docker Compose setup.
 
 ## Configuration Overview
 
@@ -158,9 +158,11 @@ CONFIG = {
 
 If `model` or `max_tokens` are omitted, the agent loads defaults from `~/.hive/configuration.json`.
 
-### Agent Graph Specification
+### Standalone agent specification (legacy export format)
 
-Agent behavior is defined in `agent.json` (or constructed in `agent.py`):
+> **Scope:** the `nodes`/`edges` `agent.json` format below is the **standalone / exported-agent** format, still supported by the loader for single, exportable agents. It is **not** how the live colony runtime works — a [colony](key_concepts/colony.md) has no graph; the [Queen](key_concepts/queen.md) grows it at runtime and coordinates workers through the shared [tracker](key_concepts/coordination.md#the-tracker). Use this format only when authoring a portable standalone agent.
+
+A standalone agent is defined in `agent.json`:
 
 ```json
 {
@@ -175,7 +177,7 @@ Agent behavior is defined in `agent.json` (or constructed in `agent.py`):
 }
 ```
 
-See the [Getting Started Guide](getting-started.md) for building agents.
+See the [Getting Started Guide](getting-started.md) for building agents, and the [Architecture Overview](architecture/README.md) for how colonies actually run.
 
 ## MCP Server Configuration
 
@@ -202,17 +204,19 @@ The standalone `files-tools` server (`files_server.py`) exposes file I/O (`read_
 
 ## Storage
 
-Aden Hive uses **file-based persistence** (no database required):
+Hive uses **file-based persistence** (no external database required). State lives under `HIVE_HOME`:
 
 ```
-{storage_path}/
-  runs/{run_id}.json          # Complete execution traces
-  indexes/
-    by_goal/{goal_id}.json    # Runs indexed by goal
-    by_status/{status}.json   # Runs indexed by status
-    by_node/{node_id}.json    # Runs indexed by node
-  summaries/{run_id}.json     # Quick-load run summaries
+$HIVE_HOME/
+  agents/queens/<queen_id>/     # Queen profiles + sessions
+  colonies/<name>/              # one self-contained directory per colony
+    worker.json                 #   the colony's worker (clone) spec
+    data/tracker.db             #   the colony's shared SQLite ledger
+  memories/                     # scoped Queen memory (global / colony / queen)
+  credentials/                  # encrypted credential store
 ```
+
+Each colony is self-contained in its directory, which is what makes it portable (export/import as a tarball). A colony's per-session conversation and cursor state persist under the colony's directory so a crash or restart resumes exactly where it left off.
 
 Storage is managed by `framework.storage.FileStorage`. No external database setup is needed.
 

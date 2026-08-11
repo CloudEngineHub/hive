@@ -1,6 +1,6 @@
 # Excel Tool
 
-Read and manipulate Excel files (.xlsx, .xlsm) within the Aden agent framework.
+Read and manipulate Excel files (.xlsx, .xlsm) within the Hive framework.
 
 ## Installation
 

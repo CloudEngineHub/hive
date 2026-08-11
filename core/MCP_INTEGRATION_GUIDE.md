@@ -444,6 +444,6 @@ if __name__ == "__main__":
 
 ## See Also
 
-- [MCP_SERVER_GUIDE.md](MCP_SERVER_GUIDE.md) - Building your own MCP servers
+- [MCP_BUILDER_TOOLS_GUIDE.md](MCP_BUILDER_TOOLS_GUIDE.md) - Building your own MCP servers and tools
 - [examples/mcp_integration_example.py](examples/mcp_integration_example.py) - More examples
 - [examples/mcp_servers.json](examples/mcp_servers.json) - Example configuration

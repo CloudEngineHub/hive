@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="100%" alt="Hive Banner" src="https://github.com/user-attachments/assets/a027429b-5d3c-4d34-88e4-0feaeaabbab3" />
+  <img width="100%" alt="Hive Banner" src="https://asset.acho.io/github/img/banner.gif" />
 </p>
 
 <p align="center">
@@ -23,11 +23,12 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Agent_Harness-Runtime_Layer-ff6600?style=flat-square" alt="Agent Harness" />
   <img src="https://img.shields.io/badge/AI_Agents-Self--Improving-brightgreen?style=flat-square" alt="AI Agents" />
   <img src="https://img.shields.io/badge/Multi--Agent-Systems-blue?style=flat-square" alt="Multi-Agent" />
   <img src="https://img.shields.io/badge/Headless-Development-purple?style=flat-square" alt="Headless" />
   <img src="https://img.shields.io/badge/Human--in--the--Loop-orange?style=flat-square" alt="HITL" />
-  <img src="https://img.shields.io/badge/Production--Ready-red?style=flat-square" alt="Production" />
+  <img src="https://img.shields.io/badge/Browser-Use-red?style=flat-square" alt="Browser Use" />
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/OpenAI-supported-412991?style=flat-square&logo=openai" alt="OpenAI" />
@@ -35,55 +36,74 @@
   <img src="https://img.shields.io/badge/Google_Gemini-supported-4285F4?style=flat-square&logo=google" alt="Gemini" />
 </p>
 
+<p align="center"><em>The agent harness for production workloads — state management, failure recovery, observability, and human oversight so your agents actually run.</em></p>
+
 ## 概要
 
-ワークフローをハードコーディングせずに、自律的で信頼性の高い自己改善型 AI エージェントを構築できます。コーディングエージェントとの会話を通じて目標を定義すると、フレームワークが動的に作成された接続コードを持つノードグラフを生成します。問題が発生すると、フレームワークは障害データをキャプチャし、コーディングエージェントを通じてエージェントを進化させ、再デプロイします。組み込みのヒューマンインザループノード、認証情報管理、リアルタイムモニタリングにより、適応性を損なうことなく制御を維持できます。
+OpenHive は、**エージェントのコロニー（colony）**のためのゼロセットアップかつモデル非依存のランタイムです。コロニーとは、1 つのビジネスプロセスを実行するために協働する専門エージェントのグループであり、**Queen（クイーン）**—永続的でクライアントと対話する司令塔—と、ジョブが必要とするだけの数の **worker（ワーカー）** エージェントで構成されます。あなたは成果（アウトカム）を記述するだけで、Queen がまず自ら作業を行い、その作業を確実かつ大規模に実行するために、その周りにコロニーを成長させます。
+
+その根底にある仕組みは、**1 つのループが多数のループを制御する**というものです。Hive には単一の実行プリミティブしかありません。Queen は文字どおりエージェントループそのものであり、すべての worker はその **clone（クローン）**—同じツール、同じモデル、そして独自のタスクを持つ—です。コンパイルすべきグラフも、記述すべきオーケストレーションの定型コードもありません。コロニーは共有台帳と永続的なプランを通じて連携し、クラッシュセーフな状態管理、深い可観測性、そして人間による監督が、すべてのエージェントが共有するこの唯一のプリミティブに組み込まれています。仕組みの詳細については、**[アーキテクチャ概要](../architecture/README.md)** をご覧ください。
+
+## 機能
+
+- ✅ エージェントのコロニー — Queen が必要に応じて worker クローンを生成し、並列かつ長時間実行の作業を行う
+- ✅ 1 つのプリミティブ、多数のループ — 配線すべきグラフはなく、Queen が実行時にコロニーを成長させる
+- ✅ 共有トラッカー（tracker）台帳 + 永続的なタスクプランにより、データバッファなしで連携
+- ✅ CEO スタイルのルーティングと、進化するスコープ付きメモリを備えた Queen ペルソナ
+- ✅ クラッシュセーフな一時停止／再開（park/resume）、コスト制御、帯域外のヒューマンインザループ（Sentinel）
+- ✅ ゼロセットアップ — 技術的な設定は不要
+- ✅ ネイティブ拡張機能による汎用コンピュータ操作（General Compute Use）とブラウザ操作（Browser Use）
+- ✅ カスタムモデルのサポート
 
 完全なドキュメント、例、ガイドについては [adenhq.com](https://adenhq.com) をご覧ください。
 
-[![Hive Demo](https://img.youtube.com/vi/XDOG9fOaLjU/maxresdefault.jpg)](https://www.youtube.com/watch?v=XDOG9fOaLjU)
+どのような仕事が AI によって自動化されつつあるかを見るには、[HoneyComb](http://honeycomb.open-hive.com/) をご覧ください。これは、私たちのコミュニティの AI エージェントの進歩によって動く、仕事のための株式市場です。ある仕事がどれだけ AI に置き換えられると考えるかに基づいて、（実際の資金ではなくコンピュートトークンで）仕事をロング・ショートできます。
+
+https://github.com/user-attachments/assets/bf10edc3-06ba-48b6-98ba-d069b15fb69d
+
 
 ## Hive は誰のためのものか？
 
-Hive は、複雑なワークフローを手動で配線することなく**本番グレードの AI エージェント**を構築したい開発者やチーム向けに設計されています。
+Hive は、AI エージェントをプロトタイプから本番環境へと移行させるチームのためのマルチエージェントハーネス層です。Openclaw や Cowork のような単一エージェントは個人的なジョブをかなりうまくこなせますが、ビジネスプロセスを遂行するための厳密さに欠けています。
 
-Hive が適している場合：
+Hive が適しているのは、次のような場合です：
 
-- デモではなく、**実際のビジネスプロセスを実行する** AI エージェントが必要
-- ハードコードされたワークフローよりも**目標駆動開発**を好む
+- デモではなく、**実際のビジネスプロセスを実行する** AI エージェントが欲しい
+- 大規模に**状態、リカバリ、並列実行を処理するランタイム**が必要
 - 時間とともに改善される**自己修復・適応型エージェント**が必要
 - **ヒューマンインザループ制御**、可観測性、コスト制限が必要
-- **本番環境**でエージェントを実行する予定がある
+- 稼働時間、コスト、監査可能性が重要となる**本番環境**でエージェントを実行する予定がある
 
-シンプルなエージェントチェーンや単発スクリプトの実験のみを行う場合、Hive は最適ではないかもしれません。
+シンプルなエージェントチェーンや単発のスクリプトを試すだけであれば、Hive は最適ではないかもしれません。
 
 ## いつ Hive を使うべきか？
 
-Hive は以下が必要な場合に使用してください：
+ボトルネックがもはやモデルではなく、その周りのハーネスになったときに Hive を使用してください：
 
-- 長時間実行される自律型エージェント
-- 強力なガードレール、プロセス、制御
-- 障害に基づく継続的な改善
-- マルチエージェント連携
-- 目標とともに進化するフレームワーク
+- **状態の永続化とクラッシュリカバリ**を必要とする長時間実行エージェント
+- **コスト制御、可観測性、監査証跡**を必要とする本番ワークロード
+- リフレクション、スコープ付きメモリ、習得したスキルを通じて**時間とともに改善する**エージェント
+- **共有トラッカー台帳と永続的なプラン**を通じて連携される、並列マルチエージェント作業
+- モデルの改善に抗うのではなく、それと**ともにスケールする**フレームワーク
 
 ## クイックリンク
 
 - **[ドキュメント](https://docs.adenhq.com/)** - 完全なガイドと API リファレンス
-- **[セルフホスティングガイド](https://docs.adenhq.com/getting-started/quickstart)** - インフラストラクチャへの Hive デプロイ
+- **[セルフホスティングガイド](https://docs.adenhq.com/getting-started/quickstart)** - 自分のインフラに Hive をデプロイ
 - **[変更履歴](https://github.com/aden-hive/hive/releases)** - 最新の更新とリリース
 - **[ロードマップ](../roadmap.md)** - 今後の機能と計画
-- **[問題を報告](https://github.com/adenhq/hive/issues)** - バグレポートと機能リクエスト
+- **[問題を報告](https://github.com/aden-hive/hive/issues)** - バグレポートと機能リクエスト
 - **[貢献](../../CONTRIBUTING.md)** - 貢献方法と PR の提出方法
 
 ## クイックスタート
 
 ### 前提条件
 
-- Python 3.11+ - エージェント開発用
-- Claude Code、Codex CLI、または Cursor - エージェントスキルの活用用
+- Python 3.11+ — エージェント開発用
+- エージェントを動かす LLM プロバイダー
+- **ripgrep（オプション、Windows では推奨）：** `terminal_rg` / `terminal_glob` 検索ツールは、より高速なファイル検索のために ripgrep を使用します。インストールされていない場合は、Python のフォールバックが使用されます。Windows の場合：`winget install BurntSushi.ripgrep` または `scoop install ripgrep`
 
-> **Windows ユーザーへの注意：** このフレームワークを実行するには、**WSL（Windows Subsystem for Linux）**または **Git Bash** の使用を強く推奨します。一部のコア自動化スクリプトは、標準のコマンドプロンプトや PowerShell では正しく実行されない場合があります。
+> **Windows ユーザーへ：** ネイティブ Windows は `quickstart.ps1` および `hive.ps1` を介してサポートされています。これらは PowerShell 5.1+ で実行してください。WSL も選択肢の 1 つですが、必須ではありません。
 
 ### インストール
 
@@ -93,13 +113,15 @@ Hive は以下が必要な場合に使用してください：
 > 環境をセットアップするには、以下のクイックスタートスクリプトをご使用ください。
 
 ```bash
-# リポジトリをクローン
+# Clone the repository
 git clone https://github.com/aden-hive/hive.git
 cd hive
 
-
-# クイックスタートセットアップを実行
+# Run quickstart setup (macOS/Linux)
 ./quickstart.sh
+
+# Windows (PowerShell)
+.\quickstart.ps1
 ```
 
 これにより以下がセットアップされます：
@@ -107,16 +129,16 @@ cd hive
 - **framework** - コアエージェントランタイムとグラフエグゼキュータ（`core/.venv` 内）
 - **aden_tools** - エージェント機能のための MCP ツール（`tools/.venv` 内）
 - **credential store** - 暗号化された API キーストレージ（`~/.hive/credentials`）
-- **LLM provider** - インタラクティブなデフォルトモデル設定
+- **LLM provider** - Hive LLM や OpenRouter を含む、インタラクティブなデフォルトモデル設定
 - `uv` による必要な Python 依存関係すべて
 
-- 最後に、ブラウザでオープン Hive インターフェースが起動します
+- 最後に、ブラウザで Hive インターフェースが起動します
 
-<img width="2500" height="1214" alt="home-screen" src="https://github.com/user-attachments/assets/134d897f-5e75-4874-b00b-e0505f6b45c4" />
+> **ヒント：** 後でダッシュボードを再度開くには、プロジェクトディレクトリから `hive open` を実行してください。
 
 ### 最初のエージェントを構築
 
-ホームの入力ボックスに構築したいエージェントを入力してください
+ホームの入力ボックスに、構築したいエージェントを入力してください。Queen があなたに質問し、一緒に解決策を練り上げます。
 
 <img width="2500" height="1214" alt="Image" src="https://github.com/user-attachments/assets/1ce19141-a78b-46f5-8d64-dbf987e048f4" />
 
@@ -124,54 +146,48 @@ cd hive
 
 「Try a sample agent」をクリックしてテンプレートを確認してください。テンプレートを直接実行することも、既存のテンプレートをベースに独自のバージョンを構築することもできます。
 
-## 機能
+### エージェントの実行
 
-- **ブラウザ操作** - コンピュータ上のブラウザを制御して困難なタスクを達成
-- **並列実行** - 生成されたグラフを並列で実行。複数のエージェントが同時にジョブを完了
-- **[目標駆動生成](../key_concepts/goals_outcome.md)** - 自然言語で目標を定義；コーディングエージェントがそれを達成するためのエージェントグラフと接続コードを生成
-- **[適応性](../key_concepts/evolution.md)** - フレームワークが障害をキャプチャし、目標に応じて調整し、エージェントグラフを進化
-- **[動的ノード接続](../key_concepts/graph.md)** - 事前定義されたエッジなし；接続コードは目標に基づいて任意の対応 LLM によって生成
-- **SDK ラップノード** - すべてのノードが共有メモリ、ローカル RLM メモリ、モニタリング、ツール、LLM アクセスを標準装備
-- **[ヒューマンインザループ](../key_concepts/graph.md#human-in-the-loop)** - 設定可能なタイムアウトとエスカレーションを備えた、人間の入力のために実行を一時停止する介入ノード
-- **リアルタイム可観測性** - エージェント実行、決定、ノード間通信のライブモニタリングのための WebSocket ストリーミング
-- **本番環境対応** - セルフホスト可能、スケールと信頼性のために構築
+これで、エージェント（既存のエージェントまたはサンプルエージェント）を選択して実行できます。左上の Run ボタンをクリックするか、Queen エージェントに話しかけてエージェントを実行してもらうことができます。
+
+<img width="2549" height="1174" alt="Screenshot 2026-03-12 at 9 27 36 PM" src="https://github.com/user-attachments/assets/7c7d30fa-9ceb-4c23-95af-b1caa405547d" />
 
 ## 統合
 
 <a href="https://github.com/aden-hive/hive/tree/main/tools/src/aden_tools/tools"><img width="100%" alt="Integration" src="https://github.com/user-attachments/assets/a1573f93-cf02-4bb8-b3d5-b305b05b1e51" /></a>
-Hive はモデル非依存およびシステム非依存に設計されています。
+Hive はモデル非依存かつシステム非依存に設計されています。
 
-- **LLM の柔軟性** - Hive フレームワークは、LiteLLM 互換プロバイダーを通じて、ホスト型およびローカルモデルを含む様々なタイプの LLM をサポートするよう設計されています。
-- **ビジネスシステム接続性** - Hive フレームワークは、CRM、サポート、メッセージング、データ、ファイル、内部 API など、MCP を介してあらゆる種類のビジネスシステムにツールとして接続するよう設計されています。
+- **LLM の柔軟性** - Hive フレームワークは、LiteLLM 互換プロバイダーを通じて、Anthropic、OpenAI、OpenRouter、Hive LLM、およびその他のホスト型またはローカルモデルをサポートします。
+- **ビジネスシステム接続性** - Hive フレームワークは、CRM、サポート、メッセージング、データ、ファイル、内部 API など、あらゆる種類のビジネスシステムに MCP を介してツールとして接続するように設計されています。
 
-## なぜ Aden か
+## なぜ Hive か
 
-Hive は汎用的なエージェントではなく、実際のビジネスプロセスを実行するエージェントの生成に焦点を当てています。ワークフローを手動で設計し、エージェントの相互作用を定義し、障害を事後的に処理することを要求する代わりに、Hive はパラダイムを逆転させます：**結果を記述すれば、システムが自ら構築します**—結果駆動型で適応性のある体験を、使いやすいツールと統合のセットとともに提供します。
+モデルが改善するにつれて、エージェントにできることの上限は上がります—しかし、その信頼性と本番環境での価値はハーネスによって決まります。Hive は、汎用的なエージェントではなく、実際のビジネスプロセスを実行することに焦点を当てています。ワークフローグラフを手作業で配線し、すべてのエージェントの相互作用を定義し、障害を事後的に処理させる代わりに、Hive はパラダイムを逆転させます：**あなたが成果を記述すると、Queen がまず自ら作業を行い、それをスケールさせるためにコロニーを成長させます**—使いやすいツールと統合のセットを備えた、成果駆動型で適応的な体験です。
 
 ```mermaid
 flowchart LR
-    GOAL["Define Goal"] --> GEN["Auto-Generate Graph"]
-    GEN --> EXEC["Execute Agents"]
-    EXEC --> MON["Monitor & Observe"]
-    MON --> CHECK{{"Pass?"}}
+    GOAL["Describe Outcome"] --> PILOT["Queen Pilots\n(does one unit herself)"]
+    PILOT --> SYS["Systematize\n(skill + playbook)"]
+    SYS --> FAN["Fan Out\n(spawn worker clones)"]
+    FAN --> CONV["Converge\n(shared tracker ledger)"]
+    CONV --> CHECK{{"Done?"}}
     CHECK -- "Yes" --> DONE["Deliver Result"]
-    CHECK -- "No" --> EVOLVE["Evolve Graph"]
-    EVOLVE --> EXEC
+    CHECK -- "No" --> FAN
 
     GOAL -.- V1["Natural Language"]
-    GEN -.- V2["Instant Architecture"]
-    EXEC -.- V3["Easy Integrations"]
-    MON -.- V4["Full visibility"]
-    EVOLVE -.- V5["Adaptability"]
+    PILOT -.- V2["Prove the path"]
+    SYS -.- V3["Repeatable process"]
+    FAN -.- V4["Parallel at scale"]
+    CONV -.- V5["Resume by construction"]
     DONE -.- V6["Reliable outcomes"]
 
     style GOAL fill:#ffbe42,stroke:#cc5d00,stroke-width:2px,color:#333
-    style GEN fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
-    style EXEC fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
-    style MON fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style PILOT fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
+    style SYS fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style FAN fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style CONV fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
     style CHECK fill:#fff59d,stroke:#ed8c00,stroke-width:2px,color:#333
     style DONE fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-    style EVOLVE fill:#e8763d,stroke:#cc5d00,stroke-width:2px,color:#fff
     style V1 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V2 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V3 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
@@ -180,164 +196,23 @@ flowchart LR
     style V6 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
 ```
 
-### Hive の優位性
-
-| 従来のフレームワーク                   | Hive                                   |
-| -------------------------------------- | -------------------------------------- |
-| エージェントワークフローをハードコード | 自然言語で目標を記述                   |
-| 手動でグラフを定義                     | 自動生成されるエージェントグラフ       |
-| 事後的なエラー処理                     | 結果評価と適応性                       |
-| 静的なツール設定                       | 動的な SDK ラップノード                |
-| 別途モニタリング設定                   | 組み込みのリアルタイム可観測性         |
-| DIY 予算管理                           | 統合されたコスト制御と劣化             |
-
 ### 仕組み
 
-1. **[目標を定義](../key_concepts/goals_outcome.md)** → 達成したいことを平易な言葉で記述
-2. **コーディングエージェントが生成** → [エージェントグラフ](../key_concepts/graph.md)、接続コード、テストケースを作成
-3. **[ワーカーが実行](../key_concepts/worker_agent.md)** → SDK ラップノードが完全な可観測性とツールアクセスで実行
-4. **コントロールプレーンが監視** → リアルタイムメトリクス、予算執行、ポリシー管理
-5. **[適応性](../key_concepts/evolution.md)** → 障害時、システムがグラフを進化させ自動的に再デプロイ
-
-## エージェントの実行
-
-エージェントを選択して実行できます（既存のエージェントまたはサンプルエージェント）。左上の Run ボタンをクリックするか、クイーンエージェントに話しかけてエージェントを実行してもらうことができます。
+1. **[成果を記述](../key_concepts/goals_outcome.md)** → 望むことを平易な言葉で伝えると、CEO スタイルのルーターが適切な [Queen](../key_concepts/queen.md) を選びます
+2. **Queen が先導** → Queen が自ら 1 単位の作業を行い、その道筋を実証して共有トラッカーに記録します
+3. **[体系化](../key_concepts/improvement.md)** → 実証済みのプロトコルをスキル + プレイブック（再現可能なプロセス）へと落とし込みます
+4. **[ファンアウト](../key_concepts/colony.md)** → `run_worker` が [worker クローン](../key_concepts/worker_agent.md) を生成し、それらが並列で実行して結果を報告します
+5. **収束と監視** → worker が結果をトラッカーに書き込み、Queen が SQL で検証します。リアルタイムメトリクス、予算の執行、クラッシュセーフな再開を伴います
 
 ## ドキュメント
 
-- **[開発者ガイド](../developer-guide.md)** - 開発者向け総合ガイド
+- **[開発者ガイド](../developer-guide.md)** - 開発者向けの総合ガイド
 - [はじめに](../getting-started.md) - クイックセットアップ手順
 - [設定ガイド](../configuration.md) - すべての設定オプション
 - [アーキテクチャ概要](../architecture/README.md) - システム設計と構造
 
-## ロードマップ
-
-Aden Hive エージェントフレームワークは、開発者が結果志向で自己適応するエージェントを構築できるよう支援することを目指しています。詳細は [roadmap.md](../roadmap.md) をご覧ください。
-
-```mermaid
-flowchart TB
-    %% Main Entity
-    User([User])
-
-    %% =========================================
-    %% EXTERNAL EVENT SOURCES
-    %% =========================================
-    subgraph ExtEventSource [External Event Source]
-        E_Sch["Schedulers"]
-        E_WH["Webhook"]
-        E_SSE["SSE"]
-    end
-
-    %% =========================================
-    %% SYSTEM NODES
-    %% =========================================
-    subgraph WorkerBees [Worker Bees]
-        WB_C["Conversation"]
-        WB_SP["System prompt"]
-
-        subgraph Graph [Graph]
-            direction TB
-            N1["Node"] --> N2["Node"] --> N3["Node"]
-            N1 -.-> AN["Active Node"]
-            N2 -.-> AN
-            N3 -.-> AN
-
-            %% Nested Event Loop Node
-            subgraph EventLoopNode [Event Loop Node]
-                ELN_L["listener"]
-                ELN_SP["System Prompt<br/>(Task)"]
-                ELN_EL["Event loop"]
-                ELN_C["Conversation"]
-            end
-        end
-    end
-
-    subgraph JudgeNode [Judge]
-        J_C["Criteria"]
-        J_P["Principles"]
-        J_EL["Event loop"] <--> J_S["Scheduler"]
-    end
-
-    subgraph QueenBee [Queen Bee]
-        QB_SP["System prompt"]
-        QB_EL["Event loop"]
-        QB_C["Conversation"]
-    end
-
-    subgraph Infra [Infra]
-        SA["Sub Agent"]
-        TR["Tool Registry"]
-        WTM["Write through Conversation Memory<br/>(Logs/RAM/Harddrive)"]
-        SM["Shared Memory<br/>(State/Harddrive)"]
-        EB["Event Bus<br/>(RAM)"]
-        CS["Credential Store<br/>(Harddrive/Cloud)"]
-    end
-
-    subgraph PC [PC]
-        B["Browser"]
-        CB["Codebase<br/>v 0.0.x ... v n.n.n"]
-    end
-
-    %% =========================================
-    %% CONNECTIONS & DATA FLOW
-    %% =========================================
-
-    %% External Event Routing
-    E_Sch --> ELN_L
-    E_WH --> ELN_L
-    E_SSE --> ELN_L
-    ELN_L -->|"triggers"| ELN_EL
-
-    %% User Interactions
-    User -->|"Talk"| WB_C
-    User -->|"Talk"| QB_C
-    User -->|"Read/Write Access"| CS
-
-    %% Inter-System Logic
-    ELN_C <-->|"Mirror"| WB_C
-    WB_C -->|"Focus"| AN
-
-    WorkerBees -->|"Inquire"| JudgeNode
-    JudgeNode -->|"Approve"| WorkerBees
-
-    %% Judge Alignments
-    J_C <-.->|"aligns"| WB_SP
-    J_P <-.->|"aligns"| QB_SP
-
-    %% Escalate path
-    J_EL -->|"Report (Escalate)"| QB_EL
-
-    %% Pub/Sub Logic
-    AN -->|"publish"| EB
-    EB -->|"subscribe"| QB_C
-
-    %% Infra and Process Spawning
-    ELN_EL -->|"Spawn"| SA
-    SA -->|"Inform"| ELN_EL
-    SA -->|"Starts"| B
-    B -->|"Report"| ELN_EL
-    TR -->|"Assigned"| ELN_EL
-    CB -->|"Modify Worker Bee"| WB_C
-
-    %% =========================================
-    %% SHARED MEMORY & LOGS ACCESS
-    %% =========================================
-
-    %% Worker Bees Access (link to node inside Graph subgraph)
-    AN <-->|"Read/Write"| WTM
-    AN <-->|"Read/Write"| SM
-
-    %% Queen Bee Access
-    QB_C <-->|"Read/Write"| WTM
-    QB_EL <-->|"Read/Write"| SM
-
-    %% Credentials Access
-    CS -->|"Read Access"| QB_C
-```
-
 ## 貢献
-
-コミュニティからの貢献を歓迎します！特にフレームワークのツール、統合、サンプルエージェントの構築にご協力いただける方を募集しています（[#2805 を確認](https://github.com/aden-hive/hive/issues/2805)）。機能拡張に興味がある方にとって、ここは最適な出発点です。ガイドラインについては [CONTRIBUTING.md](../../CONTRIBUTING.md) をご覧ください。
+コミュニティからの貢献を歓迎します！特に、フレームワークのツール、統合、サンプルエージェントの構築にご協力いただける方を募集しています（[#2805 を確認](https://github.com/aden-hive/hive/issues/2805)）。機能拡張に興味がある方にとって、ここは最適な出発点です。ガイドラインについては [CONTRIBUTING.md](../../CONTRIBUTING.md) をご覧ください。
 
 **重要：** PR を提出する前に、まず Issue にアサインされてください。Issue にコメントして担当を申請すると、メンテナーがアサインします。再現手順と提案を含む Issue が優先されます。これにより重複作業を防ぐことができます。
 
@@ -358,7 +233,7 @@ flowchart TB
 
 ## チームに参加
 
-**採用中です！** エンジニアリング、リサーチ、マーケティングの役職で私たちに参加してください。
+**採用中です！** エンジニアリング、リサーチ、市場開拓（go-to-market）の役職で私たちに参加してください。
 
 [オープンポジションを見る](https://jobs.adenhq.com/a8cec478-cdbc-473c-bbd4-f4b7027ec193/applicant)
 
@@ -374,7 +249,7 @@ flowchart TB
 
 **Q: Hive はどの LLM プロバイダーをサポートしていますか？**
 
-Hive は LiteLLM 統合を通じて 100 以上の LLM プロバイダーをサポートしており、OpenAI（GPT-4、GPT-4o）、Anthropic（Claude モデル）、Google Gemini、DeepSeek、Mistral、Groq などが含まれます。適切な API キー環境変数を設定し、モデル名を指定するだけです。Claude、GLM、Gemini が最高のパフォーマンスを発揮するため、推奨されます。
+Hive は LiteLLM 統合を通じて 100 以上の LLM プロバイダーをサポートしており、OpenAI（GPT-4、GPT-4o）、Anthropic（Claude モデル）、Google Gemini、DeepSeek、Mistral、Groq、OpenRouter、Hive LLM が含まれます。適切な API キー環境変数を設定し、モデル名を指定するだけです。プロバイダー固有の設定例については [docs/configuration.md](../configuration.md) をご覧ください。
 
 **Q: Ollama のようなローカル AI モデルで Hive を使用できますか？**
 
@@ -382,19 +257,15 @@ Hive は LiteLLM 統合を通じて 100 以上の LLM プロバイダーをサ�
 
 **Q: Hive は他のエージェントフレームワークと何が違いますか？**
 
-Hive はコーディングエージェントを使用して自然言語の目標からエージェントシステム全体を生成します—ワークフローをハードコードしたり、グラフを手動で定義したりする必要はありません。エージェントが失敗すると、フレームワークは自動的に障害データをキャプチャし、[エージェントグラフを進化](../key_concepts/evolution.md)させ、再デプロイします。この自己改善ループは Aden 独自のものです。
+Hive は、単一エージェントや手作業で配線したエージェントグラフではなく、**エージェントのコロニー**を実行します。ほとんどのフレームワークでは、個別のノードとエッジからなるグラフをコンパイルさせられますが、Hive には実行プリミティブが 1 つしかありません—Queen は文字どおりエージェントループそのものであり、すべての worker はその [clone](../key_concepts/the_loop.md) です。オーケストレーションはコンパイルされた DAG ではなく、実行時の `run_worker` によるファンアウトであり、コロニーはデータバッファではなく [共有トラッカー台帳](../key_concepts/coordination.md) を通じて連携します。この「1 つのループ、多数のループ」というコアの上に、Hive は本番向けハーネス—クラッシュセーフな一時停止／再開、コスト制御、リアルタイム可観測性、帯域外のヒューマンインザループ—を提供します。エージェントの種類が 1 つしかないため、これらはすべてのエージェントに継承されます。[アーキテクチャ概要](../architecture/README.md) をご覧ください。
 
 **Q: Hive はオープンソースですか？**
 
 はい、Hive は Apache License 2.0 の下で完全にオープンソースです。コミュニティの貢献とコラボレーションを積極的に奨励しています。
 
-**Q: Hive は複雑な本番スケールのユースケースに対応できますか？**
-
-はい。Hive は自動障害回復、リアルタイム可観測性、コスト制御、水平スケーリングサポートなどの機能を備え、本番環境向けに明確に設計されています。フレームワークはシンプルな自動化から複雑なマルチエージェントワークフローまで対応します。
-
 **Q: Hive はヒューマンインザループワークフローをサポートしていますか？**
 
-はい、Hive は人間の入力のために実行を一時停止する介入ノードを通じて、[ヒューマンインザループ](../key_concepts/graph.md#human-in-the-loop)ワークフローを完全にサポートしています。設定可能なタイムアウトとエスカレーションポリシーが含まれており、人間の専門家と AI エージェントのシームレスなコラボレーションを可能にします。
+はい。Queen は、アカウントに紐づいた Slack/Telegram チャネルである **Sentinel** を通じて、帯域外で人間へエスカレーションします。エージェントループは一時停止し（状態をディスクに永続化し）、人間に通知し、返信があると中断したまさにその地点から再開します。エスカレーションはグラフ内のノードではないため、コロニー内のどのエージェントも、設定可能なタイムアウトとエスカレーションポリシーとともに、いつでも人間の判断を仰ぐために停止できます。[アーキテクチャ概要](../architecture/README.md#reliability-is-in-the-primitive) をご覧ください。
 
 **Q: Hive はどのプログラミング言語をサポートしていますか？**
 
@@ -402,19 +273,29 @@ Hive フレームワークは Python で構築されています。JavaScript/Ty
 
 **Q: Hive エージェントは外部ツールや API と連携できますか？**
 
-はい。Aden の SDK ラップノードは組み込みのツールアクセスを提供し、フレームワークは柔軟なツールエコシステムをサポートします。エージェントはノードアーキテクチャを通じて外部 API、データベース、サービスと統合できます。
+はい。コロニー内のすべてのエージェントは組み込みのツールアクセスを持ち、Hive は MCP を通じて外部 API、データベース、サービスに接続します—100 以上の統合ツールに加え、ネイティブ拡張機能による汎用コンピュータ操作（General Compute Use）とブラウザ操作（Browser Use）を含みます。Queen とその worker は 1 つのツール面を共有するため、あなたが追加した機能はコロニー全体で利用可能になります。
 
 **Q: Hive のコスト制御はどのように機能しますか？**
 
-Hive は支出制限、スロットル、自動モデル劣化ポリシーを含む詳細な予算制御を提供します。チーム、エージェント、またはワークフローレベルで予算を設定でき、リアルタイムのコスト追跡とアラートが利用できます。
+Hive は、支出制限、スロットル、自動的なモデル劣化ポリシーを含む、きめ細かな予算制御を提供します。チーム、エージェント、またはワークフローのレベルで予算を設定でき、リアルタイムのコスト追跡とアラートが利用できます。
 
 **Q: 例やドキュメントはどこにありますか？**
 
-完全なガイド、API リファレンス、入門チュートリアルについては [docs.adenhq.com](https://docs.adenhq.com/) をご覧ください。リポジトリには `docs/` フォルダ内のドキュメントと包括的な[開発者ガイド](../developer-guide.md)も含まれています。
+完全なガイド、API リファレンス、入門チュートリアルについては [docs.adenhq.com](https://docs.adenhq.com/) をご覧ください。リポジトリには `docs/` フォルダ内のドキュメントと、包括的な[開発者ガイド](../developer-guide.md)も含まれています。
 
 **Q: Aden に貢献するにはどうすればよいですか？**
 
 貢献を歓迎します！リポジトリをフォークし、機能ブランチを作成し、変更を実装し、プルリクエストを提出してください。詳細なガイドラインについては [CONTRIBUTING.md](../../CONTRIBUTING.md) をご覧ください。
+
+## Star History
+
+<a href="https://www.star-history.com/?type=date&repos=aden-hive%2Fhive">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&theme=dark&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+ </picture>
+</a>
 
 ---
 

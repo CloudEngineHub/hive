@@ -40,7 +40,7 @@ Register an MCP server as a tool source for your agent.
     "command": "python",
     "args": "[\"mcp_server.py\", \"--stdio\"]",
     "cwd": "../tools",
-    "description": "Aden tools for web search and file operations"
+    "description": "Hive tools for web search and file operations"
   }
 }
 ```
@@ -70,7 +70,7 @@ Register an MCP server as a tool source for your agent.
     "command": "python",
     "args": ["mcp_server.py", "--stdio"],
     "cwd": "../tools",
-    "description": "Aden tools..."
+    "description": "Hive tools..."
   },
   "tools_discovered": 5,
   "tools": [
@@ -102,7 +102,7 @@ List all registered MCP servers.
       "command": "python",
       "args": ["mcp_server.py", "--stdio"],
       "cwd": "../tools",
-      "description": "Aden tools..."
+      "description": "Hive tools..."
     }
   ],
   "total": 1
@@ -284,7 +284,7 @@ When you export an agent with registered MCP servers, an `mcp_servers.json` file
       "command": "python",
       "args": ["mcp_server.py", "--stdio"],
       "cwd": "../tools",
-      "description": "Aden tools for web search and file operations"
+      "description": "Hive tools for web search and file operations"
     }
   ]
 }

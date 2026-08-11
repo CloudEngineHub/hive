@@ -1,6 +1,6 @@
 # Contributor Guide — Bounty Program
 
-Earn XP, Discord roles, and eventually real money by contributing to the Aden agent framework — from quick fixes to major features and integration work.
+Earn XP, Discord roles, and eventually real money by contributing to the Hive framework — from quick fixes to major features and integration work.
 
 ## Getting Started
 

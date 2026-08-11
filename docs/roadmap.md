@@ -1,6 +1,8 @@
 # Product Roadmap
 
-Aden Agent Framework aims to help developers build outcome-oriented, self-adaptive agents. Please find our roadmap here
+Hive aims to help developers build outcome-oriented, self-adaptive agents. Please find our roadmap here.
+
+> **Note on terminology:** parts of this roadmap predate the v0.10 "Colony" rewrite and use earlier or aspirational vocabulary ("Queen Bee / Worker Bee / Judge Bee", "swarm", "worker graph"). For the **current, shipped** architecture — colonies of agents, one `AgentLoop` primitive shared by the Queen and worker clones, and coordination through a shared tracker — the [Architecture Overview](architecture/README.md) and [key concepts](key_concepts/colony.md) are the source of truth. Roadmap items below describe direction, not necessarily current implementation.
 
 ```mermaid
 flowchart TB

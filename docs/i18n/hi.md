@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="100%" alt="Hive Banner" src="https://github.com/user-attachments/assets/a027429b-5d3c-4d34-88e4-0feaeaabbab3" />
+  <img width="100%" alt="Hive Banner" src="https://asset.acho.io/github/img/banner.gif" />
 </p>
 
 <p align="center">
@@ -23,11 +23,12 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Agent_Harness-Runtime_Layer-ff6600?style=flat-square" alt="Agent Harness" />
   <img src="https://img.shields.io/badge/AI_Agents-Self--Improving-brightgreen?style=flat-square" alt="AI Agents" />
   <img src="https://img.shields.io/badge/Multi--Agent-Systems-blue?style=flat-square" alt="Multi-Agent" />
   <img src="https://img.shields.io/badge/Headless-Development-purple?style=flat-square" alt="Headless" />
   <img src="https://img.shields.io/badge/Human--in--the--Loop-orange?style=flat-square" alt="HITL" />
-  <img src="https://img.shields.io/badge/Production--Ready-red?style=flat-square" alt="Production" />
+  <img src="https://img.shields.io/badge/Browser-Use-red?style=flat-square" alt="Browser Use" />
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/OpenAI-supported-412991?style=flat-square&logo=openai" alt="OpenAI" />
@@ -35,37 +36,55 @@
   <img src="https://img.shields.io/badge/Google_Gemini-supported-4285F4?style=flat-square&logo=google" alt="Gemini" />
 </p>
 
+<p align="center"><em>प्रोडक्शन वर्कलोड के लिए एजेंट हार्नेस — स्टेट प्रबंधन, विफलता रिकवरी, ऑब्ज़र्वेबिलिटी और मानवीय निगरानी, ताकि आपके एजेंट वास्तव में चलें।</em></p>
+
 ## अवलोकन
 
-वर्कफ़्लो को हार्डकोड किए बिना स्वायत्त, भरोसेमंद और स्वयं-सुधार करने वाले AI एजेंट बनाएँ। कोडिंग एजेंट के साथ बातचीत के माध्यम से अपना लक्ष्य परिभाषित करें, और फ़्रेमवर्क डायनेमिक रूप से बनाए गए कनेक्शन कोड के साथ एक नोड ग्राफ़ उत्पन्न करता है। जब कुछ विफल होता है, फ़्रेमवर्क उस त्रुटि का डेटा कैप्चर करता है, कोडिंग एजेंट के माध्यम से एजेंट को विकसित करता है और उसे दोबारा डिप्लॉय करता है। एकीकृत human-in-the-loop नोड्स, क्रेडेंशियल प्रबंधन और रीयल-टाइम मॉनिटरिंग आपको अनुकूलनशीलता खोए बिना पूरा नियंत्रण देते हैं।
+OpenHive **एजेंट्स की कॉलोनियों (colonies)** के लिए एक ज़ीरो-सेटअप, मॉडल-एग्नॉस्टिक रनटाइम है। एक कॉलोनी विशेषीकृत एजेंट्स का एक समूह है जो मिलकर एक व्यावसायिक प्रक्रिया चलाते हैं: एक **Queen** (क्वीन) — स्थायी, क्लाइंट-फेसिंग अगुआ — साथ ही उतने **worker** (वर्कर) एजेंट जितने काम को चाहिए। आप परिणाम का वर्णन करते हैं; Queen काम करती है, फिर उसके इर्द-गिर्द एक कॉलोनी विकसित करती है ताकि उस काम को भरोसेमंद रूप से और बड़े पैमाने पर चलाया जा सके।
+
+इसके नीचे का तंत्र है **एक लूप जो कई लूप्स को नियंत्रित करता है**। Hive में एक ही एक्ज़ीक्यूशन प्रिमिटिव है: Queen *स्वयं* एक एजेंट लूप है, और हर worker उसका एक **clone** (क्लोन) है — वही टूल्स, वही मॉडल, अपना अलग कार्य। न कोई ग्राफ़ कंपाइल करना है और न कोई ऑर्केस्ट्रेशन बॉयलरप्लेट लिखनी है। कॉलोनी एक साझा लेजर और एक स्थायी प्लान के माध्यम से समन्वय करती है, जिसमें क्रैश-सेफ स्टेट, गहरी ऑब्ज़र्वेबिलिटी और मानवीय निगरानी उसी एक प्रिमिटिव में निर्मित होती हैं जिसे हर एजेंट साझा करता है। यह कैसे काम करता है, यह जानने के लिए **[Architecture Overview](../architecture/README.md)** देखें।
+
+## विशेषताएँ
+
+- ✅ एजेंट्स की कॉलोनियाँ — एक Queen समानांतर, लंबे समय तक चलने वाले काम के लिए मांग पर worker clones स्पॉन करती है
+- ✅ एक प्रिमिटिव, कई लूप्स — कोई ग्राफ़ वायर नहीं करना; Queen रनटाइम पर कॉलोनी को विकसित करती है
+- ✅ डेटा बफ़र के बिना समन्वय के लिए साझा tracker लेजर + स्थायी टास्क प्लान
+- ✅ CEO-शैली की रूटिंग और विकसित होती, स्कोप्ड मेमोरी के साथ Queen पर्सोना
+- ✅ क्रैश-सेफ पार्क/रिज़्यूम, लागत प्रवर्तन, और आउट-ऑफ़-बैंड human-in-the-loop (Sentinel)
+- ✅ ज़ीरो सेटअप — किसी तकनीकी कॉन्फ़िगरेशन की आवश्यकता नहीं
+- ✅ नेटिव एक्सटेंशन के साथ General Compute Use और Browser Use
+- ✅ कस्टम मॉडल सपोर्ट
 
 पूर्ण दस्तावेज़ीकरण, उदाहरणों और मार्गदर्शिकाओं के लिए [adenhq.com](https://adenhq.com) पर जाएँ।
 
-[![Hive Demo](https://img.youtube.com/vi/XDOG9fOaLjU/maxresdefault.jpg)](https://www.youtube.com/watch?v=XDOG9fOaLjU)
+यह देखने के लिए कि AI द्वारा कौन-से जॉब्स ऑटोमेट किए जा रहे हैं, [HoneyComb](http://honeycomb.open-hive.com/) पर जाएँ। यह जॉब्स के लिए एक स्टॉक मार्केट है, जो हमारे समुदाय की AI एजेंट प्रगति से संचालित होता है। आप इस आधार पर जॉब्स को लॉन्ग और शॉर्ट कर सकते हैं (असली पैसे से नहीं बल्कि compute token से) कि आपको कितना लगता है कि किसी जॉब को AI द्वारा प्रतिस्थापित किया जाएगा।
+
+https://github.com/user-attachments/assets/bf10edc3-06ba-48b6-98ba-d069b15fb69d
+
 
 ## Hive किसके लिए है?
 
-Hive उन डेवलपर्स और टीमों के लिए डिज़ाइन किया गया है जो जटिल वर्कफ़्लो को मैन्युअली वायर किए बिना **प्रोडक्शन-ग्रेड AI एजेंट** बनाना चाहते हैं।
+Hive उन टीमों के लिए मल्टी-एजेंट हार्नेस लेयर है जो AI एजेंट्स को प्रोटोटाइप से प्रोडक्शन तक ले जा रही हैं। Openclaw और Cowork जैसे सिंगल एजेंट व्यक्तिगत कार्यों को काफ़ी अच्छे से पूरा कर सकते हैं, लेकिन व्यावसायिक प्रक्रियाओं को पूरा करने की कठोरता (rigor) उनमें नहीं होती।
 
 Hive आपके लिए उपयुक्त है यदि आप:
 
 - ऐसे AI एजेंट चाहते हैं जो **वास्तविक व्यावसायिक प्रक्रियाओं को निष्पादित करें**, केवल डेमो नहीं
-- **हार्डकोडेड वर्कफ़्लो** के बजाय **लक्ष्य-आधारित विकास** पसंद करते हैं
+- ऐसा **रनटाइम चाहते हैं जो स्टेट, रिकवरी और समानांतर निष्पादन को** बड़े पैमाने पर संभाले
 - ऐसे **स्वयं-सुधार करने वाले और अनुकूली एजेंट** चाहते हैं जो समय के साथ बेहतर हों
-- **मानव-इन-द-लूप नियंत्रण**, ऑब्ज़र्वेबिलिटी और लागत सीमाएँ आवश्यक हैं
-- एजेंट्स को **प्रोडक्शन वातावरण** में चलाने की योजना है
+- **human-in-the-loop नियंत्रण**, ऑब्ज़र्वेबिलिटी और लागत सीमाएँ आवश्यक हैं
+- एजेंट्स को **प्रोडक्शन** में चलाने की योजना है जहाँ अपटाइम, लागत और ऑडिटेबिलिटी मायने रखते हैं
 
-Hive उपयुक्त नहीं हो सकता यदि आप केवल साधारण एजेंट चेन्स या एकबारगी स्क्रिप्ट्स के साथ प्रयोग कर रहे हैं।
+Hive सर्वोत्तम उपयुक्त नहीं हो सकता यदि आप केवल साधारण एजेंट चेन्स या एकबारगी स्क्रिप्ट्स के साथ प्रयोग कर रहे हैं।
 
 ## Hive का उपयोग कब करें?
 
-Hive का उपयोग करें जब आपको आवश्यकता हो:
+Hive का उपयोग तब करें जब बाधा (bottleneck) अब मॉडल नहीं बल्कि उसके इर्द-गिर्द का हार्नेस हो:
 
-- लंबे समय तक चलने वाले, स्वायत्त एजेंट
-- मजबूत गार्डरेल्स, प्रक्रिया और नियंत्रण
-- विफलताओं पर आधारित निरंतर सुधार
-- मल्टी-एजेंट समन्वय
-- एक ऐसा फ़्रेमवर्क जो आपके लक्ष्यों के साथ विकसित हो
+- लंबे समय तक चलने वाले एजेंट जिन्हें **स्टेट परसिस्टेंस और क्रैश रिकवरी** की आवश्यकता है
+- ऐसे प्रोडक्शन वर्कलोड जिन्हें **लागत प्रवर्तन, ऑब्ज़र्वेबिलिटी और ऑडिट ट्रेल्स** की आवश्यकता है
+- ऐसे एजेंट जो रिफ्लेक्शन, स्कोप्ड मेमोरी और सीखे गए स्किल्स के माध्यम से **समय के साथ बेहतर होते हैं**
+- **साझा tracker लेजर और स्थायी प्लान** के माध्यम से समन्वित समानांतर, मल्टी-एजेंट काम
+- ऐसा फ़्रेमवर्क जो मॉडल के सुधारों से लड़ने के बजाय **उनके साथ स्केल करता है**
 
 ## त्वरित लिंक
 
@@ -73,7 +92,7 @@ Hive का उपयोग करें जब आपको आवश्यक�
 - **[सेल्फ-होस्टिंग गाइड](https://docs.adenhq.com/getting-started/quickstart)** - Hive को अपने इंफ़्रास्ट्रक्चर पर डिप्लॉय करें
 - **[चेंजलॉग](https://github.com/aden-hive/hive/releases)** - नवीनतम अपडेट और रिलीज़
 - **[रोडमैप](../roadmap.md)** - आगामी सुविधाएँ और योजनाएँ
-- **[इशू रिपोर्ट करें](https://github.com/adenhq/hive/issues)** - बग रिपोर्ट और फ़ीचर अनुरोध
+- **[इशू रिपोर्ट करें](https://github.com/aden-hive/hive/issues)** - बग रिपोर्ट और फ़ीचर अनुरोध
 - **[योगदान करें](../../CONTRIBUTING.md)** - योगदान करने और PR सबमिट करने का तरीका
 
 ## त्वरित शुरुआत
@@ -81,9 +100,10 @@ Hive का उपयोग करें जब आपको आवश्यक�
 ### आवश्यकताएँ
 
 - एजेंट विकास के लिए Python 3.11+
-- एजेंट स्किल्स का उपयोग करने के लिए Claude Code, Codex CLI, या Cursor
+- एक LLM प्रदाता जो एजेंट्स को शक्ति देता है
+- **ripgrep (वैकल्पिक, Windows पर अनुशंसित):** `terminal_rg` / `terminal_glob` सर्च टूल्स तेज़ फ़ाइल सर्च के लिए ripgrep का उपयोग करते हैं। यदि इंस्टॉल न हो, तो एक Python फ़ॉलबैक का उपयोग किया जाता है। Windows पर: `winget install BurntSushi.ripgrep` या `scoop install ripgrep`
 
-> **विंडोज उपयोगकर्ताओं के लिए नोट:** इस फ़्रेमवर्क को चलाने के लिए **WSL (Windows Subsystem for Linux)** या **Git Bash** का उपयोग करने की दृढ़ता से अनुशंसा की जाती है। कुछ मुख्य ऑटोमेशन स्क्रिप्ट्स मानक Command Prompt या PowerShell में सही ढंग से निष्पादित नहीं हो सकती हैं।
+> **Windows उपयोगकर्ता:** नेटिव Windows को `quickstart.ps1` और `hive.ps1` के माध्यम से सपोर्ट किया जाता है। इन्हें PowerShell 5.1+ में चलाएँ। WSL भी एक विकल्प है लेकिन आवश्यक नहीं।
 
 ### इंस्टॉलेशन
 
@@ -97,9 +117,11 @@ Hive का उपयोग करें जब आपको आवश्यक�
 git clone https://github.com/aden-hive/hive.git
 cd hive
 
-
-# Run quickstart setup
+# Run quickstart setup (macOS/Linux)
 ./quickstart.sh
+
+# Windows (PowerShell)
+.\quickstart.ps1
 ```
 
 यह सेट अप करता है:
@@ -107,16 +129,16 @@ cd hive
 - **framework** - मुख्य एजेंट रनटाइम और ग्राफ़ एक्ज़ीक्यूटर (`core/.venv` में)
 - **aden_tools** - एजेंट क्षमताओं के लिए MCP टूल्स (`tools/.venv` में)
 - **credential store** - एन्क्रिप्टेड API कुंजी भंडारण (`~/.hive/credentials`)
-- **LLM provider** - इंटरैक्टिव डिफ़ॉल्ट मॉडल कॉन्फ़िगरेशन
+- **LLM provider** - इंटरैक्टिव डिफ़ॉल्ट मॉडल कॉन्फ़िगरेशन, जिसमें Hive LLM और OpenRouter शामिल हैं
 - `uv` के साथ सभी आवश्यक Python डिपेंडेंसीज़
 
-- अंत में, यह आपके ब्राउज़र में open hive इंटरफ़ेस शुरू करेगा
+- अंत में, यह आपके ब्राउज़र में Hive इंटरफ़ेस खोलेगा
 
-<img width="2500" height="1214" alt="home-screen" src="https://github.com/user-attachments/assets/134d897f-5e75-4874-b00b-e0505f6b45c4" />
+> **टिप:** डैशबोर्ड को बाद में फिर से खोलने के लिए, प्रोजेक्ट डायरेक्टरी से `hive open` चलाएँ।
 
 ### अपना पहला एजेंट बनाएँ
 
-होम इनपुट बॉक्स में वह एजेंट टाइप करें जिसे आप बनाना चाहते हैं
+होम इनपुट बॉक्स में वह एजेंट टाइप करें जिसे आप बनाना चाहते हैं। Queen आपसे प्रश्न पूछेगी और आपके साथ मिलकर एक समाधान तैयार करेगी।
 
 <img width="2500" height="1214" alt="Image" src="https://github.com/user-attachments/assets/1ce19141-a78b-46f5-8d64-dbf987e048f4" />
 
@@ -124,54 +146,48 @@ cd hive
 
 "Try a sample agent" पर क्लिक करें और टेम्पलेट्स देखें। आप किसी टेम्पलेट को सीधे चला सकते हैं या मौजूदा टेम्पलेट के ऊपर अपना संस्करण बनाने का विकल्प चुन सकते हैं।
 
-## विशेषताएँ
+### एजेंट चलाएँ
 
-- **Browser-Use** - कठिन कार्यों को पूरा करने के लिए अपने कंप्यूटर पर ब्राउज़र को नियंत्रित करें
-- **समानांतर निष्पादन** - उत्पन्न ग्राफ़ को समानांतर में निष्पादित करें। इस तरह आपके लिए कई एजेंट एक साथ कार्य पूरा कर सकते हैं
-- **[लक्ष्य-आधारित उत्पादन](../key_concepts/goals_outcome.md)** - प्राकृतिक भाषा में उद्देश्य परिभाषित करें; कोडिंग एजेंट उन्हें हासिल करने के लिए एजेंट ग्राफ़ और कनेक्शन कोड उत्पन्न करता है
-- **[अनुकूलनशीलता](../key_concepts/evolution.md)** - फ़्रेमवर्क विफलताओं को कैप्चर करता है, उद्देश्यों के अनुसार कैलिब्रेट करता है, और एजेंट ग्राफ़ को विकसित करता है
-- **[डायनेमिक नोड कनेक्शन](../key_concepts/graph.md)** - पूर्व-परिभाषित किनारों के बिना; आपके लक्ष्यों के आधार पर किसी भी सक्षम LLM द्वारा कनेक्शन कोड उत्पन्न किया जाता है
-- **SDK-रैप्ड नोड्स** - प्रत्येक नोड को साझा मेमोरी, स्थानीय RLM मेमोरी, मॉनिटरिंग, टूल्स और LLM एक्सेस डिफ़ॉल्ट रूप से मिलता है
-- **[मानव-इन-द-लूप](../key_concepts/graph.md#human-in-the-loop)** - मानव हस्तक्षेप नोड्स जो मानव इनपुट के लिए निष्पादन को रोकते हैं, कॉन्फ़िगर करने योग्य टाइमआउट और एस्केलेशन के साथ
-- **रीयल-टाइम ऑब्ज़र्वेबिलिटी** - एजेंट निष्पादन, निर्णयों और नोड-से-नोड संचार की लाइव मॉनिटरिंग के लिए WebSocket स्ट्रीमिंग
-- **प्रोडक्शन के लिए तैयार** - स्वयं-होस्ट करने योग्य, स्केल और विश्वसनीयता के लिए निर्मित
+अब आप किसी एजेंट को चुनकर (मौजूदा एजेंट या उदाहरण एजेंट) चला सकते हैं। आप ऊपर बाईं ओर Run बटन पर क्लिक कर सकते हैं, या Queen एजेंट से बात कर सकते हैं और वह आपके लिए एजेंट चला सकती है।
+
+<img width="2549" height="1174" alt="Screenshot 2026-03-12 at 9 27 36 PM" src="https://github.com/user-attachments/assets/7c7d30fa-9ceb-4c23-95af-b1caa405547d" />
 
 ## इंटीग्रेशन
 
 <a href="https://github.com/aden-hive/hive/tree/main/tools/src/aden_tools/tools"><img width="100%" alt="Integration" src="https://github.com/user-attachments/assets/a1573f93-cf02-4bb8-b3d5-b305b05b1e51" /></a>
 Hive मॉडल-एग्नॉस्टिक और सिस्टम-एग्नॉस्टिक बनाया गया है।
 
-- **LLM लचीलापन** - Hive फ़्रेमवर्क विभिन्न प्रकार के LLMs को सपोर्ट करने के लिए डिज़ाइन किया गया है, जिसमें LiteLLM-संगत प्रदाताओं के माध्यम से होस्टेड और लोकल मॉडल शामिल हैं।
-- **व्यावसायिक सिस्टम कनेक्टिविटी** - Hive फ़्रेमवर्क CRM, सपोर्ट, मैसेजिंग, डेटा, फ़ाइल और आंतरिक APIs जैसे सभी प्रकार के व्यावसायिक सिस्टम से MCP के माध्यम से टूल्स के रूप में कनेक्ट करने के लिए डिज़ाइन किया गया है।
+- **LLM लचीलापन** - Hive Framework, LiteLLM-संगत प्रदाताओं के माध्यम से Anthropic, OpenAI, OpenRouter, Hive LLM और अन्य होस्टेड या लोकल मॉडलों को सपोर्ट करता है।
+- **व्यावसायिक सिस्टम कनेक्टिविटी** - Hive Framework को MCP के माध्यम से CRM, सपोर्ट, मैसेजिंग, डेटा, फ़ाइल और आंतरिक APIs जैसे सभी प्रकार के व्यावसायिक सिस्टम से टूल्स के रूप में कनेक्ट करने के लिए डिज़ाइन किया गया है।
 
-## Aden क्यों
+## Hive क्यों
 
-Hive जेनेरिक एजेंट्स के बजाय वास्तविक व्यावसायिक प्रक्रियाओं को चलाने वाले एजेंट उत्पन्न करने पर केंद्रित है। आपको मैन्युअली वर्कफ़्लो डिज़ाइन करने, एजेंट इंटरैक्शन्स परिभाषित करने और विफलताओं को प्रतिक्रियात्मक रूप से संभालने की आवश्यकता के बजाय, Hive इस पैरेडाइम को उलट देता है: **आप परिणामों का वर्णन करते हैं, और सिस्टम अपने-आप तैयार हो जाता है**—एक परिणाम-उन्मुख, अनुकूली अनुभव प्रदान करता है जिसमें उपयोग में आसान टूल्स और इंटीग्रेशन्स का सेट होता है।
+जैसे-जैसे मॉडल बेहतर होते हैं, एजेंट क्या कर सकते हैं इसकी ऊपरी सीमा बढ़ती है — लेकिन उनकी विश्वसनीयता और प्रोडक्शन मूल्य हार्नेस द्वारा निर्धारित होते हैं। Hive जेनेरिक एजेंट्स के बजाय वास्तविक व्यावसायिक प्रक्रियाओं को चलाने पर केंद्रित है। आपको एक वर्कफ़्लो ग्राफ़ को हाथ से वायर करने, हर एजेंट इंटरैक्शन को परिभाषित करने और विफलताओं को प्रतिक्रियात्मक रूप से संभालने पर बाध्य करने के बजाय, Hive इस पैरेडाइम को उलट देता है: **आप परिणाम का वर्णन करते हैं, Queen पहले काम करती है, फिर उसे स्केल करने के लिए एक कॉलोनी विकसित करती है** — उपयोग में आसान टूल्स और इंटीग्रेशन्स के सेट के साथ एक परिणाम-उन्मुख, अनुकूली अनुभव।
 
 ```mermaid
 flowchart LR
-    GOAL["Define Goal"] --> GEN["Auto-Generate Graph"]
-    GEN --> EXEC["Execute Agents"]
-    EXEC --> MON["Monitor & Observe"]
-    MON --> CHECK{{"Pass?"}}
+    GOAL["Describe Outcome"] --> PILOT["Queen Pilots\n(does one unit herself)"]
+    PILOT --> SYS["Systematize\n(skill + playbook)"]
+    SYS --> FAN["Fan Out\n(spawn worker clones)"]
+    FAN --> CONV["Converge\n(shared tracker ledger)"]
+    CONV --> CHECK{{"Done?"}}
     CHECK -- "Yes" --> DONE["Deliver Result"]
-    CHECK -- "No" --> EVOLVE["Evolve Graph"]
-    EVOLVE --> EXEC
+    CHECK -- "No" --> FAN
 
     GOAL -.- V1["Natural Language"]
-    GEN -.- V2["Instant Architecture"]
-    EXEC -.- V3["Easy Integrations"]
-    MON -.- V4["Full visibility"]
-    EVOLVE -.- V5["Adaptability"]
+    PILOT -.- V2["Prove the path"]
+    SYS -.- V3["Repeatable process"]
+    FAN -.- V4["Parallel at scale"]
+    CONV -.- V5["Resume by construction"]
     DONE -.- V6["Reliable outcomes"]
 
     style GOAL fill:#ffbe42,stroke:#cc5d00,stroke-width:2px,color:#333
-    style GEN fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
-    style EXEC fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
-    style MON fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style PILOT fill:#ffb100,stroke:#cc5d00,stroke-width:2px,color:#333
+    style SYS fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style FAN fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
+    style CONV fill:#ff9800,stroke:#cc5d00,stroke-width:2px,color:#fff
     style CHECK fill:#fff59d,stroke:#ed8c00,stroke-width:2px,color:#333
     style DONE fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
-    style EVOLVE fill:#e8763d,stroke:#cc5d00,stroke-width:2px,color:#fff
     style V1 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V2 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
     style V3 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
@@ -180,160 +196,20 @@ flowchart LR
     style V6 fill:#fff,stroke:#ed8c00,stroke-width:1px,color:#cc5d00
 ```
 
-### Hive की बढ़त
-
-| पारंपरिक फ़्रेमवर्क्स                | Hive                                       |
-| ------------------------------------ | ------------------------------------------ |
-| एजेंट वर्कफ़्लो को हार्डकोड करना     | प्राकृतिक भाषा में लक्ष्यों का वर्णन       |
-| ग्राफ़ की मैन्युअल परिभाषा           | स्वतः-उत्पन्न एजेंट ग्राफ़                 |
-| त्रुटियों का प्रतिक्रियात्मक प्रबंधन | परिणाम-मूल्यांकन और अनुकूलनशीलता           |
-| स्थिर टूल कॉन्फ़िगरेशन               | SDK-रैप्ड डायनेमिक नोड्स                   |
-| अलग मॉनिटरिंग सेटअप                  | एकीकृत रीयल-टाइम ऑब्ज़र्वेबिलिटी           |
-| DIY बजट प्रबंधन                      | एकीकृत लागत नियंत्रण और डिग्रेडेशन नीतियाँ |
-
 ### यह कैसे काम करता है
 
-1. **[अपना लक्ष्य परिभाषित करें](../key_concepts/goals_outcome.md)** → सरल भाषा में बताएं कि आप क्या हासिल करना चाहते हैं
-2. **कोडिंग एजेंट उत्पन्न करता है** → [एजेंट ग्राफ़](../key_concepts/graph.md), कनेक्शन कोड और टेस्ट केस तैयार करता है
-3. **[वर्कर एजेंट्स निष्पादन करते हैं](../key_concepts/worker_agent.md)** → SDK-रैप्ड नोड्स पूर्ण ऑब्ज़र्वेबिलिटी और टूल्स तक पहुँच के साथ चलते हैं
-4. **कंट्रोल प्लेन निगरानी करता है** → रीयल-टाइम मेट्रिक्स, बजट प्रवर्तन, नीति प्रबंधन
-5. **[अनुकूलनशीलता](../key_concepts/evolution.md)** → विफलता की स्थिति में, सिस्टम ग्राफ़ को विकसित करता है और स्वचालित रूप से दोबारा डिप्लॉय करता है
-
-## एजेंट चलाएँ
-
-अब आप किसी एजेंट को चुनकर (मौजूदा एजेंट या उदाहरण एजेंट) चला सकते हैं। आप ऊपर बाईं ओर Run बटन पर क्लिक कर सकते हैं, या क्वीन एजेंट से बात कर सकते हैं और वह आपके लिए एजेंट चला सकती है।
+1. **[परिणाम का वर्णन करें](../key_concepts/goals_outcome.md)** → सरल भाषा में बताएँ कि आप क्या चाहते हैं; एक CEO-शैली का राउटर सही [Queen](../key_concepts/queen.md) चुनता है
+2. **Queen पायलट करती है** → वह स्वयं काम की एक इकाई करती है, रास्ते को सिद्ध करती है और उसे साझा tracker में रिकॉर्ड करती है
+3. **[सिस्टमीकरण करें](../key_concepts/improvement.md)** → वह सिद्ध प्रोटोकॉल को एक skill + playbook में बदल देती है — एक दोहराने योग्य प्रक्रिया
+4. **[फैन आउट](../key_concepts/colony.md)** → `run_worker` [worker clones](../key_concepts/worker_agent.md) स्पॉन करता है जो समानांतर में चलते हैं और वापस रिपोर्ट करते हैं
+5. **अभिसरण और निगरानी** → Workers परिणामों को tracker में लिखते हैं; Queen SQL के माध्यम से सत्यापन करती है, रीयल-टाइम मेट्रिक्स, बजट प्रवर्तन और क्रैश-सेफ रिज़्यूम के साथ
 
 ## दस्तावेज़ीकरण
 
-- **[डेवलपर गाइड](../developer-guide.md)** - डेवलपर्स के लिए पूर्ण मार्गदर्शिका
+- **[डेवलपर गाइड](../developer-guide.md)** - डेवलपर्स के लिए व्यापक मार्गदर्शिका
 - [शुरुआत करें](../getting-started.md) - त्वरित सेटअप निर्देश
 - [कॉन्फ़िगरेशन गाइड](../configuration.md) - सभी कॉन्फ़िगरेशन विकल्प
 - [आर्किटेक्चर का अवलोकन](../architecture/README.md) - सिस्टम का डिज़ाइन और संरचना
-
-## रोडमैप
-
-Aden Hive एजेंट फ़्रेमवर्क का उद्देश्य डेवलपर्स को परिणाम-उन्मुख, स्वयं-अनुकूलित एजेंट बनाने में मदद करना है। विवरण के लिए [roadmap.md](../roadmap.md) देखें।
-
-```mermaid
-flowchart TB
-    %% Main Entity
-    User([User])
-
-    %% =========================================
-    %% EXTERNAL EVENT SOURCES
-    %% =========================================
-    subgraph ExtEventSource [External Event Source]
-        E_Sch["Schedulers"]
-        E_WH["Webhook"]
-        E_SSE["SSE"]
-    end
-
-    %% =========================================
-    %% SYSTEM NODES
-    %% =========================================
-    subgraph WorkerBees [Worker Bees]
-        WB_C["Conversation"]
-        WB_SP["System prompt"]
-
-        subgraph Graph [Graph]
-            direction TB
-            N1["Node"] --> N2["Node"] --> N3["Node"]
-            N1 -.-> AN["Active Node"]
-            N2 -.-> AN
-            N3 -.-> AN
-
-            %% Nested Event Loop Node
-            subgraph EventLoopNode [Event Loop Node]
-                ELN_L["listener"]
-                ELN_SP["System Prompt<br/>(Task)"]
-                ELN_EL["Event loop"]
-                ELN_C["Conversation"]
-            end
-        end
-    end
-
-    subgraph JudgeNode [Judge]
-        J_C["Criteria"]
-        J_P["Principles"]
-        J_EL["Event loop"] <--> J_S["Scheduler"]
-    end
-
-    subgraph QueenBee [Queen Bee]
-        QB_SP["System prompt"]
-        QB_EL["Event loop"]
-        QB_C["Conversation"]
-    end
-
-    subgraph Infra [Infra]
-        SA["Sub Agent"]
-        TR["Tool Registry"]
-        WTM["Write through Conversation Memory<br/>(Logs/RAM/Harddrive)"]
-        SM["Shared Memory<br/>(State/Harddrive)"]
-        EB["Event Bus<br/>(RAM)"]
-        CS["Credential Store<br/>(Harddrive/Cloud)"]
-    end
-
-    subgraph PC [PC]
-        B["Browser"]
-        CB["Codebase<br/>v 0.0.x ... v n.n.n"]
-    end
-
-    %% =========================================
-    %% CONNECTIONS & DATA FLOW
-    %% =========================================
-
-    %% External Event Routing
-    E_Sch --> ELN_L
-    E_WH --> ELN_L
-    E_SSE --> ELN_L
-    ELN_L -->|"triggers"| ELN_EL
-
-    %% User Interactions
-    User -->|"Talk"| WB_C
-    User -->|"Talk"| QB_C
-    User -->|"Read/Write Access"| CS
-
-    %% Inter-System Logic
-    ELN_C <-->|"Mirror"| WB_C
-    WB_C -->|"Focus"| AN
-
-    WorkerBees -->|"Inquire"| JudgeNode
-    JudgeNode -->|"Approve"| WorkerBees
-
-    %% Judge Alignments
-    J_C <-.->|"aligns"| WB_SP
-    J_P <-.->|"aligns"| QB_SP
-
-    %% Escalate path
-    J_EL -->|"Report (Escalate)"| QB_EL
-
-    %% Pub/Sub Logic
-    AN -->|"publish"| EB
-    EB -->|"subscribe"| QB_C
-
-    %% Infra and Process Spawning
-    ELN_EL -->|"Spawn"| SA
-    SA -->|"Inform"| ELN_EL
-    SA -->|"Starts"| B
-    B -->|"Report"| ELN_EL
-    TR -->|"Assigned"| ELN_EL
-    CB -->|"Modify Worker Bee"| WB_C
-
-    %% =========================================
-    %% SHARED MEMORY & LOGS ACCESS
-    %% =========================================
-
-    %% Worker Bees Access (link to node inside Graph subgraph)
-    AN <-->|"Read/Write"| WTM
-    AN <-->|"Read/Write"| SM
-
-    %% Queen Bee Access
-    QB_C <-->|"Read/Write"| WTM
-    QB_EL <-->|"Read/Write"| SM
-
-    %% Credentials Access
-    CS -->|"Read Access"| QB_C
-```
 
 ## योगदान करें
 हम समुदाय से योगदान का स्वागत करते हैं! हम विशेष रूप से फ़्रेमवर्क के लिए टूल्स, इंटीग्रेशन्स और उदाहरण एजेंट बनाने में मदद की तलाश में हैं ([#2805 देखें](https://github.com/aden-hive/hive/issues/2805))। यदि आप इसकी कार्यक्षमता बढ़ाने में रुचि रखते हैं, तो यह शुरू करने के लिए सबसे अच्छी जगह है। कृपया दिशानिर्देशों के लिए [CONTRIBUTING.md](../../CONTRIBUTING.md) देखें।
@@ -373,35 +249,31 @@ flowchart TB
 
 **प्रश्न: Hive कौन-कौन से LLM प्रदाताओं को सपोर्ट करता है?**
 
-Hive LiteLLM इंटीग्रेशन के माध्यम से 100 से अधिक LLM प्रदाताओं को सपोर्ट करता है, जिसमें OpenAI (GPT-4, GPT-4o), Anthropic (Claude मॉडल), Google Gemini, DeepSeek, Mistral, Groq और कई अन्य शामिल हैं। बस संबंधित API कुंजी के लिए एनवायरनमेंट वेरिएबल सेट करें और मॉडल का नाम निर्दिष्ट करें। हम Claude, GLM और Gemini के उपयोग की सिफ़ारिश करते हैं क्योंकि इनका प्रदर्शन सबसे अच्छा है।
+Hive, LiteLLM इंटीग्रेशन के माध्यम से 100 से अधिक LLM प्रदाताओं को सपोर्ट करता है, जिसमें OpenAI (GPT-4, GPT-4o), Anthropic (Claude मॉडल), Google Gemini, DeepSeek, Mistral, Groq, OpenRouter और Hive LLM शामिल हैं। बस संबंधित API कुंजी एनवायरनमेंट वेरिएबल सेट करें और मॉडल का नाम निर्दिष्ट करें। प्रदाता-विशिष्ट कॉन्फ़िगरेशन उदाहरणों के लिए [docs/configuration.md](../configuration.md) देखें।
 
 **प्रश्न: क्या मैं Hive का उपयोग Ollama जैसे लोकल AI मॉडलों के साथ कर सकता हूँ?**
 
-हाँ! Hive LiteLLM के माध्यम से लोकल मॉडलों को सपोर्ट करता है। बस `ollama/model-name` फ़ॉर्मेट में मॉडल नाम का उपयोग करें (उदा., `ollama/llama3`, `ollama/mistral`) और सुनिश्चित करें कि Ollama स्थानीय रूप से चल रहा है।
+हाँ! Hive, LiteLLM के माध्यम से लोकल मॉडलों को सपोर्ट करता है। बस `ollama/model-name` फ़ॉर्मेट में मॉडल नाम का उपयोग करें (उदा., `ollama/llama3`, `ollama/mistral`) और सुनिश्चित करें कि Ollama स्थानीय रूप से चल रहा है।
 
 **प्रश्न: Hive को अन्य एजेंट फ़्रेमवर्क्स से अलग क्या बनाता है?**
 
-Hive आपके संपूर्ण एजेंट सिस्टम को प्राकृतिक भाषा में दिए गए लक्ष्यों से कोडिंग एजेंट का उपयोग करके उत्पन्न करता है—आपको वर्कफ़्लो को हार्डकोड करने या मैन्युअली ग्राफ़ परिभाषित करने की आवश्यकता नहीं। जब एजेंट विफल होते हैं, फ़्रेमवर्क स्वचालित रूप से विफलता डेटा कैप्चर करता है, [एजेंट ग्राफ़ को विकसित करता है](../key_concepts/evolution.md), और दोबारा डिप्लॉय करता है। यह स्व-सुधार चक्र Aden के लिए अद्वितीय है।
+Hive **एजेंट्स की कॉलोनियाँ** चलाता है, न कि सिंगल एजेंट या हाथ से वायर किए गए एजेंट ग्राफ़। अधिकांश फ़्रेमवर्क आपको अलग-अलग नोड्स और एजेस का ग्राफ़ कंपाइल करने पर बाध्य करते हैं; Hive में एक ही एक्ज़ीक्यूशन प्रिमिटिव है — Queen *स्वयं* एक एजेंट लूप है, और हर worker उसका एक [clone](../key_concepts/the_loop.md) है। ऑर्केस्ट्रेशन एक रनटाइम `run_worker` फैन-आउट है, न कि कंपाइल किया गया DAG, और कॉलोनी एक डेटा बफ़र के बजाय एक [साझा tracker लेजर](../key_concepts/coordination.md) के माध्यम से समन्वय करती है। उस "एक लूप, कई लूप्स" कोर के ऊपर, Hive एक प्रोडक्शन हार्नेस है — क्रैश-सेफ पार्क/रिज़्यूम, लागत प्रवर्तन, रीयल-टाइम ऑब्ज़र्वेबिलिटी और आउट-ऑफ़-बैंड human-in-the-loop — जो हर एजेंट को विरासत में मिलता है क्योंकि केवल एक ही प्रकार का एजेंट है। [Architecture Overview](../architecture/README.md) देखें।
 
 **प्रश्न: क्या Hive ओपन-सोर्स है?**
 
-हाँ, Hive पूरी तरह से ओपन-सोर्स है और Apache License 2.0 के तहत उपलब्ध है। हम समुदाय के योगदान और सहयोग को सक्रिय रूप से प्रोत्साहित करते हैं।
+हाँ, Hive पूरी तरह से Apache License 2.0 के तहत ओपन-सोर्स है। हम समुदाय के योगदान और सहयोग को सक्रिय रूप से प्रोत्साहित करते हैं।
 
-**प्रश्न: क्या Hive जटिल, प्रोडक्शन-स्केल उपयोग मामलों को संभाल सकता है?**
+**प्रश्न: क्या Hive human-in-the-loop वर्कफ़्लो को सपोर्ट करता है?**
 
-हाँ। Hive स्पष्ट रूप से प्रोडक्शन वातावरण के लिए डिज़ाइन किया गया है, जिसमें स्वचालित विफलता रिकवरी, रीयल-टाइम ऑब्ज़र्वेबिलिटी, लागत नियंत्रण और क्षैतिज स्केलिंग सपोर्ट जैसी सुविधाएँ हैं। फ़्रेमवर्क सरल ऑटोमेशन और जटिल मल्टी-एजेंट वर्कफ़्लो दोनों को संभालता है।
-
-**प्रश्न: क्या Hive ह्यूमन-इन-द-लूप वर्कफ़्लो को सपोर्ट करता है?**
-
-हाँ, Hive [ह्यूमन-इन-द-लूप](../key_concepts/graph.md#human-in-the-loop) वर्कफ़्लो को पूरी तरह सपोर्ट करता है, इंटरवेंशन नोड्स के माध्यम से जो मानव इनपुट के लिए निष्पादन को रोकते हैं। इसमें कॉन्फ़िगर करने योग्य टाइमआउट और एस्केलेशन नीतियाँ शामिल हैं, जिससे मानव विशेषज्ञों और AI एजेंट्स के बीच सहज सहयोग संभव होता है।
+हाँ। एक Queen **Sentinel** के माध्यम से किसी मानव को आउट-ऑफ़-बैंड एस्केलेट करती है — एक अकाउंट-बाउंड Slack/Telegram चैनल। एजेंट लूप पार्क हो जाता है (अपनी स्टेट को डिस्क पर परसिस्ट करते हुए), मानव को सूचित करता है, और जब वे उत्तर देते हैं तो ठीक वहीं से फिर शुरू हो जाता है जहाँ उसने छोड़ा था। चूँकि एस्केलेशन किसी ग्राफ़ में एक नोड नहीं है, इसलिए किसी कॉलोनी का कोई भी एजेंट किसी भी बिंदु पर मानवीय निर्णय के लिए रुक सकता है, कॉन्फ़िगर करने योग्य टाइमआउट और एस्केलेशन नीतियों के साथ। [Architecture Overview](../architecture/README.md#reliability-is-in-the-primitive) देखें।
 
 **प्रश्न: Hive कौन सी प्रोग्रामिंग भाषाओं को सपोर्ट करता है?**
 
-Hive फ़्रेमवर्क Python में बनाया गया है। JavaScript/TypeScript SDK रोडमैप पर है।
+Hive फ़्रेमवर्क Python में बनाया गया है। एक JavaScript/TypeScript SDK रोडमैप पर है।
 
 **प्रश्न: क्या Hive एजेंट बाहरी टूल्स और APIs के साथ इंटरैक्ट कर सकते हैं?**
 
-हाँ। Aden के SDK-रैप्ड नोड्स बिल्ट-इन टूल एक्सेस प्रदान करते हैं, और फ़्रेमवर्क लचीले टूल इकोसिस्टम को सपोर्ट करता है। एजेंट नोड आर्किटेक्चर के माध्यम से बाहरी APIs, डेटाबेस और सेवाओं के साथ इंटीग्रेट हो सकते हैं।
+हाँ। कॉलोनी के हर एजेंट के पास बिल्ट-इन टूल एक्सेस होता है, और Hive, MCP के माध्यम से बाहरी APIs, डेटाबेस और सेवाओं से कनेक्ट होता है — जिसमें 100 से अधिक इंटीग्रेशन टूल्स के साथ-साथ नेटिव एक्सटेंशन के माध्यम से General Compute Use और Browser Use शामिल हैं। चूँकि Queen और उसके workers एक ही टूल सरफेस साझा करते हैं, इसलिए आपके द्वारा जोड़ी गई कोई भी क्षमता पूरी कॉलोनी के लिए उपलब्ध होती है।
 
 **प्रश्न: Hive में लागत नियंत्रण कैसे काम करता है?**
 
@@ -414,6 +286,16 @@ Hive विस्तृत बजट नियंत्रण प्रदान
 **प्रश्न: मैं Aden में योगदान कैसे कर सकता हूँ?**
 
 योगदान का स्वागत है! रिपॉज़िटरी को fork करें, अपनी फ़ीचर ब्रांच बनाएँ, अपने बदलाव लागू करें, और एक pull request सबमिट करें। विस्तृत दिशानिर्देशों के लिए [CONTRIBUTING.md](../../CONTRIBUTING.md) देखें।
+
+## स्टार इतिहास
+
+<a href="https://www.star-history.com/?type=date&repos=aden-hive%2Fhive">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&theme=dark&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=aden-hive/hive&type=date&legend=top-left&sealed_token=vfX1DG8w_KTkonUUtIEjFRLvBopgDzxQpyb8hiYT22sobcDIpvQiMciZghLsDu5hyU3LJs-ZddFjl8eYFx5zRrY-kcMRsfyQ3vAiacsroPoqgRYmZaES3Q" />
+ </picture>
+</a>
 
 ---
 

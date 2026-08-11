@@ -70,7 +70,7 @@ Hive is a good fit if you:
 
 - Want AI agents that **execute real business processes**, not demos
 - Need a **runtime that handles state, recovery, and parallel execution** at scale
-- Need **self-healing and adaptive agents** that improve over time
+- Need **adaptive agents that improve over time** through reflexion, memory, and learned skills
 - Require **human-in-the-loop control**, observability, and cost limits
 - Plan to run agents in **production** where uptime, cost, and auditability matter
 
@@ -126,7 +126,7 @@ cd hive
 
 This sets up:
 
-- **framework** - Core agent runtime and graph executor (in `core/.venv`)
+- **framework** - Core agent runtime and colony runtime (in `core/.venv`)
 - **aden_tools** - MCP tools for agent capabilities (in `tools/.venv`)
 - **credential store** - Encrypted API key storage (`~/.hive/credentials`)
 - **LLM provider** - Interactive default model configuration, including Hive LLM and OpenRouter
@@ -166,10 +166,10 @@ As models improve, the upper bound of what agents can do rises — but their rel
 
 ```mermaid
 flowchart LR
-    GOAL["Describe Outcome"] --> PILOT["Queen Pilots\n(does one unit herself)"]
-    PILOT --> SYS["Systematize\n(skill + playbook)"]
-    SYS --> FAN["Fan Out\n(spawn worker clones)"]
-    FAN --> CONV["Converge\n(shared tracker ledger)"]
+    GOAL["Describe Outcome"] --> PILOT["Queen Pilots<br/>(does one unit herself)"]
+    PILOT --> SYS["Systematize<br/>(skill + playbook)"]
+    SYS --> FAN["Fan Out<br/>(spawn worker clones)"]
+    FAN --> CONV["Converge<br/>(shared tracker ledger)"]
     CONV --> CHECK{{"Done?"}}
     CHECK -- "Yes" --> DONE["Deliver Result"]
     CHECK -- "No" --> FAN

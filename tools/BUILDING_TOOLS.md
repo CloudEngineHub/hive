@@ -1,6 +1,6 @@
 # Building Tools for Aden
 
-This guide explains how to create new tools for the Aden agent framework using FastMCP.
+This guide explains how to create new tools for the Hive framework using FastMCP.
 
 ## Quick Start Checklist
 

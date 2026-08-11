@@ -1,6 +1,6 @@
-# Aden Tools
+# Hive Tools
 
-Tool library for the Aden agent framework. Provides a collection of tools that AI agents can use to interact with external systems, process data, and perform actions via the Model Context Protocol (MCP).
+Tool library for the Hive framework. Provides a collection of tools that AI agents can use to interact with external systems, process data, and perform actions via the Model Context Protocol (MCP).
 
 ## Installation
 

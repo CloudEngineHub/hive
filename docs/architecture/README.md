@@ -29,12 +29,12 @@ flowchart TB
             W3["worker N"]
         end
 
-        Tracker[("Tracker (tracker.db)\nshared SQLite ledger")]
-        Reminders["Reminder hub\n(fleet + tracker + metacognition nudges)"]
+        Tracker[("Tracker (tracker.db)<br/>shared SQLite ledger")]
+        Reminders["Reminder hub<br/>(fleet + tracker + metacognition nudges)"]
     end
 
     subgraph Escalation["Out-of-band"]
-        Sentinel["Sentinel\n(Slack / Telegram)"]
+        Sentinel["Sentinel<br/>(Slack / Telegram)"]
     end
 
     User -->|"chat"| Q_LOOP
@@ -150,7 +150,7 @@ Because every actor is the same loop, the harness features live in one place and
 
 ---
 
-## Tool result truncation & the pointer pattern
+## Tool result truncation and the pointer pattern
 
 Agents routinely produce or consume tool results that exceed the context budget (web searches, scraped pages, large API responses). Hive uses a **pointer pattern**: large results are persisted to disk and replaced in the conversation with a compact file reference the agent dereferences on demand via `load_data()`.
 
@@ -169,10 +169,10 @@ flowchart LR
     HasSpillDir -->|"No"| InlineTrunc{"≤ 30KB?"}
     InlineTrunc -->|"Yes"| InlinePass["Pass through"]
     InlineTrunc -->|"No"| InlineCut["Truncate in place"]
-    HasSpillDir -->|"Yes"| SaveFile["Save full result to file\n(web_search_1.txt)"]
+    HasSpillDir -->|"Yes"| SaveFile["Save full result to file<br/>(web_search_1.txt)"]
     SaveFile --> SpillSize{"≤ 30KB?"}
     SpillSize -->|"Yes"| SmallRef["Full content + [Saved to …]"]
-    SpillSize -->|"No"| LargeRef["Preview + pointer:\nload_data(filename)"]
+    SpillSize -->|"No"| LargeRef["Preview + pointer:<br/>load_data(filename)"]
 ```
 
 **How it works:**

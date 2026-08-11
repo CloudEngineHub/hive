@@ -1,8 +1,8 @@
-# Contributing to Aden Hive
+# Contributing to Hive
 
 > **"The best way to predict the future is to invent it."** — Alan Kay
 
-Welcome to Aden Hive, an open-source AI agent framework built for developers who demand production-grade reliability, cross-platform support, and real-world performance. This guide will help you contribute effectively, whether you're fixing bugs, adding features, improving documentation, or building new tools.
+Welcome to Hive, an open-source AI agent framework built for developers who demand production-grade reliability, cross-platform support, and real-world performance. This guide will help you contribute effectively, whether you're fixing bugs, adding features, improving documentation, or building new tools.
 
 Thank you for your interest in contributing! We're especially looking for help building tools, integrations ([check #2805](https://github.com/aden-hive/hive/issues/2805)), and example agents for the framework.
 
@@ -45,7 +45,7 @@ We follow the [Contributor Covenant](https://www.contributor-covenant.org/). In 
 
 ## Philosophy: Why We Build in the Open
 
-Like Linux, TypeScript, and PSPDFKit, **Aden Hive is built by practitioners for practitioners**. We believe:
+Like Linux, TypeScript, and PSPDFKit, **Hive is built by practitioners for practitioners**. We believe:
 
 - **Quality over speed**: A well-tested feature beats a rushed release
 - **Transparency over mystery**: Every decision is documented and reviewable
@@ -153,7 +153,7 @@ uv run ruff format .
 
 ## OS Support: Write Once, Run Everywhere
 
-Aden Hive runs on **macOS, Windows, and Linux** with platform-specific optimizations.
+Hive runs on **macOS, Windows, and Linux** with platform-specific optimizations.
 
 ### Current OS Support Matrix
 
@@ -398,7 +398,7 @@ uv run python -m exports.ai_outreach_architect
 
 ## LLM Models & Providers
 
-Aden Hive supports **100+ LLM providers** via LiteLLM, giving users maximum flexibility.
+Hive supports **100+ LLM providers** via LiteLLM, giving users maximum flexibility.
 
 ### Supported Providers
 
@@ -1159,7 +1159,7 @@ We recognize contributors through:
 
 ## Contributor License Agreement
 
-By submitting a Pull Request, you agree that your contributions will be licensed under the Aden Agent Framework license (Apache 2.0).
+By submitting a Pull Request, you agree that your contributions will be licensed under the Hive license (Apache 2.0).
 
 ---
 
@@ -1186,6 +1186,6 @@ As Anders Hejlsberg (TypeScript) says: *"Make it work, make it right, make it fa
 
 ---
 
-**Thank you for contributing to Aden Hive.** Together, we're building the most reliable, performant, and developer-friendly AI agent framework in the world.
+**Thank you for contributing to Hive.** Together, we're building the most reliable, performant, and developer-friendly AI agent framework in the world.
 
 Now go build something amazing. 🚀

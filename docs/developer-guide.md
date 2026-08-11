@@ -1,6 +1,6 @@
 # Developer Guide
 
-This guide covers everything you need to know to develop with the Aden Agent Framework.
+This guide covers everything you need to know to develop with the Hive.
 
 ## Table of Contents
 
@@ -19,7 +19,7 @@ This guide covers everything you need to know to develop with the Aden Agent Fra
 
 ## Repository Overview
 
-Aden Agent Framework is a Python-based system for building goal-driven, self-improving AI agents.
+Hive is a Python-based system for building goal-driven, self-improving AI agents.
 
 | Package       | Directory  | Description                               | Tech Stack   |
 | ------------- | ---------- | ----------------------------------------- | ------------ |

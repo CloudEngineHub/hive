@@ -1,6 +1,6 @@
 # Browser-Use Patterns Analysis
 
-## Key Learnings from `/home/timothy/aden/browser-use`
+## Key Learnings from the browser-use integration
 
 ### 1. Element Click Implementation
 

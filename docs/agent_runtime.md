@@ -1,6 +1,8 @@
 # Agent Runtime
 
-Unified execution system for all Hive agents. Every agent — single-entry or multi-entry, headless or TUI — runs through the same runtime stack.
+> **Scope:** this describes the **standalone agent** execution stack (`AgentRunner` → `AgentRuntime` → `GraphExecutor`), used for single, exportable agents defined with the legacy `nodes`/`edges` format. The **live colony runtime** is different: a session starts a `ColonyRuntime` whose Queen and workers are each an `AgentLoop`, coordinating through the shared [tracker](key_concepts/coordination.md#the-tracker) with no graph traversal. Read the [Architecture Overview](architecture/README.md) for the colony model; read on here for the standalone path.
+
+Execution system for standalone Hive agents. A standalone agent — single-entry or multi-entry, headless or TUI — runs through the runtime stack below.
 
 ## Topology
 

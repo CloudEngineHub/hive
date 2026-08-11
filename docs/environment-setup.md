@@ -1,6 +1,6 @@
 # Agent Development Environment Setup
 
-Complete setup guide for building and running goal-driven agents with the Aden Agent Framework.
+Complete setup guide for building and running goal-driven agents with the Hive.
 
 ## Quick Setup
 

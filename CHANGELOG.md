@@ -1,5 +1,19 @@
 # Release Notes
 
+> Full, detailed release notes live in [`docs/releases/`](docs/releases/). The entries below summarize the architecturally significant releases; older entries follow.
+
+## v0.11.0 — Action Plans, Charts, and a Cleaner Queen
+
+**Highlights:** a persistent, file-backed **task plan** gives every Queen a structured plan that survives session reload; inline **charting** (ECharts/Mermaid via a new `chart_tools` MCP server); colony import/export; and a major consolidation of the Queen's tool surface (`file_ops`, `shell_tools`) and prompt. See [docs/releases/v0.11.0.md](docs/releases/v0.11.0.md).
+
+## v0.10.0 — The Colony
+
+**Breaking, ground-up architectural rewrite.** Old agents are not compatible. Hive moved from a compiled graph/DAG of nodes to **colonies of agents**: a persistent **Queen** (one of 13 domain personas, picked by a CEO-style router) leads a **colony** of **worker clones**. There are no graphs, edges, nodes, or data buffers — the Queen fans out workers with `run_worker` and coordinates them through a shared SQLite **tracker**. The framework, agent loop, runtime, and worker layers were rewritten from the ground up. See [docs/releases/v0.10.0.md](docs/releases/v0.10.0.md) (and v0.10.1–v0.10.5 for follow-ups).
+
+> The architecture has continued to evolve past v0.11.0 (a large runtime sync brought in the tracker-based coordination, the reminder/nudge hub, the incubating phase, and Sentinel escalation). The [Architecture Overview](docs/architecture/README.md) is the current source of truth.
+
+---
+
 ## v0.7.1
 
 **Release Date:** March 13, 2026

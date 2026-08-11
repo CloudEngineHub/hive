@@ -48,7 +48,7 @@ Within the loop, work happens in **iterations** — one turn of reason → act �
 Because there's only one primitive, durability is built once and inherited everywhere. Every loop:
 
 - **persists a cursor to disk** and can **park/resume** — a crash, restart, or deploy picks up exactly where it left off;
-- **manages its own context window** through compaction and the [pointer pattern](../architecture/README.md#tool-result-truncation--the-pointer-pattern), so long sessions don't blow the budget;
+- **manages its own context window** through compaction and the [pointer pattern](../architecture/README.md#tool-result-truncation-and-the-pointer-pattern), so long sessions don't blow the budget;
 - **meters every LLM call** so cost limits are enforced;
 - **stays coherent** via framework-injected reminders (see [Coordination](./coordination.md#the-reminder-hub)).
 

@@ -1,6 +1,6 @@
 # Redshift Tool
 
-Query and manage Amazon Redshift data warehouse within the Aden agent framework.
+Query and manage Amazon Redshift data warehouse within the Hive framework.
 
 ## Overview
 

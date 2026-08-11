@@ -20,7 +20,7 @@ run, `/report` renders an HTML scoreboard.
 ## Run
 
 ```
-cd /home/timothy/aden/hive-desktop-runtime/tools/tests/vision_eval
+cd tools/tests/vision_eval   # from the repo root
 uv run python server.py
 # default: http://127.0.0.1:8765
 ```

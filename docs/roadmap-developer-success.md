@@ -200,7 +200,7 @@ After your MVP agent or sample agent runs, you'll want to iterate by expanding t
 
 After your MVP is deployed, your taste and judgment still drive the direction—AI is a significant force multiplier for rapidly iterating and solving problems.
 
-With Aden Cloud Hive, production evolution is fully automatic. The Aden Queen Bee runs natural selection by deploying, evaluating, and improving your agents.
+With Hive Cloud, production improvement is continuous: your Queen keeps a running colony, reflects on outcomes into scoped memory, and turns proven work into reusable skills and playbooks — deploying, evaluating, and improving your agents over time.
 
 ## Version Control
 

@@ -1,6 +1,6 @@
 # MSSQL Tool
 
-Professional SQL Server database operations for Aden Hive.
+Professional SQL Server database operations for Hive.
 
 ## Overview
 
@@ -342,4 +342,4 @@ Solutions:
 
 ## License
 
-This tool is part of the Aden Hive project.
+This tool is part of the Hive project.

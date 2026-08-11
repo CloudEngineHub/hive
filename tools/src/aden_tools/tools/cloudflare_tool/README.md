@@ -76,7 +76,7 @@ Requires a Cloudflare API token with the following permissions:
 
 ---
 
-_Generated for the Model Context Protocol (MCP) as part of the Aden Tools suite._
+_Generated for the Model Context Protocol (MCP) as part of the Hive Tools suite._
 
 ### `cloudflare_get_zone`
 
