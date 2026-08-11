@@ -23,7 +23,7 @@ pieces compose correctly.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
@@ -95,9 +95,7 @@ async def test_cancel_queen_marks_user_stop_before_cancelling() -> None:
 
     assert response.status == 200
     body = node._calls
-    assert body == ["mark_user_stopped", "cancel_current_turn"], (
-        f"expected mark_user_stopped to precede cancel_current_turn, got {body}"
-    )
+    assert body == ["mark_user_stopped", "cancel_current_turn"], f"expected mark_user_stopped to precede cancel_current_turn, got {body}"
     assert node._user_stopped is True
 
 
@@ -229,9 +227,7 @@ async def test_idle_nudge_suppressed_when_user_stopped_between_turns() -> None:
     ``user_stopped`` — a user who clicked Stop during a stream stall must
     not be nudged."""
     src = IdleNudgeSource(budget_seconds=1.0, max_nudges=3)
-    out = await src.render(
-        _signals(awaiting_input=False, stream_active=False, park_reason=None)
-    )
+    out = await src.render(_signals(awaiting_input=False, stream_active=False, park_reason=None))
     assert out is None
 
 
@@ -262,9 +258,7 @@ async def test_idle_nudge_suppressed_for_turn_done_even_without_user_stop() -> N
         max_nudges=3,
         awaiting_budget_seconds=1.0,
     )
-    out = await src.render(
-        _signals(park_reason=ParkReason.TURN_DONE, user_stopped=False)
-    )
+    out = await src.render(_signals(park_reason=ParkReason.TURN_DONE, user_stopped=False))
     assert out is None
 
 

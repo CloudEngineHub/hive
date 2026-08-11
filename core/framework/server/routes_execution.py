@@ -692,12 +692,12 @@ async def handle_chat(request: web.Request) -> web.Response:
 
             # Publish BEFORE inject_event so handlers (e.g. memory recall)
             # complete before the event loop unblocks and starts the LLM turn.
-            from framework.host.event_bus import AgentEvent, EventType
-
             # Correlate the received event with the later CLIENT_INPUT_COMMITTED
             # the drain emits, so the UI can re-stamp this bubble to its true
             # injection time once the message actually enters the conversation.
             import uuid
+
+            from framework.host.event_bus import AgentEvent, EventType
 
             input_correlation_id = uuid.uuid4().hex
 
@@ -2200,9 +2200,7 @@ def register_routes(app: web.Application) -> None:
     # Session-primary routes
     app.router.add_post("/api/sessions/{session_id}/chat", handle_chat)
     app.router.add_post("/api/sessions/{session_id}/queen-context", handle_queen_context)
-    app.router.add_post(
-        "/api/sessions/{session_id}/record-message", handle_record_user_message
-    )
+    app.router.add_post("/api/sessions/{session_id}/record-message", handle_record_user_message)
     app.router.add_post("/api/sessions/{session_id}/cancel-queen", handle_cancel_queen)
     app.router.add_post("/api/sessions/{session_id}/presence", handle_session_presence)
     app.router.add_post(

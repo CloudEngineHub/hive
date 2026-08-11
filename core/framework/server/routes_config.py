@@ -26,12 +26,12 @@ from framework.config import (
     OPENROUTER_API_BASE,
     get_hive_config,
 )
-from framework.server.app import get_request_executor
 from framework.llm.model_catalog import (
     find_model,
     get_models_catalogue,
     get_preset,
 )
+from framework.server.app import get_request_executor
 
 logger = logging.getLogger(__name__)
 
@@ -1039,8 +1039,7 @@ async def handle_update_rate_limits(request: web.Request) -> web.Response:
             val = 1
         if ceiling is not None and val > ceiling:
             warnings.append(
-                f"{platform}.{action}.{window}={val} exceeds recommended max of {ceiling}. "
-                f"High values increase the risk of account bans."
+                f"{platform}.{action}.{window}={val} exceeds recommended max of {ceiling}. High values increase the risk of account bans."
             )
         cleaned[key] = val
 

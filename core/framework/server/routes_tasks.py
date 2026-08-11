@@ -1,8 +1,8 @@
 """REST routes for task lists.
 
-  GET  /api/sessions/{session_id}/tasks                  -- snapshot of one list
-  POST /api/sessions/{session_id}/tasks/unarchive        -- restore archived tasks
-  POST /api/sessions/{session_id}/tasks/clear-completed  -- archive completed tasks
+GET  /api/sessions/{session_id}/tasks                  -- snapshot of one list
+POST /api/sessions/{session_id}/tasks/unarchive        -- restore archived tasks
+POST /api/sessions/{session_id}/tasks/clear-completed  -- archive completed tasks
 """
 
 from __future__ import annotations
@@ -117,9 +117,7 @@ async def handle_clear_completed_tasks(request: web.Request) -> web.Response:
 
 def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/sessions/{session_id}/tasks", handle_get_task_list)
-    app.router.add_post(
-        "/api/sessions/{session_id}/tasks/unarchive", handle_unarchive_task_list
-    )
+    app.router.add_post("/api/sessions/{session_id}/tasks/unarchive", handle_unarchive_task_list)
     app.router.add_post(
         "/api/sessions/{session_id}/tasks/clear-completed",
         handle_clear_completed_tasks,

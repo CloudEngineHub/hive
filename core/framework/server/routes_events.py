@@ -127,9 +127,7 @@ def _parse_watch(raw: str | None) -> tuple[bool, set[str]]:
     return False, {s.strip() for s in raw.split(",") if s.strip() and s.strip() != "*"}
 
 
-def is_suppressed_for_client(
-    evt_dict: dict, watch_all: bool, watched_streams: set[str]
-) -> bool:
+def is_suppressed_for_client(evt_dict: dict, watch_all: bool, watched_streams: set[str]) -> bool:
     """True if this event must not reach *this* client.
 
     Queen events and worker META always pass — META is what renders the worker
@@ -497,9 +495,7 @@ async def handle_crm_changed(request: web.Request) -> web.Response:
         body = {}
 
     raw = body.get("entities")
-    entities = sorted(
-        {e for e in raw if isinstance(e, str) and e in _CRM_ENTITIES}
-    ) if isinstance(raw, list) else []
+    entities = sorted({e for e in raw if isinstance(e, str) and e in _CRM_ENTITIES}) if isinstance(raw, list) else []
 
     await publish_global(
         AgentEvent(

@@ -74,13 +74,13 @@ _BINARY_PREVIEW_EXT_TO_MIME: dict[str, str] = {
 def _classify_file(ext: str, raw_bytes: bytes) -> tuple[str, str]:
     """Decide how to surface a file to the LLM. Returns ``(kind, mime)``:
 
-      ``("pdf",   "application/pdf")``    → binary PDF preview block
-      ``("image", "<image/*>")``          → image block
-      ``("text",  "<text/* or similar>")``→ inline text block
-      ``("blob",  "application/octet-stream")``
-                                          → user-facing chip only; the LLM
-                                            sees just a summary entry, not
-                                            the bytes (e.g. zip, docx, mp3).
+    ``("pdf",   "application/pdf")``    → binary PDF preview block
+    ``("image", "<image/*>")``          → image block
+    ``("text",  "<text/* or similar>")``→ inline text block
+    ``("blob",  "application/octet-stream")``
+                                        → user-facing chip only; the LLM
+                                          sees just a summary entry, not
+                                          the bytes (e.g. zip, docx, mp3).
     """
     if ext in _BINARY_PREVIEW_EXT_TO_MIME:
         mime = _BINARY_PREVIEW_EXT_TO_MIME[ext]
@@ -256,8 +256,8 @@ def register_tools(mcp: FastMCP) -> None:
                 # chip always have the full file.
                 if len(raw_bytes) > _TEXT_INLINE_CAP_BYTES:
                     text_body = (
-                        text_body[:_TEXT_INLINE_CAP_BYTES]
-                        + f"\n\n…[preview truncated at {_TEXT_INLINE_CAP_BYTES} bytes — download the full file via the chip, or read it with a terminal tool]"
+                        text_body[:_TEXT_INLINE_CAP_BYTES] + f"\n\n…[preview truncated at {_TEXT_INLINE_CAP_BYTES} bytes — download the full file"
+                        " via the chip, or read it with a terminal tool]"
                     )
                 inline_block = TextContent(
                     type="text",

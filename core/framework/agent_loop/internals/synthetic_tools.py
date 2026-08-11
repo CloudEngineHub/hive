@@ -405,9 +405,7 @@ def build_report_to_parent_tool(report_schema: dict[str, Any] | None = None) -> 
         data_param = {
             "type": "object",
             "description": (
-                "Optional structured payload (rows fetched, IDs "
-                "processed, files written, etc.) that the "
-                "overseer can merge into its final summary."
+                "Optional structured payload (rows fetched, IDs processed, files written, etc.) that the overseer can merge into its final summary."
             ),
         }
         required = ["status", "summary"]

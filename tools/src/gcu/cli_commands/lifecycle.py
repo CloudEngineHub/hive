@@ -7,6 +7,7 @@ import argparse
 import time
 
 from gcu.browser.bridge import connection_error, get_bridge
+from gcu.browser.telemetry import log_tool_call
 from gcu.browser.tools.lifecycle import (
     _CHROME_WEB_STORE_URL,
     _connected_profiles,
@@ -14,7 +15,6 @@ from gcu.browser.tools.lifecycle import (
     _resolve_profile,
     close_profile_context,
 )
-from gcu.browser.telemetry import log_tool_call
 
 
 async def cmd_setup(args: argparse.Namespace) -> dict:
@@ -27,8 +27,7 @@ async def cmd_setup(args: argparse.Namespace) -> dict:
         if len(profiles) > 1:
             labels = ", ".join(p.get("label") for p in profiles if p.get("label"))
             status += (
-                f" {len(profiles)} Chrome profiles are connected ({labels}); pass "
-                "--browser-profile <label> to `hive-browser open` to choose one."
+                f" {len(profiles)} Chrome profiles are connected ({labels}); pass --browser-profile <label> to `hive-browser open` to choose one."
             )
         return {"ok": True, "connected": True, "status": status, "connected_profiles": profiles}
 

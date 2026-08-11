@@ -147,11 +147,7 @@ def _find_oauth_integration(provider: str, from_email: str) -> str | None:
         return None
     wanted = (from_email or "").strip().lower()
     for i in integrations:
-        if (
-            i.provider == provider
-            and i.status == "active"
-            and (i.email or "").strip().lower() == wanted
-        ):
+        if i.provider == provider and i.status == "active" and (i.email or "").strip().lower() == wanted:
             return i.integration_id
     return None
 

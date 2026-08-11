@@ -23,7 +23,7 @@ def limiter(tmp_path):
 
 def test_creates_db_and_table(tmp_path):
     db = tmp_path / "sub" / "rate_limits.db"
-    rl = SocialRateLimiter(db_path=db)
+    SocialRateLimiter(db_path=db)
     assert db.exists()
     con = sqlite3.connect(str(db))
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -49,8 +49,7 @@ def test_check_allowed_after_some_records(limiter):
     now = time.time()
     for i in range(5):
         con.execute(
-            "INSERT INTO actions (platform, account_id, action_type, target_id, performed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO actions (platform, account_id, action_type, target_id, performed_at) VALUES (?, ?, ?, ?, ?)",
             ("linkedin", "user1", "invite", f"t{i}", now - 60 * (i + 1)),
         )
     con.commit()
@@ -69,8 +68,7 @@ def test_daily_limit_blocks(limiter):
     # Spread actions across multiple hours so hourly limit doesn't trip first
     for i in range(50):
         con.execute(
-            "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
             ("linkedin", "acct1", "invite", now - 900 * (i + 1)),
         )
     con.commit()
@@ -89,8 +87,7 @@ def test_daily_limit_different_accounts_independent(limiter):
     now = time.time()
     for i in range(50):
         con.execute(
-            "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
             ("linkedin", "acct_a", "invite", now - 900 * (i + 1)),
         )
     con.commit()
@@ -114,8 +111,7 @@ def test_weekly_limit_blocks(limiter):
     base = now - 2 * 86400  # 2 days ago
     for i in range(200):
         con.execute(
-            "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
             ("linkedin", "user1", "invite", base - 1800 * i),
         )
     con.commit()
@@ -134,8 +130,7 @@ def test_no_weekly_limit_for_actions_without_one(limiter):
     # Insert 19 messages (under daily limit of 60), spread across hours
     for i in range(19):
         con.execute(
-            "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
             ("linkedin", "user1", "message", now - 3600 * (i + 1)),
         )
     con.commit()
@@ -153,8 +148,7 @@ def test_no_weekly_limit_for_actions_without_one(limiter):
 def test_min_delay_blocks_too_fast(limiter):
     con = sqlite3.connect(str(limiter._db_path))
     con.execute(
-        "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
         ("linkedin", "user1", "invite", time.time() - 5),
     )
     con.commit()
@@ -171,8 +165,7 @@ def test_min_delay_blocks_too_fast(limiter):
 def test_min_delay_allows_after_enough_time(limiter):
     con = sqlite3.connect(str(limiter._db_path))
     con.execute(
-        "INSERT INTO actions (platform, account_id, action_type, performed_at) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO actions (platform, account_id, action_type, performed_at) VALUES (?, ?, ?, ?)",
         ("linkedin", "user1", "invite", time.time() - 31),
     )
     con.commit()

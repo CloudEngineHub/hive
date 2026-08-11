@@ -92,10 +92,10 @@ class TestDefaultLoopConfig:
         """
         assert DEFAULT_LOOP_CONFIG["max_iterations"] == 3
         assert DEFAULT_LOOP_CONFIG["grace_iterations"] == 1
-        assert DEFAULT_LOOP_CONFIG["tool_call_budget"] == 20
+        assert DEFAULT_LOOP_CONFIG["tool_call_budget"] == 30
         assert DEFAULT_LOOP_CONFIG["tool_call_hard_multiple"] == 3
         # Cumulative cap across all turns — bounds a high-max_iterations worker.
-        assert DEFAULT_LOOP_CONFIG["tool_call_lifetime_budget"] == 150
+        assert DEFAULT_LOOP_CONFIG["tool_call_lifetime_budget"] == 200
         assert DEFAULT_LOOP_CONFIG["max_context_tokens"] == 180_000
 
     def test_all_keys_are_ints(self) -> None:

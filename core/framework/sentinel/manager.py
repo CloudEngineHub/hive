@@ -33,6 +33,7 @@ _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 def _to_mrkdwn(text: str) -> str:
     return _BOLD_RE.sub(r"*\1*", text)
 
+
 _instance: SentinelManager | None = None
 
 
@@ -70,14 +71,10 @@ def _install_sentinel_log_file() -> None:
 
     log_dir = HIVE_HOME / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        log_dir / "sentinel.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
-    )
+    handler = RotatingFileHandler(log_dir / "sentinel.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     handler._sentinel_file = True  # idempotency marker
     handler.setLevel(logging.DEBUG)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
     pkg_logger.addHandler(handler)
     pkg_logger.setLevel(logging.DEBUG)
     # Keep sentinel chatter out of the main console — the file is the one window.
@@ -305,29 +302,17 @@ class SentinelManager:
         # done/progress are FYI reports (no answer required); heartbeat is a
         # redirectable checkpoint; blocker (default) is the only "needs you".
         if kind == "done":
-            return (
-                f"✅ Your colony \"{colony}\" finished.\n\n"
-                f"{detail}\n\n"
-                f"Reply to send it back out, or ignore."
-            )
+            return f'✅ Your colony "{colony}" finished.\n\n{detail}\n\nReply to send it back out, or ignore.'
         if kind == "progress":
-            return (
-                f"🐝 Your colony \"{colony}\" — progress update:\n\n"
-                f"{detail}\n\n"
-                f"Reply to redirect it, or ignore to let it keep going."
-            )
+            return f'🐝 Your colony "{colony}" — progress update:\n\n{detail}\n\nReply to redirect it, or ignore to let it keep going.'
         if kind == "heartbeat":
             return (
-                f"🐝 Your colony \"{colony}\" is still working.\n\n"
+                f'🐝 Your colony "{colony}" is still working.\n\n'
                 f"It's been running on its own for a while — latest checkpoint:\n\n"
                 f"{detail}\n\n"
                 f"Reply to redirect it, or ignore to let it keep going."
             )
-        return (
-            f"🐝 Your colony \"{colony}\" needs you.\n\n"
-            f"{detail}\n\n"
-            f"Reply to this message to answer and resume the colony."
-        )
+        return f'🐝 Your colony "{colony}" needs you.\n\n{detail}\n\nReply to this message to answer and resume the colony.'
 
     @staticmethod
     def _hive_title(payload: dict[str, Any]) -> str:
@@ -390,9 +375,7 @@ class SentinelManager:
             self._by_token.pop(rec.correlation_token, None)
             logger.info("[sentinel] resumed colony=%s from reply", rec.colony_id)
 
-    def _resolve_record(
-        self, channel: str, text: str, thread_ref: dict[str, Any] | None
-    ) -> store.EscalationRecord | None:
+    def _resolve_record(self, channel: str, text: str, thread_ref: dict[str, Any] | None) -> store.EscalationRecord | None:
         # Primary: the (ref: …) token.
         tok = token.extract_token(text)
         if tok and tok in self._by_token:

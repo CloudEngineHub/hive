@@ -105,13 +105,25 @@ async def cmd_interact(args: argparse.Namespace) -> dict:
         )
         out = _blocks_to_cli_dict(result, intent=args.intent)
         history_action = _interact_action(
-            action, args.selector, args.coordinate, args.start_selector, args.start_coordinate,
-            args.text, args.scroll_direction, args.wait_for_selector, args.wait_for_text, args.duration,
+            action,
+            args.selector,
+            args.coordinate,
+            args.start_selector,
+            args.start_coordinate,
+            args.text,
+            args.scroll_direction,
+            args.wait_for_selector,
+            args.wait_for_text,
+            args.duration,
         )
-        log_tool_call("browser_interact", log_params,
-                      result={"ok": out.get("ok", True), "action": action},
-                      duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=history_action)
+        log_tool_call(
+            "browser_interact",
+            log_params,
+            result={"ok": out.get("ok", True), "action": action},
+            duration_ms=(time.perf_counter() - start) * 1000,
+            tab_id=target_tab,
+            action=history_action,
+        )
         return out
     except Exception as e:
         err = {"ok": False, "error": str(e)}
@@ -147,13 +159,20 @@ async def cmd_select(args: argparse.Namespace) -> dict:
     select_target = _truncate_target(f"{args.selector} = {', '.join(values)}" if values else args.selector)
     try:
         select_result = await bridge.select_option(target_tab, args.selector, values)
-        log_tool_call("browser_select", params, result=select_result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("select", select_target))
+        log_tool_call(
+            "browser_select",
+            params,
+            result=select_result,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            tab_id=target_tab,
+            action=("select", select_target),
+        )
         return select_result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_select", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("select", select_target))
+        log_tool_call(
+            "browser_select", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("select", select_target)
+        )
         return result
 
 
@@ -218,10 +237,7 @@ async def cmd_upload(args: argparse.Namespace) -> dict:
         "files:Array.prototype.slice.call(input.files).map(function(x){return {name:x.name,size:x.size,type:x.type};})};"
         "})()"
     )
-    exists_js = (
-        "(function(){var e=document.querySelector(" + json.dumps(selector) + ");"
-        "return !!(e&&e.tagName==='INPUT'&&e.type==='file');})()"
-    )
+    exists_js = "(function(){var e=document.querySelector(" + json.dumps(selector) + ");return !!(e&&e.tagName==='INPUT'&&e.type==='file');})()"
 
     intercept_enabled = False
     try:

@@ -18,12 +18,7 @@ def grant_permissions():
     try:
         # Connect to AdenTestDB
         connection_string = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={SERVER};"
-            f"DATABASE=AdenTestDB;"
-            f"UID={USERNAME};"
-            f"PWD={PASSWORD};"
-            f"TrustServerCertificate=yes;"
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE=AdenTestDB;UID={USERNAME};PWD={PASSWORD};TrustServerCertificate=yes;"
         )
 
         print("=" * 70)
@@ -63,12 +58,7 @@ def grant_permissions():
         # If we can't connect, try connecting to master and creating user
         try:
             connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={SERVER};"
-                f"DATABASE=master;"
-                f"UID={USERNAME};"
-                f"PWD={PASSWORD};"
-                f"TrustServerCertificate=yes;"
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE=master;UID={USERNAME};PWD={PASSWORD};TrustServerCertificate=yes;"
             )
 
             print("Attempting to grant permissions via master database...")

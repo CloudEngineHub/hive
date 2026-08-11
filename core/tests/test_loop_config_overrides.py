@@ -25,7 +25,7 @@ _WORKER_GRACE_ITERATIONS = 1
 _WORKER_BUDGET = 30
 _WORKER_HARD_MULTIPLE = 3
 # Cumulative (lifetime) tool-call cap across all of a worker's turns.
-_WORKER_LIFETIME_BUDGET = 150
+_WORKER_LIFETIME_BUDGET = 200
 
 
 def test_no_overrides_returns_worker_profile() -> None:

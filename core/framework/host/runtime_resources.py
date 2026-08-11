@@ -35,6 +35,7 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
+
 # ── Tunables (env-overridable) ──────────────────────────────────────────────
 def _env_num(name: str, default: float, cast):
     """Parse a numeric env override, falling back (with a warning) on garbage.
@@ -139,9 +140,7 @@ class ResourceMonitor:
         now = time.time()
         wall_delta = (now - self._prev_wall) if self._prev_wall else None
 
-        comps: dict[str, dict[str, Any]] = {
-            b: {"rss_mb": 0.0, "cpu_pct": 0.0, "procs": 0} for b in _BUCKETS
-        }
+        comps: dict[str, dict[str, Any]] = {b: {"rss_mb": 0.0, "cpu_pct": 0.0, "procs": 0} for b in _BUCKETS}
         chrome = {"renderers": 0, "rss_mb": 0.0}
         cur_cpu: dict[int, float] = {}
 
@@ -237,9 +236,7 @@ class ResourceMonitor:
             "hive_rss_mb": round(sum(c["rss_mb"] for c in sample["components"].values()), 1),
             # Per-bucket RSS so the UI can chart each component's trend, not just
             # the aggregate. Keyed by bucket name; ~5 floats per entry (cheap).
-            "comp_rss_mb": {
-                b: round(c["rss_mb"], 1) for b, c in sample["components"].items()
-            },
+            "comp_rss_mb": {b: round(c["rss_mb"], 1) for b, c in sample["components"].items()},
             "active_workers": sample["context"].get("active_workers"),
         }
         with self._lock:
@@ -253,10 +250,7 @@ class ResourceMonitor:
 
     def _log_transition(self, prev: str | None, sample: dict[str, Any]) -> None:
         v = sample["verdict"]
-        msg = (
-            "runtime-resources verdict %s->%s | avail=%sMB renderers=%d chrome_rss=%.0fMB "
-            "hive_rss=%.0fMB workers=%s | %s"
-        )
+        msg = "runtime-resources verdict %s->%s | avail=%sMB renderers=%d chrome_rss=%.0fMB hive_rss=%.0fMB workers=%s | %s"
         args = (
             prev or "init",
             v,
@@ -350,13 +344,9 @@ def _classify(sample: dict[str, Any]) -> tuple[str, list[str]]:
         warn_th = total * _WARN_AVAIL_FRAC
         crit_th = total * _CRIT_AVAIL_FRAC
         if avail < crit_th:
-            bump("critical",
-                 f"system available {avail:.0f}MB < {crit_th:.0f} "
-                 f"({_CRIT_AVAIL_FRAC:.0%} of {total:.0f}MB total, critical)")
+            bump("critical", f"system available {avail:.0f}MB < {crit_th:.0f} ({_CRIT_AVAIL_FRAC:.0%} of {total:.0f}MB total, critical)")
         elif avail < warn_th:
-            bump("warn",
-                 f"system available {avail:.0f}MB < {warn_th:.0f} "
-                 f"({_WARN_AVAIL_FRAC:.0%} of {total:.0f}MB total, warn)")
+            bump("warn", f"system available {avail:.0f}MB < {warn_th:.0f} ({_WARN_AVAIL_FRAC:.0%} of {total:.0f}MB total, warn)")
 
     renderers = sample["chrome"]["renderers"]
     if renderers > _CRIT_RENDERERS:

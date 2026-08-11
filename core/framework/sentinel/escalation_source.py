@@ -46,9 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Parks we never act on: explicit user pause, a colony-fork suggestion (can't
 # be answered by a text reply), or a worker waiting on its queen.
-_SKIP_REASONS = frozenset(
-    {ParkReason.USER_STOPPED, ParkReason.COLONY_SUGGESTION, ParkReason.AWAITING_QUEEN}
-)
+_SKIP_REASONS = frozenset({ParkReason.USER_STOPPED, ParkReason.COLONY_SUGGESTION, ParkReason.AWAITING_QUEEN})
 
 # Report kinds — every Sentinel evaluation produces one (the manager picks the
 # message template + framing from this; the desktop decides notify-vs-feed):
@@ -113,8 +111,7 @@ class EscalationSource(ReminderSource):
             except Exception:
                 opted = False
             logger.debug(
-                "[sentinel] applies_to: is_queen_stream=%s colony_id=%r opted_in=%s "
-                "(stream_id=%r) — sentinel %s this stream",
+                "[sentinel] applies_to: is_queen_stream=%s colony_id=%r opted_in=%s (stream_id=%r) — sentinel %s this stream",
                 is_queen,
                 colony_id,
                 opted,
@@ -162,8 +159,7 @@ class EscalationSource(ReminderSource):
         cfg = store.load_notifications_config(colony_id)
         if not cfg.sentinel_enabled:
             logger.debug(
-                "[sentinel] no-escalate (colony=%s): not opted in "
-                "(sentinel_enabled=False, channel=%s)",
+                "[sentinel] no-escalate (colony=%s): not opted in (sentinel_enabled=False, channel=%s)",
                 colony_id,
                 cfg.channel,
             )
@@ -300,11 +296,7 @@ class EscalationSource(ReminderSource):
         # Progress is the passive Inbox feed only — never an away channel.
         if kind == REPORT_PROGRESS and cfg.channel != notifier.CHANNEL_HIVE:
             return
-        if (
-            cfg.channel != notifier.CHANNEL_HIVE
-            and not store.escalate_when_ui_attached()
-            and self._ui_attached(session_id)
-        ):
+        if cfg.channel != notifier.CHANNEL_HIVE and not store.escalate_when_ui_attached() and self._ui_attached(session_id):
             logger.info("[sentinel] report suppressed — UI attached (colony=%s)", colony_id)
             return
         summary = self._question_text(pctx)

@@ -173,9 +173,7 @@ async def handle_stop_live_worker(request: web.Request) -> web.Response:
 
     # Keep `stopped: true` as the boolean the client already relies on; the
     # cascade summary rides alongside it rather than clobbering it.
-    return web.json_response(
-        {"stopped": True, "worker_id": worker_id, "detail": summary}
-    )
+    return web.json_response({"stopped": True, "worker_id": worker_id, "detail": summary})
 
 
 async def handle_stop_all_live_workers(request: web.Request) -> web.Response:
@@ -313,37 +311,27 @@ async def handle_browser_tabs(request: web.Request) -> web.Response:
     try:
         from gcu.browser.bridge import get_bridge, init_bridge
     except ImportError:
-        return web.json_response(
-            {"available": False, "reason": "gcu browser tools not loaded", "tabs": []}
-        )
+        return web.json_response({"available": False, "reason": "gcu browser tools not loaded", "tabs": []})
 
     bridge = get_bridge()
     if bridge is None:
         try:
             bridge = init_bridge(mode="client")
         except Exception as exc:  # noqa: BLE001
-            return web.json_response(
-                {"available": False, "reason": f"bridge init failed: {exc}", "tabs": []}
-            )
+            return web.json_response({"available": False, "reason": f"bridge init failed: {exc}", "tabs": []})
     connect = getattr(bridge, "connect", None)
     if callable(connect) and not bridge.is_connected:
         try:
             await connect()
         except Exception as exc:  # noqa: BLE001
-            return web.json_response(
-                {"available": False, "reason": f"bridge connect failed: {exc}", "tabs": []}
-            )
+            return web.json_response({"available": False, "reason": f"bridge connect failed: {exc}", "tabs": []})
     if not bridge.is_connected:
-        return web.json_response(
-            {"available": False, "reason": "bridge not connected", "tabs": []}
-        )
+        return web.json_response({"available": False, "reason": "bridge not connected", "tabs": []})
 
     try:
         list_result = await bridge.list_tabs()
     except Exception as exc:  # noqa: BLE001
-        return web.json_response(
-            {"available": False, "reason": f"list_tabs failed: {exc}", "tabs": []}
-        )
+        return web.json_response({"available": False, "reason": f"list_tabs failed: {exc}", "tabs": []})
     tabs = list(list_result.get("tabs") or [])
 
     # Which groupIds carry HIVE_GROUP_MARKER? Derived from list_active_contexts

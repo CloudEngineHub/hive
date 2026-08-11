@@ -232,9 +232,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             set_sentinel_manager(sentinel_mgr)
             await sentinel_mgr.start()
         except Exception:  # noqa: BLE001 — never let Sentinel block server start
-            logging.getLogger(__name__).warning(
-                "sentinel: failed to start (continuing without it)", exc_info=True
-            )
+            logging.getLogger(__name__).warning("sentinel: failed to start (continuing without it)", exc_info=True)
 
         dashboard_url = f"http://{args.host}:{args.port}"
         has_frontend = _frontend_dist_exists()

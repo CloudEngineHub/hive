@@ -103,7 +103,7 @@ def cmd_janitor_run(args: argparse.Namespace) -> int:
             "are protected — POST /api/maintenance/janitor/run on the runtime's port, e.g.:\n"
             f"  curl -X POST http://127.0.0.1:<port>/api/maintenance/janitor/run "
             '-H "Content-Type: application/json" '
-            f"-d '{{\"execute\": {str(bool(args.execute)).lower()}, \"tiers\": {sorted(tiers)}}}'\n"
+            f'-d \'{{"execute": {str(bool(args.execute)).lower()}, "tiers": {sorted(tiers)}}}\'\n'
             "Or stop the desktop app / server and re-run this command."
         )
         return 1
@@ -147,10 +147,7 @@ def _print_report(report: dict, *, verbose: bool) -> None:
     for target in report.get("targets", []):
         if not (target.get("files") or target.get("bytes_freed") or target.get("skipped") or target.get("errors")):
             continue
-        line = (
-            f"  {target['name']:<22} files={target['files']:<7} "
-            f"freed={_human(target['bytes_freed']):<10} skipped={target['skipped']}"
-        )
+        line = f"  {target['name']:<22} files={target['files']:<7} freed={_human(target['bytes_freed']):<10} skipped={target['skipped']}"
         if target.get("errors"):
             line += f" errors={len(target['errors'])}"
         print(line)
@@ -164,9 +161,6 @@ def _print_report(report: dict, *, verbose: bool) -> None:
                 with open(report["manifest_path"], encoding="utf-8") as f:
                     for line in f:
                         item = json.loads(line)
-                        print(
-                            f"    [{item['outcome']:<9}] {item['action']:<9} "
-                            f"{_human(item['bytes']):<10} {item['path']}  ({item['reason']})"
-                        )
+                        print(f"    [{item['outcome']:<9}] {item['action']:<9} {_human(item['bytes']):<10} {item['path']}  ({item['reason']})")
             except (OSError, json.JSONDecodeError, KeyError):
                 pass

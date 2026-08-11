@@ -728,12 +728,18 @@ def test_principal_is_injected_into_terminal_tool_env(monkeypatch):
 
         def list_tools(self):
             return [
-                SimpleNamespace(name="terminal_exec", description="run a command",
-                                input_schema={"type": "object", "required": ["command"], "properties": {
-                                    "command": {"type": "string"}, "env": {"type": "object"}}}),
-                SimpleNamespace(name="plain_tool", description="no env",
-                                input_schema={"type": "object", "required": [], "properties": {
-                                    "x": {"type": "string"}}}),
+                SimpleNamespace(
+                    name="terminal_exec",
+                    description="run a command",
+                    input_schema={
+                        "type": "object",
+                        "required": ["command"],
+                        "properties": {"command": {"type": "string"}, "env": {"type": "object"}},
+                    },
+                ),
+                SimpleNamespace(
+                    name="plain_tool", description="no env", input_schema={"type": "object", "required": [], "properties": {"x": {"type": "string"}}}
+                ),
             ]
 
         def call_tool(self, tool_name, arguments):
@@ -741,14 +747,12 @@ def test_principal_is_injected_into_terminal_tool_env(monkeypatch):
             return {"result": "ok"}
 
     monkeypatch.setattr("framework.loader.mcp_client.MCPClient", FakeClient)
-    registry.register_mcp_server({"name": "term", "transport": "stdio", "command": "echo"},
-                                 use_connection_manager=False)
+    registry.register_mcp_server({"name": "term", "transport": "stdio", "command": "echo"}, use_connection_manager=False)
     executor = registry.get_executor()
 
     token = _execution_context.set({"principal": "colony:acme:queen"})
     try:
-        executor(ToolUse(id="c1", name="terminal_exec",
-                         input={"command": "hive-crm whoami", "env": {"FOO": "bar"}}))
+        executor(ToolUse(id="c1", name="terminal_exec", input={"command": "hive-crm whoami", "env": {"FOO": "bar"}}))
         executor(ToolUse(id="c2", name="plain_tool", input={"x": "y"}))
     finally:
         _execution_context.reset(token)

@@ -163,16 +163,13 @@ def test_legacy_pass_never_deletes_the_agents_tree() -> None:
 def test_legacy_sessions_get_tier3_hygiene(monkeypatch) -> None:
     # Point QUEENS_DIR elsewhere so the legacy iterator is the only source.
     monkeypatch.setattr(config, "QUEENS_DIR", config.HIVE_HOME / "queens")
-    session = (
-        config.HIVE_HOME / "agents" / "queens" / "q1" / "sessions" / "session_20250101_000000_deadbeef"
-    )
+    session = config.HIVE_HOME / "agents" / "queens" / "q1" / "sessions" / "session_20250101_000000_deadbeef"
     (session / "conversations" / "parts").mkdir(parents=True)
     (session / "data").mkdir()
     (session / "data" / "orphan_9.txt").write_text("x" * 300, encoding="utf-8")
-    events = [
-        json.dumps({"type": "context_usage_updated", "data": {"full_request": {"m": "y" * 400}}})
-        for _ in range(3)
-    ] + [json.dumps({"type": "tool_call_completed", "data": {"result": "keep"}})]
+    events = [json.dumps({"type": "context_usage_updated", "data": {"full_request": {"m": "y" * 400}}}) for _ in range(3)] + [
+        json.dumps({"type": "tool_call_completed", "data": {"result": "keep"}})
+    ]
     (session / "events.jsonl").write_text("\n".join(events) + "\n", encoding="utf-8")
     old = time.time() - 90 * 86400
     for p in [session, *session.rglob("*")]:
@@ -227,9 +224,7 @@ def test_junk_detection_reports_but_never_deletes_without_flag() -> None:
     junk_report = next(t for t in report.targets if t.name == "junk")
     assert junk_report.skipped == 1
 
-    report = run_once(
-        SafetyContext.for_offline(cfg), cfg, tiers=set(), execute=True, include_junk=True
-    )
+    report = run_once(SafetyContext.for_offline(cfg), cfg, tiers=set(), execute=True, include_junk=True)
     assert not junk.exists()
 
 
@@ -239,9 +234,7 @@ def test_protected_toplevel_entries_never_appear_as_junk() -> None:
     (config.HIVE_HOME / "charts").mkdir()
     (config.HIVE_HOME / "charts" / "c.png").write_text("x" * 200, encoding="utf-8")
     cfg = _cfg(junk_min_bytes=1)
-    report = run_once(
-        SafetyContext.for_offline(cfg), cfg, tiers=set(), execute=True, include_junk=True
-    )
+    report = run_once(SafetyContext.for_offline(cfg), cfg, tiers=set(), execute=True, include_junk=True)
     assert (config.HIVE_HOME / "memories" / "fact.md").exists()
     assert (config.HIVE_HOME / "charts" / "c.png").exists()
     junk_report = next(t for t in report.targets if t.name == "junk")

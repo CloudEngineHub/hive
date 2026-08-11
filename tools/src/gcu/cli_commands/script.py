@@ -37,10 +37,7 @@ async def cmd_script(args: argparse.Namespace) -> dict:
     from gcu.browser.tools.script import run_browser_script
 
     if not args.skill:
-        raise validation(
-            "--skill is required (scripts are scoped to a skill dir). "
-            "For ad-hoc JavaScript, use: hive-browser evaluate --js '<code>'"
-        )
+        raise validation("--skill is required (scripts are scoped to a skill dir). For ad-hoc JavaScript, use: hive-browser evaluate --js '<code>'")
     if not args.script:
         raise validation("--script is required (a script file under <skill>/scripts/)")
 

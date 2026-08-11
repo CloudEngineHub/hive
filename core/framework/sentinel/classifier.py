@@ -158,10 +158,7 @@ def _build_prompt(ctx: ParkContext) -> str:
         errors = "\nRecent tool errors:\n" + "\n".join(f"- {e}" for e in ctx.recent_errors[:5])
     workers = ""
     if ctx.running_workers:
-        workers = (
-            f"\nWorkers still running ({len(ctx.running_workers)}):\n"
-            + format_running_workers(ctx.running_workers)
-        )
+        workers = f"\nWorkers still running ({len(ctx.running_workers)}):\n" + format_running_workers(ctx.running_workers)
     user_msg = ""
     if ctx.recent_user_text.strip():
         user_msg = f'\nUser\'s most recent message:\n"""\n{ctx.recent_user_text[:1500]}\n"""'
@@ -169,7 +166,7 @@ def _build_prompt(ctx: ParkContext) -> str:
         f"Goal: {ctx.goal or '(no goal recorded)'}\n"
         f"Open tasks still to do:\n{tasks}\n"
         f"Park reason: {ctx.park_reason}\n"
-        f"Queen's last message:\n\"\"\"\n{ctx.last_assistant_text[:1500]}\n\"\"\""
+        f'Queen\'s last message:\n"""\n{ctx.last_assistant_text[:1500]}\n"""'
         f"{user_msg}{questions}{errors}{workers}\n\n"
         "Should the queen continue on its own, or does it need a human?"
     )

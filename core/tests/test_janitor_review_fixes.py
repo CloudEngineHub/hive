@@ -56,10 +56,9 @@ def _build_session(sid: str = _SID) -> Path:
     sdir = config.QUEENS_DIR / "qx" / "sessions" / sid
     (sdir / "conversations" / "parts").mkdir(parents=True)
     (sdir / "data").mkdir()
-    lines = [
-        json.dumps({"type": "context_usage_updated", "data": {"full_request": {"m": "z" * 500}}})
-        for _ in range(3)
-    ] + [json.dumps({"type": "tool_call_completed", "data": {"result": "keep"}})]
+    lines = [json.dumps({"type": "context_usage_updated", "data": {"full_request": {"m": "z" * 500}}}) for _ in range(3)] + [
+        json.dumps({"type": "tool_call_completed", "data": {"result": "keep"}})
+    ]
     (sdir / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     _age_tree(sdir, 60)
     return sdir
@@ -148,7 +147,7 @@ def test_orphan_scan_fails_closed_on_read_error(monkeypatch) -> None:
 
 
 def test_own_lock_does_not_mask_liveness_recheck() -> None:
-    cfg = _cfg()
+    _cfg()
     sdir = _build_session()
     (sdir / ".janitor.lock").write_text('{"pid": 1}', encoding="utf-8")
     safety = SafetyContext(
@@ -172,9 +171,7 @@ def test_refresher_blocks_mid_run_resume() -> None:
         grace_seconds=0,
         refresher=lambda: (frozenset({_SID}), frozenset()),
     )
-    report = prune_queen_session(
-        sdir, cfg=cfg, safety=safety, disposer=DeleteDisposer(), manifest=Manifest()
-    )
+    report = prune_queen_session(sdir, cfg=cfg, safety=safety, disposer=DeleteDisposer(), manifest=Manifest())
     assert (sdir / "events.jsonl").read_text(encoding="utf-8") == events_before
     assert report.skipped == 1
     assert not (sdir / ".janitor.lock").exists()

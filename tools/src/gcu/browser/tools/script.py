@@ -313,7 +313,8 @@ def _load_default_hooks() -> None:
             continue
         try:
             spec = importlib.util.spec_from_file_location(
-                f"gcu.browser.hooks.{hook_file.stem}", str(hook_file),
+                f"gcu.browser.hooks.{hook_file.stem}",
+                str(hook_file),
             )
             if spec is None or spec.loader is None:
                 continue
@@ -646,11 +647,7 @@ async def _attach_blockers(envelope: dict, bridge, tab_id: int) -> None:
             except Exception:
                 blockers = []
         err_str = envelope.get("error") or ""
-        looks_foreign_frame = (
-            isinstance(err_str, str)
-            and "chrome-extension://" in err_str.lower()
-            and "different extension" in err_str.lower()
-        )
+        looks_foreign_frame = isinstance(err_str, str) and "chrome-extension://" in err_str.lower() and "different extension" in err_str.lower()
         if not blockers and looks_foreign_frame and bridge is not None:
             try:
                 await bridge.tab_health(tab_id, force_audit=True)

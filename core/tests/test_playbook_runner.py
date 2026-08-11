@@ -57,9 +57,7 @@ class FakeColony:
     """In-memory tracker + worker. ``done`` is the row's done-predicate; a
     successful dispatch marks the row done (the worker advancing its own row)."""
 
-    def __init__(
-        self, slugs, *, fail_once=(), always_fail=(), bad_receipt=(), track_concurrency=False, dispatch_delay=0.01
-    ):
+    def __init__(self, slugs, *, fail_once=(), always_fail=(), bad_receipt=(), track_concurrency=False, dispatch_delay=0.01):
         self.rows = dict.fromkeys(slugs, False)
         self.fail_once = set(fail_once)
         self.always_fail = set(always_fail)

@@ -56,6 +56,7 @@ def _fixed_budget_constants(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(colony_runtime_mod, "_ADAPTIVE_BUDGET_FLOOR", _FLOOR)
     monkeypatch.setattr(colony_runtime_mod, "_ADAPTIVE_BUDGET_MIN_SAMPLES", _MIN_SAMPLES)
 
+
 # ---------------------------------------------------------------------------
 # Harness (mirrors test_colony_scheduler.py)
 # ---------------------------------------------------------------------------
@@ -262,12 +263,8 @@ def test_workers_route_serializes_budget_telemetry() -> None:
     assert result["budget_limited"] is True
 
     # Pre-upgrade shape (e.g. historical result.json): fields absent → defaults.
-    legacy = SimpleNamespace(
-        status="success", summary="", error=None, tokens_used=1, duration_seconds=1.0
-    )
-    legacy_info = SimpleNamespace(
-        id="w2", task="t", status=WorkerStatus.COMPLETED, started_at=0.0, result=legacy
-    )
+    legacy = SimpleNamespace(status="success", summary="", error=None, tokens_used=1, duration_seconds=1.0)
+    legacy_info = SimpleNamespace(id="w2", task="t", status=WorkerStatus.COMPLETED, started_at=0.0, result=legacy)
     result = _worker_info_to_dict(legacy_info)["result"]
     assert result["tool_calls_used"] == 0
     assert result["budget_limited"] is False
@@ -547,11 +544,7 @@ async def test_e2e_norm_established_and_inflight_worker_clamped(tmp_path: Path) 
         # The straggler (task-3, promoted from the queue, stalled at its
         # gate) must have been clamped — either at promotion or by the
         # live broadcast on the norm-establishing report.
-        straggler = next(
-            colony._workers[wid]
-            for wid in ids
-            if colony._workers[wid].is_active
-        )
+        straggler = next(colony._workers[wid] for wid in ids if colony._workers[wid].is_active)
         for _ in range(120):
             if straggler.agent_loop._config.tool_call_lifetime_budget == _FLOOR:
                 break

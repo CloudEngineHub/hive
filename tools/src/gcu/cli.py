@@ -43,11 +43,7 @@ def _setup_cli_logging() -> None:
         level = getattr(logging, level_name, logging.INFO)
         if not isinstance(level, int):
             level = logging.INFO
-        already = any(
-            isinstance(h, logging.FileHandler)
-            and getattr(h, "baseFilename", None) == os.path.abspath(log_file)
-            for h in root.handlers
-        )
+        already = any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == os.path.abspath(log_file) for h in root.handlers)
         if not already:
             fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
             fh.setLevel(level)
@@ -63,10 +59,22 @@ def _setup_cli_logging() -> None:
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
     logging.getLogger("gcu").setLevel(logging.ERROR)
 
+
 _WAIT_UNTIL = ["commit", "domcontentloaded", "load", "networkidle"]
 _INTERACT_ACTIONS = [
-    "left_click", "right_click", "middle_click", "double_click", "triple_click",
-    "hover", "type", "key", "scroll", "drag", "screenshot", "zoom", "wait",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "hover",
+    "type",
+    "key",
+    "scroll",
+    "drag",
+    "screenshot",
+    "zoom",
+    "wait",
 ]
 _SNAPSHOT_MODES = ["default", "simple", "interactive"]
 _AUTO_SNAPSHOT_MODES = ["simple", "default", "interactive", "off"]
@@ -74,6 +82,7 @@ _AUTO_SNAPSHOT_MODES = ["simple", "default", "interactive", "off"]
 
 def _floats(expected: int):
     """argparse ``type`` for a comma-separated fraction list, e.g. "0.3,0.6"."""
+
     def parse(value: str) -> list[float]:
         try:
             parts = [float(p) for p in value.split(",")]
@@ -82,6 +91,7 @@ def _floats(expected: int):
         if len(parts) != expected:
             raise argparse.ArgumentTypeError(f"expected {expected} comma-separated numbers, got {len(parts)}")
         return parts
+
     return parse
 
 
@@ -97,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="hive-browser",
         parents=[common],
         description="Drive the Hive browser (Beeline extension) from the terminal. "
-                    "Replaces the browser_* MCP tools; agents invoke it via terminal_exec with --json.",
+        "Replaces the browser_* MCP tools; agents invoke it via terminal_exec with --json.",
     )
     cmds = p.add_subparsers(dest="cmd", required=True)
 
@@ -134,8 +144,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("url")
     sp.add_argument("--tab", type=int)
     sp.add_argument("--wait-until", dest="wait_until", choices=_WAIT_UNTIL, default="load")
-    sp.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=30000,
-                    help="how long to wait for the --wait-until condition (ms)")
+    sp.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=30000, help="how long to wait for the --wait-until condition (ms)")
     sp.add_argument("--browser-profile", dest="browser_profile")
     sp.set_defaults(func=nav.cmd_navigate)
 
@@ -191,12 +200,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = leaf("screenshot", "capture the tab (JPEG spilled to a file, path returned)", always_json=True)
     sp.add_argument("--intent")
-    sp.add_argument("--full-page", dest="full_page", action="store_true",
-                    help="capture the document region (bounded; downscaled to 800px wide like the default)")
+    sp.add_argument(
+        "--full-page", dest="full_page", action="store_true", help="capture the document region (bounded; downscaled to 800px wide like the default)"
+    )
     sp.add_argument("--selector")
     sp.add_argument("--no-annotate", dest="no_annotate", action="store_true")
-    sp.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=5000,
-                    help="selector wait (ms) when --selector is given (polls like interact)")
+    sp.add_argument(
+        "--timeout-ms", dest="timeout_ms", type=int, default=5000, help="selector wait (ms) when --selector is given (polls like interact)"
+    )
     sp.add_argument("--tab", type=int)
     sp.set_defaults(func=capture.cmd_screenshot)
 
@@ -360,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
         result = _help(args)
         if as_json:
             import json
+
             print(json.dumps(result, indent=2, default=str))
         else:
             _render(result)

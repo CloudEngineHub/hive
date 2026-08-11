@@ -24,7 +24,7 @@ import re
 import tarfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 MARKER_NAME = "user_report.json"
@@ -36,7 +36,7 @@ _TEXT_SUFFIXES = {".json", ".jsonl", ".md", ".txt", ".log", ".yaml", ".yml", ".c
 # Bundle goes to GCS, not a size-capped DB, so we keep everything. A high
 # ceiling only guards against a pathological runaway session dir.
 _BINARY_BUDGET_BYTES = 1024 * 1024 * 1024  # 1 GiB total binary
-_MAX_SINGLE_BINARY = 256 * 1024 * 1024     # 256 MiB single file
+_MAX_SINGLE_BINARY = 256 * 1024 * 1024  # 256 MiB single file
 
 # --- credential patterns (the "scrub everywhere" tier) ----------------------
 _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -51,9 +51,7 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\1\2[REDACTED_SECRET]",
     ),
     (
-        re.compile(
-            r"https?://[^\s\"']+?[?&](?:code|state|access_token|refresh_token|id_token|token|key|secret|password)=[^\s\"']*"
-        ),
+        re.compile(r"https?://[^\s\"']+?[?&](?:code|state|access_token|refresh_token|id_token|token|key|secret|password)=[^\s\"']*"),
         "[REDACTED_AUTH_URL]",
     ),
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}"), "[REDACTED_KEY]"),
@@ -61,6 +59,7 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"), "[REDACTED_KEY]"),
     (re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"), "[REDACTED_KEY]"),
 ]
+
 
 def scrub_credentials(text: str) -> str:
     if not text:
@@ -82,12 +81,10 @@ class BundleStats:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_user_report_marker(
-    session_dir: Path, description: str, severity: str
-) -> dict:
+def write_user_report_marker(session_dir: Path, description: str, severity: str) -> dict:
     """Drop the training-signal marker at the session root.
 
     The exporter reads this to label the session's episodes bad/user_reported.
@@ -178,8 +175,7 @@ def build_session_report_bundle(
                 "omitted_paths": stats.omitted_paths[:50],
             },
         }
-        _add_bytes(tar, f"session_{session_id}/report_manifest.json",
-                   json.dumps(manifest, indent=2).encode("utf-8"))
+        _add_bytes(tar, f"session_{session_id}/report_manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
 
     return buf.getvalue(), stats
 

@@ -171,10 +171,7 @@ class PlaybookRun:
         self._lane_specs[name] = {"concurrency": concurrency, "rate_per_min": rate_per_min}
         if rate_per_min is not None and rate_per_min > 0:
             self._lane_gates[name] = _RateGate(float(rate_per_min))
-            self.log(
-                f"lane '{name}': concurrency={concurrency}, rate_per_min={rate_per_min} "
-                f"(>= {60.0 / rate_per_min:.1f}s between dispatches)"
-            )
+            self.log(f"lane '{name}': concurrency={concurrency}, rate_per_min={rate_per_min} (>= {60.0 / rate_per_min:.1f}s between dispatches)")
         cap = self._concurrency_cap
         if cap is not None and concurrency > cap:
             self.log(
@@ -300,7 +297,7 @@ class PlaybookRun:
         if not backoff:
             return
         if backoff == "exp":
-            await asyncio.sleep(min(30.0, 2.0 ** attempt))
+            await asyncio.sleep(min(30.0, 2.0**attempt))
         elif backoff == "linear":
             await asyncio.sleep(min(30.0, 2.0 * attempt))
         # unknown backoff spec -> no sleep
@@ -347,15 +344,9 @@ class PlaybookRun:
             rounds_run += 1
             results = await self._dispatch_round(rows, dispatch, chunk)
             failed = sum(1 for r in results if _is_failure(r))
-            self.log(
-                f"round {rounds_run}: {len(rows)} dispatched, "
-                f"{len(rows) - failed} ok, {failed} failed"
-            )
+            self.log(f"round {rounds_run}: {len(rows)} dispatched, {len(rows) - failed} ok, {failed} failed")
             if circuit_breaker is not None and rows and (failed / len(rows)) > circuit_breaker:
-                self.log(
-                    f"circuit breaker tripped: {failed}/{len(rows)} failed "
-                    f"> {circuit_breaker:.0%}; stopping"
-                )
+                self.log(f"circuit breaker tripped: {failed}/{len(rows)} failed > {circuit_breaker:.0%}; stopping")
                 break
 
         # Whatever is still pending when we stop is the unresolved gap —

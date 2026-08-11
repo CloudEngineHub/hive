@@ -41,9 +41,7 @@ def _cloud() -> Any | None:
     return get_registry().cloud()
 
 
-def default_idempotency_key(
-    colony_id: str, to_email: str, subject: str, campaign_id: str = "", step: int = 1
-) -> str:
+def default_idempotency_key(colony_id: str, to_email: str, subject: str, campaign_id: str = "", step: int = 1) -> str:
     """A stable key for "this logical message to this person".
 
     Retrying a send after a network blip must NOT deliver a second copy. The key
@@ -110,9 +108,7 @@ def reserve(
         payload["step"] = step
     # Always send a key. Retry safety must not be opt-in — the caller who forgets
     # it is exactly the caller who will double-send.
-    payload["idempotency_key"] = idempotency_key or default_idempotency_key(
-        colony_id, to_email, subject, campaign_id, step
-    )
+    payload["idempotency_key"] = idempotency_key or default_idempotency_key(colony_id, to_email, subject, campaign_id, step)
 
     try:
         return client.reserve_send(payload)

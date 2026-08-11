@@ -83,8 +83,7 @@ async def cmd_open(args: argparse.Namespace) -> dict:
             "browser_profile": ctx.get("browser_profile"),
             **group_summary,
         }
-        log_tool_call("browser_open", params, result=result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=tab_id, action=("open", url))
+        log_tool_call("browser_open", params, result=result, duration_ms=(time.perf_counter() - start) * 1000, tab_id=tab_id, action=("open", url))
         return result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
@@ -94,20 +93,20 @@ async def cmd_open(args: argparse.Namespace) -> dict:
                 "A tab was created before this error. Run `hive-browser tab list` to verify "
                 "state, or `hive-browser tab close` to discard it, before retrying."
             )
-        log_tool_call("browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=tab_id, action=("open", url))
+        log_tool_call("browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=tab_id, action=("open", url))
         return result
 
 
 async def cmd_navigate(args: argparse.Namespace) -> dict:
     # Import navigation helpers lazily so the module import stays cheap and the
     # rate-limiter (framework dep) is only pulled when a nav actually runs.
+    from framework.rate_limiter import SocialRateLimiter
+
     from gcu.browser.tools.navigation import (
         _LINKEDIN_PROFILE_RE,
         _is_instagram_profile_url,
         _record_profile_view,
     )
-    from framework.rate_limiter import SocialRateLimiter
 
     url = args.url
     tab_id = args.tab
@@ -152,6 +151,7 @@ async def cmd_navigate(args: argparse.Namespace) -> dict:
         check = limiter.check(_profile_platform, _nav_account_id, "profile_view")
         if not check["allowed"]:
             from gcu.browser.hooks.rate_limit_hook import RATE_LIMIT_GUIDANCE
+
             result = {
                 "ok": False,
                 "error": "rate_limited",
@@ -169,8 +169,14 @@ async def cmd_navigate(args: argparse.Namespace) -> dict:
         # Propagate ANY bridge-level failure (pending dialog, DNS / chrome-error
         # page) — don't hardcode ok:true over it (audit B3).
         if not nav_result.get("ok", True):
-            log_tool_call("browser_navigate", params, result=nav_result, duration_ms=(time.perf_counter() - start) * 1000,
-                          tab_id=target_tab, action=("navigate", url))
+            log_tool_call(
+                "browser_navigate",
+                params,
+                result=nav_result,
+                duration_ms=(time.perf_counter() - start) * 1000,
+                tab_id=target_tab,
+                action=("navigate", url),
+            )
             return {**nav_result, "tabId": target_tab}
         group_summary = await summarize_group_tabs(bridge, ctx)
         result = {
@@ -183,13 +189,15 @@ async def cmd_navigate(args: argparse.Namespace) -> dict:
         }
         if _profile_platform:
             _record_profile_view(_profile_platform, _nav_account_id)
-        log_tool_call("browser_navigate", params, result=result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("navigate", url))
+        log_tool_call(
+            "browser_navigate", params, result=result, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("navigate", url)
+        )
         return result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_navigate", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("navigate", url))
+        log_tool_call(
+            "browser_navigate", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("navigate", url)
+        )
         return result
 
 
@@ -217,11 +225,18 @@ async def cmd_reload(args: argparse.Namespace) -> dict:
 
     try:
         nav_result = await bridge.reload(target_tab)
-        log_tool_call("browser_reload", params, result=nav_result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("navigate", "reload"))
+        log_tool_call(
+            "browser_reload",
+            params,
+            result=nav_result,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            tab_id=target_tab,
+            action=("navigate", "reload"),
+        )
         return nav_result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_reload", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("navigate", "reload"))
+        log_tool_call(
+            "browser_reload", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("navigate", "reload")
+        )
         return result

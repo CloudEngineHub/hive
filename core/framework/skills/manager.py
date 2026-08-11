@@ -184,9 +184,7 @@ class SkillsManager:
 
         # 1c. Apply override filtering.
         self._all_skills = list(discovered)
-        discovered = self._apply_overrides(
-            discovered, skills_config, queen_store, self._config.default_preset_skills
-        )
+        discovered = self._apply_overrides(discovered, skills_config, queen_store, self._config.default_preset_skills)
 
         catalog = SkillCatalog(discovered)
         self._catalog = catalog

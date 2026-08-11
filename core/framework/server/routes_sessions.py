@@ -32,12 +32,12 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError as _AiohttpConnReset
 
 from framework.config import COLONIES_DIR
-from framework.utils.text import humanize_slug
 from framework.server.app import (
     resolve_session,
     validate_agent_path,
 )
 from framework.server.session_manager import SessionManager
+from framework.utils.text import humanize_slug
 
 logger = logging.getLogger(__name__)
 
@@ -1196,9 +1196,7 @@ async def handle_create_trigger(request: web.Request) -> web.Response:
 
     trigger_type = body.get("trigger_type", "timer")
     if trigger_type != "timer":
-        return web.json_response(
-            {"error": "Only 'timer' schedules can be created here."}, status=400
-        )
+        return web.json_response({"error": "Only 'timer' schedules can be created here."}, status=400)
 
     raw_config = body.get("trigger_config")
     if not isinstance(raw_config, dict):
@@ -1209,17 +1207,13 @@ async def handle_create_trigger(request: web.Request) -> web.Response:
     cron_expr = raw_config.get("cron")
     interval = raw_config.get("interval_minutes")
     if cron_expr is not None and not isinstance(cron_expr, str):
-        return web.json_response(
-            {"error": "'trigger_config.cron' must be a string"}, status=400
-        )
+        return web.json_response({"error": "'trigger_config.cron' must be a string"}, status=400)
     if cron_expr:
         try:
             from croniter import croniter
 
             if not croniter.is_valid(cron_expr):
-                return web.json_response(
-                    {"error": f"Invalid cron expression: {cron_expr}"}, status=400
-                )
+                return web.json_response({"error": f"Invalid cron expression: {cron_expr}"}, status=400)
         except ImportError:
             return web.json_response(
                 {"error": "croniter package not installed — cannot validate cron expression."},
@@ -1232,9 +1226,7 @@ async def handle_create_trigger(request: web.Request) -> web.Response:
             status=400,
         )
     elif not isinstance(interval, (int, float)) or interval <= 0:
-        return web.json_response(
-            {"error": "'trigger_config.interval_minutes' must be > 0"}, status=400
-        )
+        return web.json_response({"error": "'trigger_config.interval_minutes' must be > 0"}, status=400)
     else:
         trigger_config = {"interval_minutes": interval}
 
@@ -1263,9 +1255,7 @@ async def handle_create_trigger(request: web.Request) -> web.Response:
         # Roll back the half-registered definition so a failed start doesn't
         # leave a dangling inactive trigger behind.
         available.pop(trigger_id, None)
-        return web.json_response(
-            {"error": f"Failed to start trigger timer: {exc}"}, status=500
-        )
+        return web.json_response({"error": f"Failed to start trigger timer: {exc}"}, status=500)
 
     tdef.enabled = True
     session.active_trigger_ids.add(trigger_id)
@@ -1775,12 +1765,8 @@ def _history_read_executor() -> concurrent.futures.ThreadPoolExecutor:
         with _HISTORY_READ_EXECUTOR_LOCK:
             ex = _HISTORY_READ_EXECUTOR
             if ex is None:
-                workers = max(
-                    4, int(os.environ.get("HIVE_HISTORY_READ_WORKERS", "8"))
-                )
-                ex = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix="hive-history-read"
-                )
+                workers = max(4, int(os.environ.get("HIVE_HISTORY_READ_WORKERS", "8")))
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hive-history-read")
                 _HISTORY_READ_EXECUTOR = ex
     return ex
 
@@ -2093,7 +2079,7 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
             ),
             timeout=_EVENTS_HISTORY_READ_TIMEOUT_S,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # The read couldn't complete in time — almost always the shared thread
         # pool being saturated, not a slow disk. Fail fast with a retryable
         # error so the request (and the desktop's loading overlay) can't hang
@@ -2101,8 +2087,7 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
         # NB: must precede the OSError handler — asyncio.TimeoutError is the
         # builtin TimeoutError on 3.11+, which is itself an OSError subclass.
         logger.warning(
-            "events/history read timed out after %.0fs for session=%s "
-            "(thread pool saturated?)",
+            "events/history read timed out after %.0fs for session=%s (thread pool saturated?)",
             _EVENTS_HISTORY_READ_TIMEOUT_S,
             session_id,
         )
@@ -2470,22 +2455,24 @@ async def handle_report_session_bundle(request: web.Request) -> web.Response:
     bundle_path = reports_dir / filename
     bundle_path.write_bytes(bundle)
 
-    return web.json_response({
-        "ok": True,
-        "filename": filename,
-        "bundle_path": str(bundle_path),
-        "size": len(bundle),
-        "sha256": sha256_hex(bundle),
-        "content_type": "application/gzip",
-        "marker": marker,
-        "stats": {
-            "files": stats.files,
-            "text_files": stats.text_files,
-            "binary_files": stats.binary_files,
-            "binary_omitted": stats.binary_omitted,
-            "images_stripped": stats.images_stripped,
-        },
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "filename": filename,
+            "bundle_path": str(bundle_path),
+            "size": len(bundle),
+            "sha256": sha256_hex(bundle),
+            "content_type": "application/gzip",
+            "marker": marker,
+            "stats": {
+                "files": stats.files,
+                "text_files": stats.text_files,
+                "binary_files": stats.binary_files,
+                "binary_omitted": stats.binary_omitted,
+                "images_stripped": stats.images_stripped,
+            },
+        }
+    )
 
 
 def _colony_root_for_session_dir(session_dir: Path) -> Path | None:

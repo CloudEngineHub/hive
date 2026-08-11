@@ -1638,9 +1638,7 @@ class TestRepairOrphanedToolCalls:
             {
                 "role": "assistant",
                 "content": "Hollinden in.",
-                "tool_calls": [
-                    {"id": "tc_1", "function": {"name": "tracker_sql", "arguments": "{}"}}
-                ],
+                "tool_calls": [{"id": "tc_1", "function": {"name": "tracker_sql", "arguments": "{}"}}],
             },
             {"role": "user", "content": "[WORKER_REPORT] Hubcap"},
             {"role": "user", "content": "[WORKER_REPORT] Hivehouse"},
@@ -1961,7 +1959,8 @@ class TestProactiveMicrocompact:
         for m in cleared:
             assert m.content.startswith("Old tool result"), f"oldest should be cleared, got {m.content[:80]!r}"
             assert "terminal_rg" in m.content and "/tmp/data/terminal_exec_" in m.content, (
-                f"cleared placeholder must cite a recovery path, got {m.content!r}")
+                f"cleared placeholder must cite a recovery path, got {m.content!r}"
+            )
         for m in kept:
             assert m.content.startswith("file_"), f"recent result should be intact, got {m.content[:80]!r}"
 
@@ -1989,8 +1988,7 @@ class TestProactiveMicrocompact:
 
         tool_msgs = [m for m in conv.messages if m.role == "tool"]
         for m in tool_msgs:
-            assert not m.content.startswith("Old tool result"), (
-                f"path-less result must not be cleared, got {m.content[:80]!r}")
+            assert not m.content.startswith("Old tool result"), f"path-less result must not be cleared, got {m.content[:80]!r}"
             assert m.content.startswith("result_")
 
     @pytest.mark.asyncio
@@ -2003,11 +2001,9 @@ class TestProactiveMicrocompact:
         for i in range(MICROCOMPACT_KEEP_RECENT):
             await conv.add_assistant_message(
                 content="",
-                tool_calls=[{"id": f"c{i}", "type": "function",
-                             "function": {"name": "terminal_exec", "arguments": "{}"}}],
+                tool_calls=[{"id": f"c{i}", "type": "function", "function": {"name": "terminal_exec", "arguments": "{}"}}],
             )
-            await conv.add_tool_result(tool_use_id=f"c{i}", content="z" * 200,
-                                       spillover_path=f"/d/e_{i}.txt")
+            await conv.add_tool_result(tool_use_id=f"c{i}", content="z" * 200, spillover_path=f"/d/e_{i}.txt")
         tool_msgs = [m for m in conv.messages if m.role == "tool"]
         assert all(not m.content.startswith("Old tool result") for m in tool_msgs)
 
@@ -2021,11 +2017,11 @@ class TestProactiveMicrocompact:
         for i in range(MICROCOMPACT_KEEP_RECENT + 1):
             await conv.add_assistant_message(
                 content="",
-                tool_calls=[{"id": f"c{i}", "type": "function",
-                             "function": {"name": "terminal_exec", "arguments": "{}"}}],
+                tool_calls=[{"id": f"c{i}", "type": "function", "function": {"name": "terminal_exec", "arguments": "{}"}}],
             )
-            await conv.add_tool_result(tool_use_id=f"c{i}", content=f"payload_{i} " + ("x" * 200),
-                                       spillover_path=f"/session/data/terminal_exec_{i}.txt")
+            await conv.add_tool_result(
+                tool_use_id=f"c{i}", content=f"payload_{i} " + ("x" * 200), spillover_path=f"/session/data/terminal_exec_{i}.txt"
+            )
         oldest = [m for m in conv.messages if m.role == "tool"][0]
         assert oldest.content.startswith("Old tool result")
         assert "/session/data/terminal_exec_0.txt" in oldest.content

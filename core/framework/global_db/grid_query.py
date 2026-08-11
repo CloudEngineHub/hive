@@ -134,9 +134,7 @@ def build_search_clause(search: Any, allowed: set[str]) -> str:
     cols = sorted(allowed)
     if not cols:
         return ""
-    ors = " OR ".join(
-        f"{_as_text(quote_ident(c))} ILIKE {lit} ESCAPE '\\'" for c in cols
-    )
+    ors = " OR ".join(f"{_as_text(quote_ident(c))} ILIKE {lit} ESCAPE '\\'" for c in cols)
     return f"({ors})"
 
 
@@ -206,10 +204,7 @@ def build_group_counts(
         build_filter_clause(filters, allowed),
         build_search_clause(search, allowed),
     )
-    sql = (
-        f"SELECT {col} AS value, count(*) AS count "
-        f"FROM {t}{where} GROUP BY {col} ORDER BY count(*) DESC, {col} ASC"
-    )
+    sql = f"SELECT {col} AS value, count(*) AS count FROM {t}{where} GROUP BY {col} ORDER BY count(*) DESC, {col} ASC"
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
     return sql
@@ -218,7 +213,5 @@ def build_group_counts(
 def build_delete(table: str, pk: dict[str, Any], pk_cols: list[str]) -> str:
     if not pk_cols:
         raise SqlBuildError("table has no primary key")
-    conds = " AND ".join(
-        f"{quote_ident(c)} = {sql_literal(pk[c])}" for c in pk_cols
-    )
+    conds = " AND ".join(f"{quote_ident(c)} = {sql_literal(pk[c])}" for c in pk_cols)
     return f"DELETE FROM {quote_ident(table)} WHERE {conds}"

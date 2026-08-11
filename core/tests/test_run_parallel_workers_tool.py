@@ -1,4 +1,4 @@
-"""Coverage of the run_parallel_workers tool (fire-and-forget contract).
+"""Coverage of the run_worker tool (fire-and-forget contract).
 
 The tool spawns workers and returns immediately with worker_ids. Each
 worker's completion arrives on the event bus as SUBAGENT_REPORT, which
@@ -147,7 +147,7 @@ async def test_run_parallel_workers_tool_returns_immediately_and_emits_reports(
         tools=[],
         tool_executor=_stub_executor,
         event_bus=bus,
-        colony_id="async_test",
+        stream_id="async_test",
         pipeline_stages=[],
     )
     await colony.start()
@@ -164,14 +164,35 @@ async def test_run_parallel_workers_tool_returns_immediately_and_emits_reports(
     registry = ToolRegistry()
     register_queen_lifecycle_tools(registry, session=session, session_id=session.id)
 
+    # run_worker requires (a) a colony binding on the execution context and
+    # (b) at least one registered writable tracker table — both established by
+    # the queen when it forks a colony. Replicate that setup so the tool can
+    # dispatch (workers coordinate through the shared tracker).
+    from framework.host.colony_binding import ColonyBinding
+    from framework.host.tracker_db import ensure_tracker_db
+    from framework.tools.tracker_tools import (
+        _make_tracker_register_executor,
+        _make_tracker_sql_executor,
+    )
+
+    _col_dir = tmp_path / "colony"
+    _col_dir.mkdir(parents=True, exist_ok=True)
+    _db_path = ensure_tracker_db(_col_dir)  # returns the canonical tracker/ path
+    _binding = ColonyBinding(name="async_test", dir=_col_dir, tracker_db=_db_path)
+    _binding_tok = ToolRegistry.set_execution_context(binding=_binding)
+    _sql = _make_tracker_sql_executor()
+    await _sql({"sql": "CREATE TABLE work (id INTEGER PRIMARY KEY, result TEXT)"})
+    await _sql({"sql": "CREATE UNIQUE INDEX work_id ON work(id)"})
+    await _make_tracker_register_executor()({"table": "work", "write_columns": ["result"], "key_columns": ["id"]})
+
     try:
         tools = registry.get_tools()
-        assert "run_parallel_workers" in tools
+        assert "run_worker" in tools
 
         executor = registry.get_executor()
         tool_use = ToolUse(
             id="tu_run_parallel",
-            name="run_parallel_workers",
+            name="run_worker",
             input={
                 "tasks": [
                     {"task": "fetch-A"},
@@ -193,7 +214,7 @@ async def test_run_parallel_workers_tool_returns_immediately_and_emits_reports(
 
         assert not result.is_error, f"Tool errored: {result.content}"
         payload = json.loads(result.content)
-        assert payload["status"] == "started"
+        assert payload.get("status") == "started", payload
         assert payload["worker_count"] == 3
         assert len(payload["worker_ids"]) == 3
         assert payload["soft_timeout_seconds"] == 30.0
@@ -219,6 +240,7 @@ async def test_run_parallel_workers_tool_returns_immediately_and_emits_reports(
         worker_dirs = list(worker_root.iterdir())
         assert len(worker_dirs) == 3
     finally:
+        ToolRegistry.reset_execution_context(_binding_tok)
         await colony.stop()
 
 
@@ -245,7 +267,7 @@ async def test_run_parallel_workers_returns_error_when_no_colony() -> None:
     executor = registry.get_executor()
     tool_use = ToolUse(
         id="tu_no_colony",
-        name="run_parallel_workers",
+        name="run_worker",
         input={"tasks": [{"task": "anything"}]},
     )
     result = executor(tool_use)
@@ -275,7 +297,7 @@ async def test_run_parallel_workers_validates_tasks_input() -> None:
         tools=[],
         tool_executor=_stub_executor,
         event_bus=bus,
-        colony_id="phase4_validation",
+        stream_id="phase4_validation",
         pipeline_stages=[],
     )
     await colony.start()
@@ -285,7 +307,7 @@ async def test_run_parallel_workers_validates_tasks_input() -> None:
     executor = registry.get_executor()
 
     async def _call(payload: dict) -> dict:
-        r = executor(ToolUse(id="tu", name="run_parallel_workers", input=payload))
+        r = executor(ToolUse(id="tu", name="run_worker", input=payload))
         if asyncio.iscoroutine(r):
             r = await r
         return json.loads(r.content)
@@ -380,7 +402,7 @@ async def _build_colony(tmp_path: Path, llm: LLMProvider, colony_id: str) -> Col
         tools=[],
         tool_executor=_stub_executor,
         event_bus=bus,
-        colony_id=colony_id,
+        stream_id=colony_id,
         pipeline_stages=[],
     )
     await colony.start()

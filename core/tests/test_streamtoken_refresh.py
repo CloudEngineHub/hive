@@ -25,7 +25,6 @@ import asyncio
 import base64
 import json
 from typing import Any
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -40,11 +39,7 @@ def _make_jwt(payload: dict[str, Any]) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
 
     def b64(d: dict[str, Any]) -> str:
-        return (
-            base64.urlsafe_b64encode(json.dumps(d).encode("utf-8"))
-            .rstrip(b"=")
-            .decode("ascii")
-        )
+        return base64.urlsafe_b64encode(json.dumps(d).encode("utf-8")).rstrip(b"=").decode("ascii")
 
     return f"{b64(header)}.{b64(payload)}.fake-signature"
 
@@ -79,10 +74,7 @@ class TestComputeSleepSeconds:
         # exp 1h from now, threshold 2h → fire now (clamped to min).
         now = 1000.0
         exp = int(now + 3600)
-        assert (
-            sr.compute_sleep_seconds(exp, now, refresh_before_seconds=7200)
-            == sr.MIN_SLEEP_SECONDS
-        )
+        assert sr.compute_sleep_seconds(exp, now, refresh_before_seconds=7200) == sr.MIN_SLEEP_SECONDS
 
     def test_far_from_expiry_clamps_to_max(self):
         # exp 10h from now, threshold 2h → 8h until refresh, but
@@ -137,9 +129,7 @@ def _resp(status: int, body: dict[str, Any] | None = None) -> httpx.Response:
 class TestPostRefresh:
     @pytest.mark.asyncio
     async def test_happy_path_returns_new_token(self):
-        client = _FakeAsyncClient(
-            _resp(200, {"success": True, "streamToken": "new-token-xyz"})
-        )
+        client = _FakeAsyncClient(_resp(200, {"success": True, "streamToken": "new-token-xyz"}))
 
         result = await sr.post_refresh(
             "https://app.example.com",
@@ -302,14 +292,10 @@ class TestTryRefreshNow:
         import time
 
         # Stored token is expired — that's what triggered the call.
-        old_token = _make_jwt(
-            {"sub": "u@e.com", "exp": int(time.time()) - 60}
-        )
+        old_token = _make_jwt({"sub": "u@e.com", "exp": int(time.time()) - 60})
         # New token the backend mints has exp comfortably past the
         # refresh threshold, so subsequent lock holders skip the POST.
-        new_token = _make_jwt(
-            {"sub": "u@e.com", "exp": int(time.time()) + 24 * 3600}
-        )
+        new_token = _make_jwt({"sub": "u@e.com", "exp": int(time.time()) + 24 * 3600})
         store = _FakeStore(initial=_hive_cred(old_token))
         sr._credential_store_ref = store
         sr._aden_base_url_ref = "https://app.example.com"

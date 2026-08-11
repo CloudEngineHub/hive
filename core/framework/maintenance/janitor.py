@@ -235,8 +235,7 @@ def run_once(
     destructive = bool((tiers & {2, 3}) or include_legacy or include_junk)
     if execute and destructive and safety.offline and live_server_owns_hive_home():
         report.error = (
-            "a live runtime owns this HIVE_HOME (maintenance/server.lock); "
-            "run tiers 2/3 through POST /api/maintenance/janitor/run or stop the server"
+            "a live runtime owns this HIVE_HOME (maintenance/server.lock); run tiers 2/3 through POST /api/maintenance/janitor/run or stop the server"
         )
         report.finished_at = time.time()
         return report
@@ -309,9 +308,7 @@ def run_once(
                 if meta.get("queen_session_id") in safety.protected_session_ids:
                     tier2.skipped += 1
                     continue
-                sub = retention.deep_clean_worker(
-                    colony_id, worker_id, wdir, disposer=disposer, manifest=manifest
-                )
+                sub = retention.deep_clean_worker(colony_id, worker_id, wdir, disposer=disposer, manifest=manifest)
                 tier2.files += sub.files
                 tier2.bytes_freed += sub.bytes_freed
                 tier2.errors.extend(sub.errors)
@@ -322,7 +319,7 @@ def run_once(
             tier3 = TargetReport(name="queen_hygiene", tier=3)
             # Dedupe by resolved path: in layouts where QUEENS_DIR is the
             # legacy tree the two iterators overlap.
-            session_dirs: dict[str, "Path"] = {}
+            session_dirs: dict[str, Path] = {}
             if 3 in tiers:
                 for session_dir in retention.iter_queen_sessions():
                     session_dirs[str(session_dir.resolve())] = session_dir
@@ -334,9 +331,7 @@ def run_once(
                 if not ok:
                     tier3.skipped += 1
                     continue
-                sub = retention.prune_queen_session(
-                    session_dir, cfg=cfg, safety=safety, disposer=disposer, manifest=manifest
-                )
+                sub = retention.prune_queen_session(session_dir, cfg=cfg, safety=safety, disposer=disposer, manifest=manifest)
                 tier3.files += sub.files
                 tier3.bytes_freed += sub.bytes_freed
                 tier3.skipped += sub.skipped
@@ -345,11 +340,7 @@ def run_once(
             report.targets.append(tier3)
 
         if include_legacy:
-            report.targets.append(
-                retention.sweep_orphan_message_index(
-                    DeleteDisposer() if execute else DryRunDisposer(), manifest
-                )
-            )
+            report.targets.append(retention.sweep_orphan_message_index(DeleteDisposer() if execute else DryRunDisposer(), manifest))
 
         junk = retention.find_junk_entries(cfg.junk_min_bytes)
         junk_report = TargetReport(name="junk", tier=0)

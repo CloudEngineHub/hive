@@ -28,12 +28,8 @@ def _session(triggers, active):
 
 def test_rehydrates_every_trigger_not_just_the_latest():
     # The exact bug shape: two active timers in one colony.
-    slow = TriggerDefinition(
-        id="li_slow_invite", trigger_type="timer", trigger_config={"interval_minutes": 5}, description="slow invite"
-    )
-    poll = TriggerDefinition(
-        id="li_followup_poll", trigger_type="timer", trigger_config={"interval_minutes": 120}, description="poll"
-    )
+    slow = TriggerDefinition(id="li_slow_invite", trigger_type="timer", trigger_config={"interval_minutes": 5}, description="slow invite")
+    poll = TriggerDefinition(id="li_followup_poll", trigger_type="timer", trigger_config={"interval_minutes": 120}, description="poll")
     session = _session([slow, poll], active={"li_slow_invite", "li_followup_poll"})
 
     events = _authoritative_trigger_events(session)
@@ -80,12 +76,18 @@ def test_empty_when_no_triggers():
 
 def test_view_lists_every_trigger_with_enabled_status():
     active = TriggerDefinition(
-        id="li_followup_poll", trigger_type="timer", trigger_config={"interval_minutes": 120},
-        description="poll", task="run li_poll",
+        id="li_followup_poll",
+        trigger_type="timer",
+        trigger_config={"interval_minutes": 120},
+        description="poll",
+        task="run li_poll",
     )
     inactive = TriggerDefinition(
-        id="li_slow_invite", trigger_type="timer", trigger_config={"interval_minutes": 5},
-        description="slow invite", task="run li_invite",
+        id="li_slow_invite",
+        trigger_type="timer",
+        trigger_config={"interval_minutes": 5},
+        description="slow invite",
+        task="run li_invite",
     )
     session = _session([active, inactive], active={"li_followup_poll"})
 

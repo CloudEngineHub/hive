@@ -45,14 +45,11 @@ def _tool_executor() -> concurrent.futures.ThreadPoolExecutor:
         with _TOOL_EXECUTOR_LOCK:
             ex = _TOOL_EXECUTOR
             if ex is None:
-                workers = max(
-                    8, int(os.environ.get("HIVE_TOOL_EXECUTOR_WORKERS", "64"))
-                )
-                ex = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix="hive-tool"
-                )
+                workers = max(8, int(os.environ.get("HIVE_TOOL_EXECUTOR_WORKERS", "64")))
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hive-tool")
                 _TOOL_EXECUTOR = ex
     return ex
+
 
 # Pattern for detecting context-window-exceeded errors across LLM providers.
 _CONTEXT_TOO_LARGE_RE = re.compile(

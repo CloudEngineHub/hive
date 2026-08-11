@@ -27,13 +27,13 @@ from typing import Any
 # Exit codes — the stable agent contract. 0-2 align with hive-crm / hive-global-db.
 EXIT_OK = 0
 EXIT_DOMAIN = 1
-EXIT_NOT_CONNECTED = 2   # extension/bridge down → run `hive-browser setup`
-EXIT_NOT_STARTED = 3     # no context for this session → run `hive-browser open <url>`
-EXIT_NOT_FOUND = 4       # tab / element / selector not found
-EXIT_AMBIGUOUS = 5       # selector multi-match, or multiple Chrome profiles, none chosen
-EXIT_VALIDATION = 6      # bad args (missing --intent, malformed coordinate, privileged scheme)
+EXIT_NOT_CONNECTED = 2  # extension/bridge down → run `hive-browser setup`
+EXIT_NOT_STARTED = 3  # no context for this session → run `hive-browser open <url>`
+EXIT_NOT_FOUND = 4  # tab / element / selector not found
+EXIT_AMBIGUOUS = 5  # selector multi-match, or multiple Chrome profiles, none chosen
+EXIT_VALIDATION = 6  # bad args (missing --intent, malformed coordinate, privileged scheme)
 EXIT_PENDING_DIALOG = 7  # native dialog blocks the page → run `hive-browser dialog respond`
-EXIT_RATE_LIMITED = 8    # SocialRateLimiter blocked (LinkedIn/IG view cap)
+EXIT_RATE_LIMITED = 8  # SocialRateLimiter blocked (LinkedIn/IG view cap)
 
 
 class BrowserError(Exception):

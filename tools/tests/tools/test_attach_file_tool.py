@@ -255,10 +255,6 @@ class TestAttachFileGuards:
         # Total concatenated text must stay well under a typical
         # max_tool_result_chars (~30k) so the result isn't spilled.
         total_text = sum(len(b.text) for b in result if isinstance(b, TextContent))
-        assert total_text < 30_000, (
-            f"attach_file result is {total_text} chars — it would be spilled and the chip would break"
-        )
+        assert total_text < 30_000, f"attach_file result is {total_text} chars — it would be spilled and the chip would break"
         # The inline body is a capped preview, not the whole 120KB file.
-        assert any(
-            isinstance(b, TextContent) and "preview truncated" in b.text for b in result[1:]
-        )
+        assert any(isinstance(b, TextContent) and "preview truncated" in b.text for b in result[1:])

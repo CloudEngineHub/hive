@@ -217,9 +217,9 @@ class HiveInboxListener:
             if line.startswith(":"):  # comment / keepalive
                 continue
             if line.startswith("event:"):
-                event = line[len("event:"):].strip()
+                event = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                data_lines.append(line[len("data:"):].strip())
+                data_lines.append(line[len("data:") :].strip())
 
     async def _handle_event(self, event: str, raw: str) -> None:
         if event != "reply":
@@ -237,6 +237,4 @@ class HiveInboxListener:
         # Wrap with the (ref: token) footer so on_inbound resolves by token,
         # then strips it before injecting the reply into the queen.
         envelope = f"{token.format_ref(tok)} {reply}"
-        await self._manager.on_inbound(
-            "hive", "hive", envelope, None, source=data.get("colony_id")
-        )
+        await self._manager.on_inbound("hive", "hive", envelope, None, source=data.get("colony_id"))

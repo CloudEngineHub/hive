@@ -132,5 +132,3 @@ async def test_create_queen_keeps_configurable_mcp_tools_in_colony_phase(monkeyp
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
-
-

@@ -8,9 +8,9 @@ tail staying out of the eager tiers.
 """
 
 from framework.agents.queen.queen_tools_defaults import (
+    _TOOL_CATEGORIES,
     ALWAYS_ENABLED_CATEGORIES,
     WORKER_ALWAYS_ENABLED_CATEGORIES,
-    _TOOL_CATEGORIES,
     always_enabled_tool_names,
     worker_always_enabled_tool_names,
 )
@@ -43,7 +43,10 @@ def test_browser_split_partitions_legacy_categories():
     core = set(_TOOL_CATEGORIES["browser_core"])
     extended = set(_TOOL_CATEGORIES["browser_extended"])
     legacy = set(_TOOL_CATEGORIES["browser_basic"]) | set(_TOOL_CATEGORIES["browser_interaction"])
-    assert core & extended == set()
+    # browser_setup is a shared anchor present in every browser category (it
+    # pre-activates the browser-automation skill), so core/extended overlap
+    # only on it; otherwise they partition the legacy set.
+    assert core & extended == {"browser_setup"}
     assert core | extended == legacy
 
 
@@ -76,12 +79,12 @@ def test_queen_eager_tier_excludes_browser_cold_tail():
 
 def test_worker_keep_set_size_budget():
     eager = worker_always_enabled_tool_names()
-    assert len(eager) <= WORKER_KEEP_SET_MAX, (
-        f"worker keep-set grew to {len(eager)} names (max {WORKER_KEEP_SET_MAX}): {sorted(eager)}"
-    )
+    assert len(eager) <= WORKER_KEEP_SET_MAX, f"worker keep-set grew to {len(eager)} names (max {WORKER_KEEP_SET_MAX}): {sorted(eager)}"
 
 
 def test_worker_keep_set_keeps_the_measured_hot_core():
     eager = worker_always_enabled_tool_names()
     # The tools that do the actual work (all ≥5 invocations/1k carries).
-    assert {"browser_interact", "browser_script", "terminal_exec", "attach_file", "web_scrape"} <= eager
+    # browser_setup is the eager anchor (browser_interact/script are now
+    # searchable/gated rather than always-on).
+    assert {"browser_setup", "terminal_exec", "attach_file", "web_scrape"} <= eager

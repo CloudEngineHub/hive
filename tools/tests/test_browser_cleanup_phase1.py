@@ -128,9 +128,9 @@ async def test_forward_reaper_closes_only_marked_orphans_after_debounce():
     bridge._context_registry["agentA"] = {"groupId": 10, "name": "A", "registered_at_ms": 0.0}
 
     groups = [
-        {"id": 10, "title": "A" + HIVE_GROUP_MARKER},        # owned -> never reaped
-        {"id": 20, "title": "ghost" + HIVE_GROUP_MARKER},    # hive orphan -> reaped after 2 sweeps
-        {"id": 30, "title": "my notes"},                      # user group -> never reaped
+        {"id": 10, "title": "A" + HIVE_GROUP_MARKER},  # owned -> never reaped
+        {"id": 20, "title": "ghost" + HIVE_GROUP_MARKER},  # hive orphan -> reaped after 2 sweeps
+        {"id": 30, "title": "my notes"},  # user group -> never reaped
     ]
 
     # Sweep 1: debounce only, nothing closed yet.

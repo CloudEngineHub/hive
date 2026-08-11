@@ -237,9 +237,7 @@ def microcompact(
         # the whole file would only get truncated again at max_tool_result_chars
         # and force a pagination dance, whereas ripgrep returns just the matching
         # lines and keeps per-turn density low.
-        placeholder = (
-            f"Old tool result ({orig_len:,} chars) at {spillover}. Use terminal_rg with a pattern against this path to recover specifics."
-        )
+        placeholder = f"Old tool result ({orig_len:,} chars) at {spillover}. Use terminal_rg with a pattern against this path to recover specifics."
 
         # Mutate in-place (microcompact is synchronous, no store writes)
         conversation._messages[i] = Message(
@@ -958,6 +956,7 @@ async def log_compaction(
 
     if os.environ.get("HIVE_COMPACTION_DEBUG"):
         write_compaction_debug_log(ctx, before_pct, after_pct, level, pre_inventory)
+
 
 # NOTE: the deterministic "emergency" compaction summary (build_emergency_summary)
 # was removed — it crude-summarized and deleted the conversation, destroying user

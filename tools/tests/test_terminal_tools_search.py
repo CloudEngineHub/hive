@@ -138,9 +138,7 @@ def test_rg_fallback_respects_glob_and_case(search_tools, tmp_path, monkeypatch)
     (tmp_path / "a.txt").write_text("NEEDLE\n")
     (tmp_path / "b.py").write_text("needle\n")
 
-    result = search_tools["rg"](
-        pattern="needle", path=str(tmp_path), glob="*.py", ignore_case=True
-    )
+    result = search_tools["rg"](pattern="needle", path=str(tmp_path), glob="*.py", ignore_case=True)
     assert result["total"] == 1
     assert result["matches"][0]["path"].endswith("b.py")
     assert result["matches"][0]["line"] == 1

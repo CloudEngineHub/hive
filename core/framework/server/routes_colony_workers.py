@@ -184,11 +184,7 @@ async def handle_list_workers(request: web.Request) -> web.Response:
 
     # Legacy layout: <queen_session_dir>/workers/<worker_id>/.
     if storage_path is not None:
-        workers.extend(
-            await loop.run_in_executor(
-                executor, _walk_historical_workers, storage_path, known_ids
-            )
-        )
+        workers.extend(await loop.run_in_executor(executor, _walk_historical_workers, storage_path, known_ids))
 
     # Attach task progress summaries for active workers.
     from framework.tasks.store import get_task_store
@@ -815,9 +811,7 @@ def _do_fresh_snapshot(src_path: Path) -> Path:
     Acceptable for browsing.
     """
     _TRACKER_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    fd, dst_str = tempfile.mkstemp(
-        prefix="tracker-", suffix=".db", dir=str(_TRACKER_SNAPSHOT_DIR)
-    )
+    fd, dst_str = tempfile.mkstemp(prefix="tracker-", suffix=".db", dir=str(_TRACKER_SNAPSHOT_DIR))
     os.close(fd)
     dst = Path(dst_str)
 
@@ -825,9 +819,7 @@ def _do_fresh_snapshot(src_path: Path) -> Path:
     for attempt in range(3):
         try:
             shutil.copyfile(str(src_path), str(dst))
-            probe = sqlite3.connect(
-                f"file:{dst}?mode=ro&immutable=1", uri=True
-            )
+            probe = sqlite3.connect(f"file:{dst}?mode=ro&immutable=1", uri=True)
             try:
                 probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
             finally:
@@ -913,9 +905,7 @@ def _colony_data_timeout(colony_id: str, what: str) -> web.Response:
         colony_id,
         what,
     )
-    return web.json_response(
-        {"error": "colony_data_timeout", "colony_id": colony_id}, status=503
-    )
+    return web.json_response({"error": "colony_data_timeout", "colony_id": colony_id}, status=503)
 
 
 def _q(ident: str) -> str:
@@ -963,9 +953,7 @@ def _read_tables_overview(db_path: Path) -> list[dict]:
     # Do NOT unlink `snapshot` — the cache in _snapshot_tracker_to_local
     # owns its lifetime and shares it across concurrent readers within
     # the TTL window.
-    con = sqlite3.connect(
-        f"file:{snapshot}?mode=ro&immutable=1", uri=True, timeout=5.0
-    )
+    con = sqlite3.connect(f"file:{snapshot}?mode=ro&immutable=1", uri=True, timeout=5.0)
     try:
         con.row_factory = sqlite3.Row
         out: list[dict] = []
@@ -1006,9 +994,7 @@ def _read_table_rows(
     # See _read_tables_overview: immutable=1 skips WAL/journal machinery
     # so the reader never touches -shm/-wal. Do NOT unlink `snapshot` —
     # the cache in _snapshot_tracker_to_local owns its lifetime.
-    con = sqlite3.connect(
-        f"file:{snapshot}?mode=ro&immutable=1", uri=True, timeout=5.0
-    )
+    con = sqlite3.connect(f"file:{snapshot}?mode=ro&immutable=1", uri=True, timeout=5.0)
     try:
         con.row_factory = sqlite3.Row
         tables = set(_list_user_tables(con))
@@ -1107,17 +1093,14 @@ def _read_changes(db_path: Path, since: int) -> dict:
     con = sqlite3.connect(f"file:{snapshot}?mode=ro&immutable=1", uri=True, timeout=5.0)
     try:
         con.row_factory = sqlite3.Row
-        cursor = int(
-            con.execute("SELECT COALESCE(MAX(id), 0) AS c FROM _tracker_changes").fetchone()["c"]
-        )
+        cursor = int(con.execute("SELECT COALESCE(MAX(id), 0) AS c FROM _tracker_changes").fetchone()["c"])
         # Tables with our triggers installed — the client uses this to
         # fall back to row-count diffing for uncovered (unregistered)
         # tables instead of showing no signal at all.
         covered = [
             r["t"]
             for r in con.execute(
-                "SELECT DISTINCT tbl_name AS t FROM sqlite_master "
-                "WHERE type='trigger' AND name LIKE ? ESCAPE '\\'",
+                "SELECT DISTINCT tbl_name AS t FROM sqlite_master WHERE type='trigger' AND name LIKE ? ESCAPE '\\'",
                 (_CHANGE_TRIGGER_PREFIX.replace("_", "\\_") + "%",),
             )
         ]
@@ -1144,9 +1127,7 @@ def _read_changes(db_path: Path, since: int) -> dict:
             "cursor": cursor,
             "covered": covered,
             "truncated": truncated,
-            "tables": {
-                name: {"count": len(m), "rows": list(m.values())} for name, m in tables.items()
-            },
+            "tables": {name: {"count": len(m), "rows": list(m.values())} for name, m in tables.items()},
         }
     finally:
         con.close()
@@ -1310,8 +1291,7 @@ async def handle_global_crm_status(request: web.Request) -> web.Response:
     and the gate treats that as "let the CRM page show its own sign-in state",
     rather than dropping a signed-out user into the setup flow.
     """
-    from framework.crm import client as crm_client
-    from framework.crm import errors as crm_errors
+    from framework.crm import client as crm_client, errors as crm_errors
 
     try:
         result = await asyncio.to_thread(crm_client.setup_status)
@@ -1470,8 +1450,14 @@ async def handle_global_table_query(request: web.Request) -> web.Response:
 
     try:
         select_sql = grid_query.build_select(
-            table, allowed, filters=filters, search=search,
-            order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
+            table,
+            allowed,
+            filters=filters,
+            search=search,
+            order_by=order_by,
+            order_dir=order_dir,
+            limit=limit,
+            offset=offset,
         )
         count_sql = grid_query.build_count(table, allowed, filters=filters, search=search)
     except grid_query.SqlBuildError as e:
@@ -1491,15 +1477,17 @@ async def handle_global_table_query(request: web.Request) -> web.Response:
             total = int(next(iter(crows[0].values())))
         except (TypeError, ValueError):
             total = len(rows)
-    return web.json_response({
-        "table": table,
-        "columns": cols,
-        "primary_key": pk,
-        "rows": rows,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })
+    return web.json_response(
+        {
+            "table": table,
+            "columns": cols,
+            "primary_key": pk,
+            "rows": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
 
 
 # Cap on distinct groups returned, so a high-cardinality group column can't
@@ -1540,8 +1528,12 @@ async def handle_global_table_group_counts(request: web.Request) -> web.Response
 
     try:
         sql = grid_query.build_group_counts(
-            table, allowed, group_by=group_by, filters=filters,
-            search=search, limit=_GROUP_COUNTS_CAP,
+            table,
+            allowed,
+            group_by=group_by,
+            filters=filters,
+            search=search,
+            limit=_GROUP_COUNTS_CAP,
         )
     except grid_query.SqlBuildError as e:
         return web.json_response({"error": str(e)}, status=400)

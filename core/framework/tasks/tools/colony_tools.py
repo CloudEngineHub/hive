@@ -84,10 +84,7 @@ _UPDATE_DESC = (
     "Only the queen can call this."
 )
 
-_REMOVE_DESC = (
-    "Remove a template entry from your colony's spawn-plan template. The "
-    "id is reserved (high-water-mark preserved) — never reused."
-)
+_REMOVE_DESC = "Remove a template entry from your colony's spawn-plan template. The id is reserved (high-water-mark preserved) — never reused."
 
 _LIST_DESC = (
     "List all entries on your colony's spawn-plan template. Each entry "

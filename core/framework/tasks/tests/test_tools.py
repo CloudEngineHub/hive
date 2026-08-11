@@ -175,9 +175,7 @@ async def test_agent_can_archive_via_task_update(
         # Hidden from the default list, but visible with include_archived.
         listed = json.loads((await _invoke(reg, "task_list")).content)
         assert listed["count"] == 0
-        with_arch = json.loads(
-            (await _invoke(reg, "task_list", include_archived=True)).content
-        )
+        with_arch = json.loads((await _invoke(reg, "task_list", include_archived=True)).content)
         assert with_arch["count"] == 1
         assert with_arch["tasks"][0]["status"] == "archived"
     finally:
@@ -518,9 +516,7 @@ async def test_first_task_create_requires_goal(store: TaskStore) -> None:
         assert "goal" in body["error"].lower()
 
         # Same call with a goal → succeeds and stores the goal on meta.
-        result = await _invoke(
-            reg, "task_create", goal="research competitor pricing", tasks=[{"subject": "x"}]
-        )
+        result = await _invoke(reg, "task_create", goal="research competitor pricing", tasks=[{"subject": "x"}])
         body = json.loads(result.content)
         assert body["success"] is True
         meta = await store.get_meta("fresh_session")

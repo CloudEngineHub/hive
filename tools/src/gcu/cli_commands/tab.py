@@ -88,13 +88,13 @@ async def cmd_tab_close(args: argparse.Namespace) -> dict:
             ctx["activeTabId"] = tabs[0].get("id") if tabs else None
         _persist_contexts()  # survive the tab-set / active change across invocations
         result = {"ok": True, "closed": target_tab}
-        log_tool_call("browser_close", params, result=result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("close", ""))
+        log_tool_call(
+            "browser_close", params, result=result, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("close", "")
+        )
         return result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("close", ""))
+        log_tool_call("browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("close", ""))
         return result
 
 
@@ -129,11 +129,18 @@ async def cmd_tab_activate(args: argparse.Namespace) -> dict:
         # Persist so the activation survives across per-invocation CLI processes.
         _persist_contexts()
         result = {"ok": True, "tabId": tab_id}
-        log_tool_call("browser_activate_tab", params, result=result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=tab_id, action=("focus", str(tab_id)))
+        log_tool_call(
+            "browser_activate_tab",
+            params,
+            result=result,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            tab_id=tab_id,
+            action=("focus", str(tab_id)),
+        )
         return result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_activate_tab", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=tab_id, action=("focus", str(tab_id)))
+        log_tool_call(
+            "browser_activate_tab", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=tab_id, action=("focus", str(tab_id))
+        )
         return result

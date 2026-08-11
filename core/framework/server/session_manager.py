@@ -16,14 +16,14 @@ import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from framework.config import COLONIES_DIR, QUEENS_DIR
 from framework.host.colony_binding import ColonyBinding
-from framework.utils.text import humanize_slug
 from framework.host.triggers import TriggerDefinition
+from framework.utils.text import humanize_slug
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +322,7 @@ def _deduplicate_colony_id(colony_id: str) -> str:
         return colony_id
     # Strip any existing numeric suffix so we count from the base name.
     import re
+
     m = re.match(r"^(.+?)_(\d+)$", colony_id)
     base = m.group(1) if m else colony_id
     n = 2
@@ -781,9 +782,7 @@ class SessionManager:
 
                 update_colony_metadata(colony_id, {"scaffolded": False})
             except OSError:
-                logger.warning(
-                    "Failed to clear scaffolded flag for colony '%s'", colony_id
-                )
+                logger.warning("Failed to clear scaffolded flag for colony '%s'", colony_id)
 
         if not queen_name:
             queen_name = _colony_metadata.get("queen_name") or None
@@ -809,9 +808,7 @@ class SessionManager:
             # path untouched.
             _repaired: str | None = None
             if queen_resume_from:
-                if _find_colony_queen_session_dir(
-                    colony_id, queen_resume_from, queen_name
-                ):
+                if _find_colony_queen_session_dir(colony_id, queen_resume_from, queen_name):
                     _repaired = queen_resume_from
                 else:
                     _repaired = _latest_colony_queen_session_id(colony_id, queen_name)
@@ -1010,13 +1007,14 @@ class SessionManager:
             # the gap doesn't resurface on the next reopen. Colonies should
             # not auto-start work on open — only explicit user messages and
             # scheduled trigger fires activate them.
+            from datetime import datetime
+
             from framework.host.triggers import compute_missed
-            from datetime import datetime, timezone as tz
 
             persisted_triggers = _read_agent_triggers_json(agent_path)
             missed = compute_missed(persisted_triggers)
             if missed:
-                now_iso = datetime.now(tz=tz.utc).isoformat()
+                now_iso = datetime.now(tz=UTC).isoformat()
                 for m in missed:
                     tid = m.trigger_id
                     tdef = session.available_triggers.get(tid)

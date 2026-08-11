@@ -230,11 +230,7 @@ def _patch_worker_configs(colony_dir: Path, db_path: Path) -> int:
         if not isinstance(input_data, dict):
             input_data = {}
 
-        if (
-            input_data.get("db_path") == abs_db
-            and input_data.get("colony_id") == colony_id
-            and input_data.get("colony_data_dir") == abs_data_dir
-        ):
+        if input_data.get("db_path") == abs_db and input_data.get("colony_id") == colony_id and input_data.get("colony_data_dir") == abs_data_dir:
             continue  # already patched
 
         input_data["db_path"] = abs_db

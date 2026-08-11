@@ -125,9 +125,7 @@ def vacate_soft_deleted_colony(colony_id: str) -> str | None:
     # Pick a parked name free in BOTH roots so the colony and agent dirs stay
     # paired under the same suffix.
     n = 1
-    while (colonies_root / f"{colony_id}.deleted.{n}").exists() or (
-        agents_root / f"{colony_id}.deleted.{n}"
-    ).exists():
+    while (colonies_root / f"{colony_id}.deleted.{n}").exists() or (agents_root / f"{colony_id}.deleted.{n}").exists():
         n += 1
     parked = f"{colony_id}.deleted.{n}"
 

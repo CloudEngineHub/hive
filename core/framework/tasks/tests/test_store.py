@@ -196,9 +196,7 @@ async def test_reset_preserves_floor(store: TaskStore, session_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_archiving_stamps_batch_markers(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_archiving_stamps_batch_markers(store: TaskStore, session_id: str) -> None:
     """Archiving a task (update_task → archived) stamps the markers History
     groups by (goal) and un-archive restores from (archived_from)."""
     await store.ensure_task_list(session_id)
@@ -215,9 +213,7 @@ async def test_archiving_stamps_batch_markers(
 
 
 @pytest.mark.asyncio
-async def test_unarchive_restores_prior_status_and_strips_markers(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_unarchive_restores_prior_status_and_strips_markers(store: TaskStore, session_id: str) -> None:
     """Un-archiving puts each task back where it was (not a blanket
     'pending') and removes the markers, so a restored task re-enters the
     plan exactly as it left."""
@@ -239,19 +235,15 @@ async def test_unarchive_restores_prior_status_and_strips_markers(
 
 
 @pytest.mark.asyncio
-async def test_unarchive_ignores_non_archived_ids(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_unarchive_ignores_non_archived_ids(store: TaskStore, session_id: str) -> None:
     await store.ensure_task_list(session_id)
     await store.create_task(session_id, subject="active")  # never archived
     assert await store.unarchive_tasks(session_id, [1, 999]) == []
 
 
 @pytest.mark.asyncio
-async def test_archive_completed_archives_only_completed(
-    store: TaskStore, session_id: str
-) -> None:
-    """"Clear done" archives every completed task and leaves the rest,
+async def test_archive_completed_archives_only_completed(store: TaskStore, session_id: str) -> None:
+    """ "Clear done" archives every completed task and leaves the rest,
     stamping the same History markers the agent's own archive path does."""
     await store.ensure_task_list(session_id)
     await store.create_tasks_batch(
@@ -277,9 +269,7 @@ async def test_archive_completed_archives_only_completed(
 
 
 @pytest.mark.asyncio
-async def test_archive_completed_is_noop_without_completed(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_archive_completed_is_noop_without_completed(store: TaskStore, session_id: str) -> None:
     await store.ensure_task_list(session_id)
     await store.create_task(session_id, subject="open")
     await store.update_task(session_id, 1, status=TaskStatus.IN_PROGRESS)
@@ -289,9 +279,7 @@ async def test_archive_completed_is_noop_without_completed(
 
 
 @pytest.mark.asyncio
-async def test_archive_completed_missing_list_returns_empty(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_archive_completed_missing_list_returns_empty(store: TaskStore, session_id: str) -> None:
     """No task list for the session → [] (the route hits this for unknown
     sessions and must not error or create a doc as a side effect)."""
     assert await store.archive_completed_tasks(session_id) == []
@@ -299,9 +287,7 @@ async def test_archive_completed_missing_list_returns_empty(
 
 
 @pytest.mark.asyncio
-async def test_archive_completed_second_call_is_noop_and_preserves_stamps(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_archive_completed_second_call_is_noop_and_preserves_stamps(store: TaskStore, session_id: str) -> None:
     """Idempotence: a second "Clear done" archives nothing new, and does NOT
     restamp the History markers of tasks archived by the first call (a
     restamp would tear them out of their original History batch)."""
@@ -321,16 +307,12 @@ async def test_archive_completed_second_call_is_noop_and_preserves_stamps(
 
 
 @pytest.mark.asyncio
-async def test_archive_completed_then_unarchive_restores_completed(
-    store: TaskStore, session_id: str
-) -> None:
+async def test_archive_completed_then_unarchive_restores_completed(store: TaskStore, session_id: str) -> None:
     """Round-trip with History "remove": archived_from='completed' means
     unarchive puts the task back as COMPLETED (not pending) and strips the
     archive markers."""
     await store.ensure_task_list(session_id)
-    await store.create_tasks_batch(
-        session_id, [{"subject": "done"}, {"subject": "open"}], goal="Ship it"
-    )
+    await store.create_tasks_batch(session_id, [{"subject": "done"}, {"subject": "open"}], goal="Ship it")
     await store.update_task(session_id, 1, status=TaskStatus.COMPLETED)
     archived = await store.archive_completed_tasks(session_id)
     assert [r.id for r in archived] == [1]

@@ -38,14 +38,78 @@ def _get_config_overrides() -> dict[str, Any]:
 _LIMITS: dict[tuple[str, str], dict[str, Any]] = {
     # (platform, action): {hourly_default, hourly_max, daily_default, daily_max,
     #                       weekly_default, weekly_max, min_delay_s}
-    ("linkedin", "profile_view"): {"hourly_default": 25, "hourly_max": 100, "daily_default": 150, "daily_max": 400, "weekly_default": None,  "weekly_max": None, "min_delay_s": 5},
-    ("linkedin", "invite"):       {"hourly_default": 10, "hourly_max": 25,  "daily_default": 50,  "daily_max": 125, "weekly_default": 200,   "weekly_max": 500,  "min_delay_s": 30},
-    ("linkedin", "message"):      {"hourly_default": 20, "hourly_max": 80,  "daily_default": 60,  "daily_max": 200, "weekly_default": None,  "weekly_max": None, "min_delay_s": 15},
-    ("linkedin", "comment"):      {"hourly_default": 8,  "hourly_max": 30,  "daily_default": 50,  "daily_max": 150, "weekly_default": None,  "weekly_max": None, "min_delay_s": 20},
-    ("x", "reply"):               {"hourly_default": 10, "hourly_max": 30,  "daily_default": 50,  "daily_max": 150, "weekly_default": None,  "weekly_max": None, "min_delay_s": 30},
-    ("x", "dm"):                  {"hourly_default": 20, "hourly_max": 80,  "daily_default": 60,  "daily_max": 200, "weekly_default": None,  "weekly_max": None, "min_delay_s": 20},
-    ("x", "post"):                {"hourly_default": 5,  "hourly_max": 25,  "daily_default": 30,  "daily_max": 125, "weekly_default": None,  "weekly_max": None, "min_delay_s": 60},
-    ("instagram", "dm"):          {"hourly_default": 16, "hourly_max": 40,  "daily_default": 80,  "daily_max": 150, "weekly_default": 300,   "weekly_max": 500,  "min_delay_s": 45},
+    ("linkedin", "profile_view"): {
+        "hourly_default": 25,
+        "hourly_max": 100,
+        "daily_default": 150,
+        "daily_max": 400,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 5,
+    },
+    ("linkedin", "invite"): {
+        "hourly_default": 10,
+        "hourly_max": 25,
+        "daily_default": 50,
+        "daily_max": 125,
+        "weekly_default": 200,
+        "weekly_max": 500,
+        "min_delay_s": 30,
+    },
+    ("linkedin", "message"): {
+        "hourly_default": 20,
+        "hourly_max": 80,
+        "daily_default": 60,
+        "daily_max": 200,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 15,
+    },
+    ("linkedin", "comment"): {
+        "hourly_default": 8,
+        "hourly_max": 30,
+        "daily_default": 50,
+        "daily_max": 150,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 20,
+    },
+    ("x", "reply"): {
+        "hourly_default": 10,
+        "hourly_max": 30,
+        "daily_default": 50,
+        "daily_max": 150,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 30,
+    },
+    ("x", "dm"): {
+        "hourly_default": 20,
+        "hourly_max": 80,
+        "daily_default": 60,
+        "daily_max": 200,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 20,
+    },
+    ("x", "post"): {
+        "hourly_default": 5,
+        "hourly_max": 25,
+        "daily_default": 30,
+        "daily_max": 125,
+        "weekly_default": None,
+        "weekly_max": None,
+        "min_delay_s": 60,
+    },
+    ("instagram", "dm"): {
+        "hourly_default": 16,
+        "hourly_max": 40,
+        "daily_default": 80,
+        "daily_max": 150,
+        "weekly_default": 300,
+        "weekly_max": 500,
+        "min_delay_s": 45,
+    },
 }
 
 _SCHEMA = """\
@@ -132,6 +196,7 @@ class SocialRateLimiter:
     def __init__(self, db_path: str | Path | None = None):
         if db_path is None:
             from framework.config import HIVE_HOME
+
             db_path = HIVE_HOME / "social_rate_limits.db"
         self._db_path = Path(db_path).expanduser()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,9 +225,7 @@ class SocialRateLimiter:
             delay = _min_delay(platform, action_type)
             if delay > 0:
                 row = con.execute(
-                    "SELECT performed_at FROM actions "
-                    "WHERE platform = ? AND account_id = ? AND action_type = ? "
-                    "ORDER BY performed_at DESC LIMIT 1",
+                    "SELECT performed_at FROM actions WHERE platform = ? AND account_id = ? AND action_type = ? ORDER BY performed_at DESC LIMIT 1",
                     (platform, account_id, action_type),
                 ).fetchone()
                 if row is not None:
@@ -179,9 +242,9 @@ class SocialRateLimiter:
 
             # ── window checks (hourly → daily → weekly) ─────────
             _windows = (
-                ("hourly",  3600,   False),
-                ("daily",   86400,  True),
-                ("weekly",  604800, True),
+                ("hourly", 3600, False),
+                ("daily", 86400, True),
+                ("weekly", 604800, True),
             )
             hourly_count = hourly_limit = None
             daily_count = daily_limit = None
@@ -193,9 +256,7 @@ class SocialRateLimiter:
                     continue
                 window_start = now - window_secs
                 count = con.execute(
-                    "SELECT COUNT(*) FROM actions "
-                    "WHERE platform = ? AND account_id = ? AND action_type = ? "
-                    "AND performed_at >= ?",
+                    "SELECT COUNT(*) FROM actions WHERE platform = ? AND account_id = ? AND action_type = ? AND performed_at >= ?",
                     (platform, account_id, action_type, window_start),
                 ).fetchone()[0]
 
@@ -250,8 +311,7 @@ class SocialRateLimiter:
         con = self._connect()
         try:
             con.execute(
-                "INSERT INTO actions (platform, account_id, action_type, target_id, performed_at, session_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO actions (platform, account_id, action_type, target_id, performed_at, session_id) VALUES (?, ?, ?, ?, ?, ?)",
                 (platform.lower(), account_id, action_type.lower(), target_id, time.time(), session_id),
             )
             con.commit()
@@ -264,9 +324,7 @@ class SocialRateLimiter:
         con = self._connect()
         try:
             rows = con.execute(
-                "SELECT action_type, COUNT(*) FROM actions "
-                "WHERE platform = ? AND account_id = ? AND performed_at >= ? "
-                "GROUP BY action_type",
+                "SELECT action_type, COUNT(*) FROM actions WHERE platform = ? AND account_id = ? AND performed_at >= ? GROUP BY action_type",
                 (platform.lower(), account_id, day_start),
             ).fetchall()
             return {r[0]: r[1] for r in rows}
@@ -279,9 +337,7 @@ class SocialRateLimiter:
         con = self._connect()
         try:
             rows = con.execute(
-                "SELECT action_type, COUNT(*) FROM actions "
-                "WHERE platform = ? AND account_id = ? AND performed_at >= ? "
-                "GROUP BY action_type",
+                "SELECT action_type, COUNT(*) FROM actions WHERE platform = ? AND account_id = ? AND performed_at >= ? GROUP BY action_type",
                 (platform.lower(), account_id, week_start),
             ).fetchall()
             return {r[0]: r[1] for r in rows}

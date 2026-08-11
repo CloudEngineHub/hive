@@ -705,16 +705,12 @@ async def _handle_rename(scope: SkillScope, skill_name: str, payload: dict[str, 
     entry = scope.store.get(old)
     provenance = entry.provenance if entry else Provenance.FRAMEWORK
     if provenance not in _EDITABLE_PROVENANCE:
-        return web.json_response(
-            {"error": f"skill '{old}' is not editable (provenance={provenance})"}, status=403
-        )
+        return web.json_response({"error": f"skill '{old}' is not editable (provenance={provenance})"}, status=403)
 
     old_dir = scope.write_dir / old
     new_dir = scope.write_dir / new
     if not old_dir.is_dir():
-        return web.json_response(
-            {"error": f"skill '{old}' has no editable copy for this queen"}, status=404
-        )
+        return web.json_response({"error": f"skill '{old}' has no editable copy for this queen"}, status=404)
     if new_dir.exists():
         return web.json_response({"error": f"skill '{new}' already exists"}, status=409)
 
@@ -848,9 +844,7 @@ async def handle_rename_queen_skill(request: web.Request) -> web.Response:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
-    return _push_skill_override(
-        await _handle_rename(scope, request.match_info["skill_name"], payload), queen_id
-    )
+    return _push_skill_override(await _handle_rename(scope, request.match_info["skill_name"], payload), queen_id)
 
 
 async def handle_delete_queen_skill(request: web.Request) -> web.Response:

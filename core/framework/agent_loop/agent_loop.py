@@ -31,6 +31,7 @@ from framework.agent_loop.internals.compaction import (
     format_messages_for_summary,
     llm_compact,
 )
+from framework.agent_loop.internals.credential_tool import build_credentials_tool
 from framework.agent_loop.internals.cursor_persistence import (
     RestoredState,
     check_pause,
@@ -58,14 +59,13 @@ from framework.agent_loop.internals.judge_pipeline import (
     SubagentJudge as SharedSubagentJudge,
     judge_turn,
 )
+from framework.agent_loop.internals.sentinel_tool import build_sentinel_setup_tool
 from framework.agent_loop.internals.stall_detector import (
     fingerprint_tool_calls,
     is_stalled,
     is_tool_doom_loop,
     ngram_similarity,
 )
-from framework.agent_loop.internals.credential_tool import build_credentials_tool
-from framework.agent_loop.internals.sentinel_tool import build_sentinel_setup_tool
 from framework.agent_loop.internals.synthetic_tools import (
     build_ask_user_tool,
     build_collect_result_tool,
@@ -537,8 +537,7 @@ def _publish_attach_file_result(
     """
     if conversation_store is None:
         logger.error(
-            "attach_file: chip publish skipped — conversation_store is None. "
-            "User will not see a chip in chat. tool_use_id=%s",
+            "attach_file: chip publish skipped — conversation_store is None. User will not see a chip in chat. tool_use_id=%s",
             result.tool_use_id,
         )
         return _attach_file_publish_failure(result, "no conversation store on agent loop")
@@ -549,8 +548,7 @@ def _publish_attach_file_result(
     base = getattr(conversation_store, "_base", None)
     if base is None:
         logger.error(
-            "attach_file: chip publish skipped — conversation_store=%r has no `_base`. "
-            "User will not see a chip in chat.",
+            "attach_file: chip publish skipped — conversation_store=%r has no `_base`. User will not see a chip in chat.",
             type(conversation_store).__name__,
         )
         return _attach_file_publish_failure(result, "conversation store has no filesystem base")
@@ -567,8 +565,7 @@ def _publish_attach_file_result(
     leading = content[leading_ws_len:]
     if not leading.startswith("{"):
         logger.error(
-            "attach_file: result.content does not start with a JSON object — "
-            "cannot publish chip. content[:120]=%r",
+            "attach_file: result.content does not start with a JSON object — cannot publish chip. content[:120]=%r",
             content[:120],
         )
         return _attach_file_publish_failure(result, "tool result is not a JSON summary")
@@ -772,9 +769,7 @@ class AgentLoop(AgentProtocol):
         # correlation_id ties a queued message back to the CLIENT_INPUT_RECEIVED
         # event emitted at receive time, so the drain can emit a matching
         # CLIENT_INPUT_COMMITTED carrying the true injection time.
-        self._injection_queue: asyncio.Queue[
-            tuple[str, bool, list[dict[str, Any]] | None, str | None]
-        ] = asyncio.Queue()
+        self._injection_queue: asyncio.Queue[tuple[str, bool, list[dict[str, Any]] | None, str | None]] = asyncio.Queue()
         self._trigger_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
         # Queen input blocking state
         self._input_ready = asyncio.Event()
@@ -890,16 +885,15 @@ class AgentLoop(AgentProtocol):
         )
         from framework.agent_loop.idle_nudge import IdleNudgeSource
         from framework.agent_loop.stream_stall import StreamStallSource
+        from framework.agent_loop.tool_skill_reminders import (
+            SearchableToolsReminderSource,
+            SkillsCatalogReminderSource,
+        )
         from framework.agent_loop.tracker_snapshot_reminder import (
             TrackerSnapshotReminderSource,
             WorkerTrackerSnapshotReminderSource,
         )
         from framework.tasks.reminders import TaskReminderSource
-
-        from framework.agent_loop.tool_skill_reminders import (
-            SearchableToolsReminderSource,
-            SkillsCatalogReminderSource,
-        )
 
         self._reminder_hub = ReminderHub()
         self._reminder_hub.register(TaskReminderSource())
@@ -1016,9 +1010,7 @@ class AgentLoop(AgentProtocol):
                 # History, not the working plan (and archived != completed),
                 # so they must not surface here as open work.
                 open_tasks = [
-                    (getattr(r, "subject", "") or "").strip()
-                    for r in (records or [])
-                    if r.status not in (TaskStatus.COMPLETED, TaskStatus.ARCHIVED)
+                    (getattr(r, "subject", "") or "").strip() for r in (records or []) if r.status not in (TaskStatus.COMPLETED, TaskStatus.ARCHIVED)
                 ]
                 open_tasks = [t for t in open_tasks if t]
             except Exception:
@@ -1087,11 +1079,7 @@ class AgentLoop(AgentProtocol):
                 continue
             if not last_text and role == "assistant":
                 last_text = m.content
-            elif (
-                not last_user_text
-                and role == "user"
-                and getattr(m, "is_client_input", False)
-            ):
+            elif not last_user_text and role == "user" and getattr(m, "is_client_input", False):
                 last_user_text = m.content
             if last_text and last_user_text:
                 break
@@ -1125,7 +1113,7 @@ class AgentLoop(AgentProtocol):
         out: list[str] = []
         tool_msgs = [m for m in msgs if getattr(m, "role", "") == "tool"][-8:]
         for m in tool_msgs:
-            content = (getattr(m, "content", "") or "")
+            content = getattr(m, "content", "") or ""
             if any(k in content.lower() for k in markers):
                 out.append(content.strip()[:200])
         return out
@@ -1717,8 +1705,7 @@ class AgentLoop(AgentProtocol):
                 and iteration - self._grace_start_iteration >= max(1, self._config.grace_iterations)
             ):
                 logger.info(
-                    "[AgentLoop.execute] grace wind-down complete at iteration=%d "
-                    "(grace_start=%d, grace_iterations=%d); exiting",
+                    "[AgentLoop.execute] grace wind-down complete at iteration=%d (grace_start=%d, grace_iterations=%d); exiting",
                     iteration,
                     self._grace_start_iteration,
                     self._config.grace_iterations,
@@ -1968,7 +1955,8 @@ class AgentLoop(AgentProtocol):
                         pending_input=pending_input_state,
                     )
                     got_input = await self._await_user_input(
-                        ctx, reason=ParkReason.COLD_INTERRUPTED,
+                        ctx,
+                        reason=ParkReason.COLD_INTERRUPTED,
                     )
                     if not got_input:
                         await self._publish_loop_completed(stream_id, node_id, iteration + 1, execution_id)
@@ -2135,9 +2123,7 @@ class AgentLoop(AgentProtocol):
                     # inner turn. Best-effort — never raises.
                     try:
                         if not real_tool_results:
-                            _stop_reminder_energized = await self._fire_reminder(
-                                ReminderPoint.STOP, ctx, conversation
-                            )
+                            _stop_reminder_energized = await self._fire_reminder(ReminderPoint.STOP, ctx, conversation)
                     except Exception:
                         logger.debug("reminder STOP fire failed", exc_info=True)
                     # Cache-instrumentation hook: hash the system prefix /
@@ -2869,12 +2855,7 @@ class AgentLoop(AgentProtocol):
             if ctx.supports_direct_user_io:
                 if user_input_requested:
                     _cf_block = True
-                elif (
-                    stream_id == "queen"
-                    and not real_tool_results
-                    and not outputs_set
-                    and not _stop_reminder_energized
-                ):
+                elif stream_id == "queen" and not real_tool_results and not outputs_set and not _stop_reminder_energized:
                     # Auto-block: only for the queen (conversational node).
                     # Workers are autonomous — they block only on explicit
                     # ask_user().  Turns without tool calls or set_output
@@ -5208,7 +5189,10 @@ class AgentLoop(AgentProtocol):
                     if not isinstance(tasks_in, list) or not tasks_in:
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
-                            content=("ERROR: task_create(new_colony=true) requires a non-empty `tasks` array — the plan that gets seeded into the new colony."),
+                            content=(
+                                "ERROR: task_create(new_colony=true) requires a non-empty `tasks` array"
+                                " — the plan that gets seeded into the new colony."
+                            ),
                             is_error=True,
                         )
                         results_by_id[tc.tool_use_id] = result
@@ -5400,10 +5384,7 @@ class AgentLoop(AgentProtocol):
                         # of truth: LoopConfig.replay_exempt_tools (shared with
                         # the doom-loop fingerprint above). Without this, e.g. a
                         # 3-minute image poll trips the breaker at 3 polls.
-                        if (
-                            self._config.replay_detector_enabled
-                            and tc.tool_name not in self._config.replay_exempt_tools
-                        ):
+                        if self._config.replay_detector_enabled and tc.tool_name not in self._config.replay_exempt_tools:
                             canonical = _canonical_args(tc.tool_input)
                             in_batch_dup = batch_dup_count[(tc.tool_name, canonical)]
                             prior_streak = conversation.count_consecutive_completed_tool_calls(
@@ -5664,9 +5645,7 @@ class AgentLoop(AgentProtocol):
             _tail_target_id: str | None = None
             try:
                 _batch_tool_names = [tc.tool_name for tc in tool_calls[:executed_in_batch]]
-                _task_tail = await self._reminder_hub.fire(
-                    ReminderPoint.POST_TOOL_USE, ctx, tool_names=_batch_tool_names
-                )
+                _task_tail = await self._reminder_hub.fire(ReminderPoint.POST_TOOL_USE, ctx, tool_names=_batch_tool_names)
             except Exception:
                 logger.debug("reminder POST_TOOL_USE failed", exc_info=True)
 
@@ -6572,12 +6551,7 @@ class AgentLoop(AgentProtocol):
             return ToolResult(
                 tool_use_id=tc.tool_use_id,
                 content=json.dumps(
-                    {
-                        "error": (
-                            f"Unknown or already-collected handle: {handle!r}. It may "
-                            "have been collected already, or never started."
-                        )
-                    }
+                    {"error": (f"Unknown or already-collected handle: {handle!r}. It may have been collected already, or never started.")}
                 ),
                 is_error=True,
             )
@@ -6590,7 +6564,7 @@ class AgentLoop(AgentProtocol):
         try:
             # shield: a poll-wait timeout must not cancel the in-flight work.
             result = await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(
                 tool_use_id=tc.tool_use_id,
                 content=json.dumps(

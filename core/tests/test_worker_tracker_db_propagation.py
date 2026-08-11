@@ -49,7 +49,7 @@ class _CapturingAgentLoop:
     async def execute(self, ctx: Any) -> AgentResult:
         # Snapshot the contextvar dict as the tool executors would see it.
         self.captured_ctx = dict(_execution_context.get() or {})
-        return AgentResult(success=True, output_data={"ok": True})
+        return AgentResult(success=True, output={"ok": True})
 
 
 def _make_context(

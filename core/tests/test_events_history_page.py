@@ -22,13 +22,9 @@ from framework.server.routes_sessions import (
 )
 
 
-def _write_jsonl(
-    path: Path, count: int, *, line_padding: int = 0, trailing_newline: bool = True
-) -> None:
+def _write_jsonl(path: Path, count: int, *, line_padding: int = 0, trailing_newline: bool = True) -> None:
     pad = "x" * line_padding
-    lines = [
-        json.dumps({"i": i, "pad": pad} if pad else {"i": i}) for i in range(count)
-    ]
+    lines = [json.dumps({"i": i, "pad": pad} if pad else {"i": i}) for i in range(count)]
     text = "\n".join(lines)
     if trailing_newline and count > 0:
         text += "\n"
@@ -70,9 +66,7 @@ def _page_all(path: Path, limit: int) -> tuple[int, list[list[int]], list[int]]:
     "count,limit",
     [(0, 5), (1, 5), (5, 5), (10, 5), (12, 5), (50, 10), (3, 500)],
 )
-def test_small_file_paging(
-    tmp_path: Path, count: int, limit: int, trailing: bool
-) -> None:
+def test_small_file_paging(tmp_path: Path, count: int, limit: int, trailing: bool) -> None:
     p = tmp_path / "events.jsonl"
     if count == 0:
         p.write_text("", encoding="utf-8")
@@ -146,9 +140,7 @@ def test_final_page_signals_no_more(tmp_path: Path) -> None:
     last_offset = start_offset
     while start_offset > 0:
         last_offset = start_offset
-        _events, start_offset, _ = _read_events_page(
-            p, limit=5, before_offset=last_offset
-        )
+        _events, start_offset, _ = _read_events_page(p, limit=5, before_offset=last_offset)
     assert start_offset == 0
 
 
@@ -182,17 +174,13 @@ async def test_events_history_handler_success(tmp_path: Path, monkeypatch) -> No
         lambda _sid: queen_dir,
     )
 
-    req = make_mocked_request(
-        "GET", f"/api/sessions/{sid}/events/history", match_info={"session_id": sid}
-    )
+    req = make_mocked_request("GET", f"/api/sessions/{sid}/events/history", match_info={"session_id": sid})
     resp = await routes_sessions.handle_session_events_history(req)
     assert resp.status == 200
 
 
 @pytest.mark.asyncio
-async def test_events_history_times_out_instead_of_hanging(
-    tmp_path: Path, monkeypatch
-) -> None:
+async def test_events_history_times_out_instead_of_hanging(tmp_path: Path, monkeypatch) -> None:
     """If the worker-thread read can't complete in time (the symptom of a
     saturated thread pool), the handler returns a fast retryable 503 instead
     of hanging the request — and the desktop's loading overlay — forever."""
@@ -217,8 +205,6 @@ async def test_events_history_times_out_instead_of_hanging(
     monkeypatch.setattr(routes_sessions, "_read_events_page", _slow_read)
     monkeypatch.setattr(routes_sessions, "_EVENTS_HISTORY_READ_TIMEOUT_S", 0.05)
 
-    req = make_mocked_request(
-        "GET", f"/api/sessions/{sid}/events/history", match_info={"session_id": sid}
-    )
+    req = make_mocked_request("GET", f"/api/sessions/{sid}/events/history", match_info={"session_id": sid})
     resp = await routes_sessions.handle_session_events_history(req)
     assert resp.status == 503

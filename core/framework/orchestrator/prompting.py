@@ -196,7 +196,11 @@ def build_credentials_summary(accounts: list[dict[str, Any]]) -> str:
     section disappears.
     """
     if not accounts:
-        return "# Credentials\n" "No credentials are connected yet. Use the `credentials` tool " "(action=collect) to add one, or action=browse to see what's available."
+        return (
+            "# Credentials\n"
+            "No credentials are connected yet. Use the `credentials` tool "
+            "(action=collect) to add one, or action=browse to see what's available."
+        )
 
     counts: dict[str, int] = {}
     for acct in accounts:

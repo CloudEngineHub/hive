@@ -109,6 +109,7 @@ def _maybe_inline_browser_image(tool_name: str, result: Any) -> Any:
     base_text = text if isinstance(result, str) else result.get("_text", "")
     return {"_text": base_text, "_images": [block]}
 
+
 # Per-execution context overrides.  Each asyncio task (and thus each
 # concurrent graph execution) gets its own copy, so there are no races
 # when multiple ExecutionStreams run in parallel.
@@ -155,10 +156,7 @@ class ToolRegistry:
     # a `session_id` argument the LLM legitimately fills in to filter traces, and
     # a CONTEXT_PARAM is stripped from the schema and force-injected, which would
     # silently break it.
-    CONTEXT_PARAMS = frozenset(
-        {"agent_id", "data_dir", "profile", "profile_display_name", "session_cwd", "colony_id",
-         "principal"}
-    )
+    CONTEXT_PARAMS = frozenset({"agent_id", "data_dir", "profile", "profile_display_name", "session_cwd", "colony_id", "principal"})
 
     # Tools that perform no filesystem/process/network writes and are safe
     # to run concurrently with other safe tools in the same assistant turn.

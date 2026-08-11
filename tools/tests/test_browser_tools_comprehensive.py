@@ -479,6 +479,7 @@ class TestNavigation:
         # The bridge.navigate is called with wait_until as keyword argument
         mock_bridge.navigate.assert_awaited_once_with(100, "https://example.com", wait_until="networkidle")
 
+
 class TestInteractions:
     """Tests for interaction tools."""
 
@@ -674,9 +675,7 @@ class TestAdvancedTools:
         bridge_host, which may still hand back a raw `JSON.stringify(...)` string.
         The tool wrapper (running in the recyclable gcu server) must un-nest it so
         the agent sees clean nested JSON, not an escaped string."""
-        mock_bridge.evaluate = AsyncMock(
-            return_value={"ok": True, "action": "evaluate", "result": '[{"h":"x","t":"y"}]'}
-        )
+        mock_bridge.evaluate = AsyncMock(return_value={"ok": True, "action": "evaluate", "result": '[{"h":"x","t":"y"}]'})
 
         register_advanced_tools(mcp)
         browser_evaluate = mcp._tool_manager._tools["browser_evaluate"].fn

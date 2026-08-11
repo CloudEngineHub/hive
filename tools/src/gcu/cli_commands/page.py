@@ -56,8 +56,7 @@ async def cmd_page_html(args: argparse.Namespace) -> dict:
             if isinstance(html_value, str):
                 try:
                     artifact_path = _write_browser_artifact("browser_html", target_tab, html_value, ".html")
-                    result = {"ok": True, "tabId": target_tab, "selector": args.selector,
-                              "length": len(html_value), "saved_to": str(artifact_path)}
+                    result = {"ok": True, "tabId": target_tab, "selector": args.selector, "length": len(html_value), "saved_to": str(artifact_path)}
                     if getattr(args, "head", None):
                         result["head"] = html_value[: args.head]
                 except OSError as write_err:
@@ -107,8 +106,13 @@ async def cmd_page_snapshot(args: argparse.Namespace) -> dict:
             tree_text = snapshot_result["tree"]
             try:
                 artifact_path = _write_browser_artifact("browser_snapshot", target_tab, tree_text, ".txt")
-                result = {"ok": True, "tabId": snapshot_result.get("tabId", target_tab),
-                          "url": snapshot_result.get("url"), "length": len(tree_text), "saved_to": str(artifact_path)}
+                result = {
+                    "ok": True,
+                    "tabId": snapshot_result.get("tabId", target_tab),
+                    "url": snapshot_result.get("url"),
+                    "length": len(tree_text),
+                    "saved_to": str(artifact_path),
+                }
                 if getattr(args, "head", None):
                     result["head"] = tree_text[: args.head]
             except OSError as write_err:

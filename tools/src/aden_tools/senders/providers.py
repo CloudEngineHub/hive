@@ -303,17 +303,13 @@ def send_one(
             token = registry.resolve_oauth_token(sender)
             if not token:
                 return {"error": f"Could not resolve Google token for sender '{sender.name}'"}
-            return send_via_gmail(
-                token, sender.from_email, sender.from_name, to_email, subject, html, text
-            )
+            return send_via_gmail(token, sender.from_email, sender.from_name, to_email, subject, html, text)
 
         if sender.provider == "sendgrid":
             secret = sender.secret or {}
             if not secret.get("api_key"):
                 return {"error": f"SendGrid sender '{sender.name}' has no api_key"}
-            return send_via_sendgrid(
-                secret["api_key"], sender.from_email, sender.from_name, to_email, subject, html, text
-            )
+            return send_via_sendgrid(secret["api_key"], sender.from_email, sender.from_name, to_email, subject, html, text)
 
         if sender.provider == "mailjet":
             secret = sender.secret or {}
@@ -341,9 +337,7 @@ def send_one(
             token = registry.resolve_oauth_token(sender)
             if not token:
                 return {"error": f"Could not resolve HubSpot token for sender '{sender.name}'"}
-            return send_via_hubspot_marketing(
-                token, hubspot_email_id, to_email, custom_properties=custom_properties
-            )
+            return send_via_hubspot_marketing(token, hubspot_email_id, to_email, custom_properties=custom_properties)
 
         return {"error": f"Unsupported sender provider: {sender.provider}"}
     except httpx.TimeoutException:

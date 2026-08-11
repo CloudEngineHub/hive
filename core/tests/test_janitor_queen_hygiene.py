@@ -175,7 +175,7 @@ def test_rewrite_strips_legacy_full_request_from_kept_lines() -> None:
     rewrite_events_jsonl(events, min_bytes=10, disposer=DeleteDisposer(), manifest=Manifest())
     for line in events.read_text(encoding="utf-8").splitlines():
         assert "full_request" not in line
-    kept_types = [json.loads(l)["type"] for l in events.read_text(encoding="utf-8").splitlines() if l.startswith("{")]
+    kept_types = [json.loads(ln)["type"] for ln in events.read_text(encoding="utf-8").splitlines() if ln.startswith("{")]
     assert "llm_turn_complete" in kept_types
 
 

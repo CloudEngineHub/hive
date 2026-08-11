@@ -138,11 +138,7 @@ def _interact_action(
             if isinstance(start_coordinate, (list, tuple)) and len(start_coordinate) == 2
             else ""
         )
-        dst = selector or (
-            f"({coordinate[0]:.2f}, {coordinate[1]:.2f})"
-            if isinstance(coordinate, (list, tuple)) and len(coordinate) == 2
-            else ""
-        )
+        dst = selector or (f"({coordinate[0]:.2f}, {coordinate[1]:.2f})" if isinstance(coordinate, (list, tuple)) and len(coordinate) == 2 else "")
         return (verb, f"{src} → {dst}" if src and dst else (src or dst))
     if verb == "wait":
         if wait_for_selector:
@@ -370,7 +366,8 @@ async def _do_drag(
     # 2. Synthesise HTML5 drag-and-drop events via JS so pages using the
     #    Drag-and-Drop API (dragstart/dragover/drop) respond correctly.
     #    CDP mouse events alone never fire these.
-    drag_js = """
+    drag_js = (
+        """
     (function(sx, sy, ex, ey) {
       var src = document.elementFromPoint(sx, sy);
       var dst = document.elementFromPoint(ex, ey);
@@ -384,8 +381,9 @@ async def _do_drag(
       dst.dispatchEvent(new DragEvent('drop',      {bubbles: true, cancelable: true, dataTransfer: dt}));
       src.dispatchEvent(new DragEvent('dragend',   {bubbles: true, cancelable: false, dataTransfer: dt}));
       return JSON.stringify({ok: true});
-    })(%s, %s, %s, %s)
-    """ % (sx, sy, ex, ey)
+    })"""
+        + f"({sx}, {sy}, {ex}, {ey})"
+    )
 
     await bridge._cdp(
         target_tab,
@@ -687,8 +685,16 @@ def register_interact_tools(mcp: FastMCP) -> None:
             )
             blocks = _normalize(result)
             history_action = _interact_action(
-                action, selector, coordinate, start_selector, start_coordinate,
-                text, scroll_direction, wait_for_selector, wait_for_text, duration,
+                action,
+                selector,
+                coordinate,
+                start_selector,
+                start_coordinate,
+                text,
+                scroll_direction,
+                wait_for_selector,
+                wait_for_text,
+                duration,
             )
             log_tool_call(
                 "browser_interact",
@@ -702,8 +708,16 @@ def register_interact_tools(mcp: FastMCP) -> None:
         except Exception as e:
             err = {"ok": False, "error": str(e)}
             history_action = _interact_action(
-                action, selector, coordinate, start_selector, start_coordinate,
-                text, scroll_direction, wait_for_selector, wait_for_text, duration,
+                action,
+                selector,
+                coordinate,
+                start_selector,
+                start_coordinate,
+                text,
+                scroll_direction,
+                wait_for_selector,
+                wait_for_text,
+                duration,
             )
             log_tool_call(
                 "browser_interact",
@@ -743,9 +757,7 @@ def register_interact_tools(mcp: FastMCP) -> None:
             log_tool_call("browser_select", params, result=result)
             return result
 
-        select_target = _truncate_target(
-            f"{selector} = {', '.join(values)}" if values else selector
-        )
+        select_target = _truncate_target(f"{selector} = {', '.join(values)}" if values else selector)
         try:
             select_result = await bridge.select_option(target_tab, selector, values)
             log_tool_call(

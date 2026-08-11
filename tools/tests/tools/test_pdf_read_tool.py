@@ -434,9 +434,7 @@ class TestPdfReadUrlSupport:
 class TestPdfReadFailFast:
     """Internal timeout + terminal-yield response."""
 
-    def test_pdf_extract_times_out_yields_terminal_hint(
-        self, pdf_read_fn, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_pdf_extract_times_out_yields_terminal_hint(self, pdf_read_fn, tmp_path: Path, monkeypatch) -> None:
         """A hanging pdfplumber.open returns within the internal-timeout
         budget (not the framework's 60s ceiling) with a structured
         terminal-yield response."""
@@ -467,9 +465,7 @@ class TestPdfReadFailFast:
         elapsed = _time.monotonic() - started
 
         # Strict ceiling: 0.5s budget + small overhead. Far below 60s.
-        assert elapsed < 5.0, (
-            f"pdf_read must fail fast on a stuck pdfplumber; took {elapsed:.2f}s"
-        )
+        assert elapsed < 5.0, f"pdf_read must fail fast on a stuck pdfplumber; took {elapsed:.2f}s"
         assert result["error"] == "pdf_extract_timeout"
         assert result["path"] == str(pdf_file.resolve())
         # Yield response carries the cheatsheet + a concrete next call.
@@ -482,9 +478,7 @@ class TestPdfReadFailFast:
         # (still daemon=True so process can exit either way).
         forever.set()
 
-    def test_scanned_pdf_response_includes_terminal_hint(
-        self, pdf_read_fn, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_scanned_pdf_response_includes_terminal_hint(self, pdf_read_fn, tmp_path: Path, monkeypatch) -> None:
         """The needs_vision_pages success-response now augments the
         existing attach_file next_step with a terminal_hint cheatsheet
         so non-vision models have a fallback path."""
@@ -502,9 +496,7 @@ class TestPdfReadFailFast:
         assert "terminal_hint" in result
         assert "pdftotext" in result["terminal_hint"]
 
-    def test_pdfplumber_open_failure_yields_terminal_hint(
-        self, pdf_read_fn, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_pdfplumber_open_failure_yields_terminal_hint(self, pdf_read_fn, tmp_path: Path, monkeypatch) -> None:
         """A non-encryption failure inside pdfplumber.open lands in the
         terminal-yield response so the agent can probe via pdfinfo."""
         from aden_tools.tools.pdf_read_tool import pdf_read_tool
@@ -523,9 +515,7 @@ class TestPdfReadFailFast:
         assert "terminal_hint" in result
         assert "pdfinfo" in result["next_step"]
 
-    def test_encrypted_pdf_yields_with_legacy_error_message(
-        self, pdf_read_fn, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_encrypted_pdf_yields_with_legacy_error_message(self, pdf_read_fn, tmp_path: Path, monkeypatch) -> None:
         """Encrypted-PDF responses retain the legacy ``Cannot read encrypted
         PDF`` message (existing callers may pattern-match on it) but now
         also carry the terminal_hint so the agent can route through qpdf."""

@@ -35,7 +35,6 @@ multi-root prefix is found.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import logging
 import os
@@ -51,7 +50,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from framework.config import COLONIES_DIR, HIVE_HOME, colony_dir
+from framework.config import COLONIES_DIR, colony_dir
 from framework.host.colony_metadata import (
     update_colony_metadata,
     vacate_soft_deleted_colony,
@@ -639,9 +638,7 @@ async def handle_init_upload(request: web.Request) -> web.Response:
     if total_bytes <= 0:
         return web.json_response({"error": "total_bytes must be positive"}, status=400)
     if total_bytes > _MAX_UPLOAD_BYTES:
-        return web.json_response(
-            {"error": f"total_bytes exceeds {_MAX_UPLOAD_BYTES}"}, status=413
-        )
+        return web.json_response({"error": f"total_bytes exceeds {_MAX_UPLOAD_BYTES}"}, status=413)
 
     sha256 = str(body.get("sha256") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
@@ -694,12 +691,8 @@ async def handle_init_upload(request: web.Request) -> web.Response:
         data_path.touch()
     except OSError as err:
         meta_path.unlink(missing_ok=True)
-        return web.json_response(
-            {"error": f"could not create staging file: {err}"}, status=500
-        )
-    return web.json_response(
-        {"upload_id": upload_id, "received": 0}, status=201
-    )
+        return web.json_response({"error": f"could not create staging file: {err}"}, status=500)
+    return web.json_response({"upload_id": upload_id, "received": 0}, status=201)
 
 
 async def handle_chunk_upload(request: web.Request) -> web.Response:
@@ -800,9 +793,7 @@ async def handle_chunk_upload(request: web.Request) -> web.Response:
     try:
         current_size = data_path.stat().st_size
     except FileNotFoundError:
-        return web.json_response(
-            {"error": "staging file vanished; re-init required"}, status=410
-        )
+        return web.json_response({"error": "staging file vanished; re-init required"}, status=410)
     if current_size < received:
         return web.json_response(
             {
@@ -1113,10 +1104,7 @@ async def _import_multi_root(
     # on disk (.jpg ↔ .png) — drop stale siblings so a queen never ends up
     # with two avatars (mirrors routes_queens.handle_upload_avatar).
     for prefix, dest in plan["queens"].items():
-        if any(
-            _normalise_member_name(m.name).startswith(f"{prefix}/avatar.")
-            for m in tf.getmembers()
-        ):
+        if any(_normalise_member_name(m.name).startswith(f"{prefix}/avatar.") for m in tf.getmembers()):
             for existing in Path(dest).glob("avatar.*"):
                 existing.unlink(missing_ok=True)
 
@@ -1550,9 +1538,7 @@ async def handle_scaffold_colony(request: web.Request) -> web.Response:
     try:
         update_colony_metadata(colony_id, {"scaffolded": True})
     except OSError as exc:
-        return web.json_response(
-            {"error": f"failed to mark colony scaffolded: {exc}"}, status=500
-        )
+        return web.json_response({"error": f"failed to mark colony scaffolded: {exc}"}, status=500)
     logger.info("Scaffolded colony '%s' (no queen boot)", colony_id)
     return web.json_response({"colony_id": colony_id, "scaffolded": True})
 
@@ -1564,18 +1550,10 @@ def register_routes(app: web.Application) -> None:
     # route stays registered so an older client (or the chunked flow's
     # explicit fallback path) still lands somewhere.
     app.router.add_post("/api/colonies/import/init", handle_init_upload)
-    app.router.add_put(
-        "/api/colonies/import/chunk/{upload_id}", handle_chunk_upload
-    )
-    app.router.add_get(
-        "/api/colonies/import/status/{upload_id}", handle_upload_status
-    )
-    app.router.add_post(
-        "/api/colonies/import/finalize/{upload_id}", handle_finalize_upload
-    )
-    app.router.add_delete(
-        "/api/colonies/import/{upload_id}", handle_cancel_upload
-    )
+    app.router.add_put("/api/colonies/import/chunk/{upload_id}", handle_chunk_upload)
+    app.router.add_get("/api/colonies/import/status/{upload_id}", handle_upload_status)
+    app.router.add_post("/api/colonies/import/finalize/{upload_id}", handle_finalize_upload)
+    app.router.add_delete("/api/colonies/import/{upload_id}", handle_cancel_upload)
     app.router.add_post(
         "/api/colonies/{colony_id}/scaffold",
         handle_scaffold_colony,

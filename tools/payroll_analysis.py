@@ -38,18 +38,10 @@ def main():
         # Connect to database
         if USERNAME and PASSWORD:
             # SQL Server Authentication
-            connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={SERVER};"
-                f"DATABASE={DATABASE};"
-                f"UID={USERNAME};"
-                f"PWD={PASSWORD};"
-            )
+            connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};UID={USERNAME};PWD={PASSWORD};"
         else:
             # Windows Authentication
-            connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};Trusted_Connection=yes;"
-            )
+            connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};Trusted_Connection=yes;"
 
         print("Connecting to database...")
         connection = pyodbc.connect(connection_string)
@@ -173,11 +165,7 @@ def main():
         print("=" * 80)
         print(f"✓ Total Employees: {total_employees}")
         print(f"✓ Total Company Payroll: ${total_company_payroll:,.2f}")
-        print(
-            f"✓ Average Employee Salary: ${total_company_payroll / total_employees:,.2f}"
-            if total_employees > 0
-            else "N/A"
-        )
+        print(f"✓ Average Employee Salary: ${total_company_payroll / total_employees:,.2f}" if total_employees > 0 else "N/A")
         print("=" * 80)
         print("\nPayroll analysis completed successfully!")
 

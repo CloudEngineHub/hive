@@ -29,8 +29,8 @@ import pytest
 
 from framework.agent_loop.types import AgentSpec
 from framework.host.colony_runtime import ColonyRuntime
-from framework.host.worker import WorkerStatus
 from framework.host.event_bus import AgentEvent, EventBus, EventType
+from framework.host.worker import WorkerStatus
 from framework.llm.provider import LLMProvider, LLMResponse, Tool, ToolResult, ToolUse
 from framework.llm.stream_events import FinishEvent, TextDeltaEvent, ToolCallEvent
 from framework.loader.tool_registry import ToolRegistry

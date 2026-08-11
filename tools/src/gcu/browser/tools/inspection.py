@@ -368,9 +368,7 @@ async def render_screenshot(
     if log_params is None:
         log_params = {"tab_id": target_tab, "full_page": full_page, "selector": selector}
     try:
-        screenshot_result = await bridge.screenshot(
-            target_tab, full_page=full_page, selector=selector, selector_timeout_ms=selector_timeout_ms
-        )
+        screenshot_result = await bridge.screenshot(target_tab, full_page=full_page, selector=selector, selector_timeout_ms=selector_timeout_ms)
 
         if not screenshot_result.get("ok"):
             log_tool_call(

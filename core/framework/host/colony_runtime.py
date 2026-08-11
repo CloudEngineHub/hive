@@ -28,8 +28,10 @@ from framework.host.event_bus import AgentEvent, EventBus, EventType
 from framework.host.triggers import TriggerDefinition
 from framework.host.worker import (
     STOP_TIMEOUT_SEC as WORKER_STOP_TIMEOUT_SEC,
+    Worker,
+    WorkerInfo,
+    WorkerResult,
 )
-from framework.host.worker import Worker, WorkerInfo, WorkerResult
 from framework.schemas.goal import Goal
 from framework.storage.concurrent import ConcurrentStorage
 from framework.storage.session_store import SessionStore
@@ -62,7 +64,9 @@ def _env_int(name: str, default: int) -> int:
 # compaction kicks in (max_context_tokens). Everything else on LoopConfig
 # (judge cadence, stall detection, compaction buffer math, the worker's
 # tool_call_hard_multiple) stays framework-controlled.
-_ALLOWED_WORKER_LOOP_OVERRIDES = frozenset({"max_iterations", "grace_iterations", "tool_call_budget", "tool_call_lifetime_budget", "max_context_tokens"})
+_ALLOWED_WORKER_LOOP_OVERRIDES = frozenset(
+    {"max_iterations", "grace_iterations", "tool_call_budget", "tool_call_lifetime_budget", "max_context_tokens"}
+)
 
 # Sanity bounds. Reject pathological values up front rather than letting
 # them blow up mid-run. tool_call_budget=0 is permitted (means "no
@@ -1100,9 +1104,7 @@ class ColonyRuntime:
                 "Scheduler: refused worker %s — colony is stopped (dispatch blocked)",
                 worker.id,
             )
-            await self._publish_stopped_report(
-                worker, "Colony was stopped — this task was never started."
-            )
+            await self._publish_stopped_report(worker, "Colony was stopped — this task was never started.")
             return False
 
         async with self._scheduler_lock:
@@ -1253,8 +1255,7 @@ class ColonyRuntime:
             return self._worker_storage_dir(worker_id) / "events.jsonl"
 
         self._event_bus.set_worker_log_resolver(_resolve)
-        logger.info("ColonyRuntime: per-worker event logs enabled (colony=%s)",
-                    self._binding.name if self._binding else "-")
+        logger.info("ColonyRuntime: per-worker event logs enabled (colony=%s)", self._binding.name if self._binding else "-")
 
     async def start(self) -> None:
         if self._running:
@@ -1657,9 +1658,7 @@ class ColonyRuntime:
         if not self._running:
             raise RuntimeError("ColonyRuntime is not running")
 
-        from framework.agent_loop.agent_loop import AgentLoop
         from framework.host.worker_profiles import get_worker_profile
-        from framework.storage.conversation_store import FileConversationStore
 
         # Resolve the profile binding for this spawn. ``profile_name=None``
         # means "use the default profile"; an unknown name silently falls
@@ -1897,10 +1896,7 @@ class ColonyRuntime:
             except (OSError, ValueError):
                 _result = {}
             if isinstance(_result, dict) and "_janitor" in _result:
-                raise ValueError(
-                    f"worker {worker_id} was pruned by the retention janitor; "
-                    "its transcript is archived and cannot be resumed"
-                )
+                raise ValueError(f"worker {worker_id} was pruned by the retention janitor; its transcript is archived and cannot be resumed")
         parts_dir = worker_storage / "conversations" / "parts"
         if not parts_dir.exists() or not any(parts_dir.glob("*.json")):
             raise ValueError(f"worker {worker_id} has no saved conversation to resume")
@@ -2462,7 +2458,6 @@ class ColonyRuntime:
         A plain "stop these workers" leaves the queen free to keep working, so
         it restores the previous state on the way out.
         """
-        from framework.host.worker import WorkerStatus
 
         was_blocked = self._dispatch_blocked
         self._dispatch_blocked = True
@@ -2510,9 +2505,7 @@ class ColonyRuntime:
                 if w.status != WorkerStatus.QUEUED:
                     continue
                 w.status = WorkerStatus.STOPPED
-                await self._publish_stopped_report(
-                    w, "Worker was stopped before it started running."
-                )
+                await self._publish_stopped_report(w, "Worker was stopped before it started running.")
                 queued_cancelled += 1
             if queued_cancelled:
                 # Drop the now-terminal entries so the queue doesn't carry them.
@@ -2520,11 +2513,7 @@ class ColonyRuntime:
                 # its `status != QUEUED` guard, but leaving corpses in the queue
                 # makes depth logging lie.)
                 async with self._scheduler_lock:
-                    keep = [
-                        w
-                        for w in self._pending_queue
-                        if w.status == WorkerStatus.QUEUED
-                    ]
+                    keep = [w for w in self._pending_queue if w.status == WorkerStatus.QUEUED]
                     self._pending_queue.clear()
                     self._pending_queue.extend(keep)
 
@@ -2538,7 +2527,7 @@ class ColonyRuntime:
                 *(w.stop(timeout=per_worker_timeout) for w in live),
                 return_exceptions=True,
             )
-            for w, res in zip(live, results):
+            for w, res in zip(live, results, strict=False):
                 if isinstance(res, BaseException):
                     logger.warning("stop_workers: %s raised: %s", w.id, res)
                     errors.append({"worker_id": w.id, "error": str(res)})

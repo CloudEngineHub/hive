@@ -9,12 +9,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from gcu.browser.hooks.rate_limit_hook import IDENTITY_JS, after_run, before_run
 from framework.rate_limiter import SocialRateLimiter
 
 import gcu.browser.hooks.rate_limit_hook as _hook_mod
-
+from gcu.browser.hooks.rate_limit_hook import IDENTITY_JS, after_run, before_run
 
 # ── Fixtures ────────────────────────────────────────────────────────
 
@@ -89,10 +87,12 @@ async def test_rate_action_without_account_id_detects_identity(tmp_db):
     """When account_id is missing, identity JS runs on the bridge."""
     mod = _make_module({"platform": "linkedin", "action_type": "invite"})
     bsc = _make_bsc()
-    bridge = _make_bridge(identity_result={
-        "status": "ok",
-        "account_id": "https://www.linkedin.com/in/detected/",
-    })
+    bridge = _make_bridge(
+        identity_result={
+            "status": "ok",
+            "account_id": "https://www.linkedin.com/in/detected/",
+        }
+    )
 
     with patch.object(_hook_mod, "SocialRateLimiter", lambda: SocialRateLimiter(db_path=tmp_db)):
         result = await before_run(mod, bsc, bridge)
@@ -110,7 +110,7 @@ async def test_rate_action_blocked_returns_rate_limited(tmp_db):
     bridge = _make_bridge()
 
     # Pre-fill 10 invites within the last hour to hit the hourly limit
-    limiter = SocialRateLimiter(db_path=tmp_db)
+    SocialRateLimiter(db_path=tmp_db)
     con = sqlite3.connect(str(tmp_db))
     now = time.time()
     for i in range(10):
@@ -212,7 +212,7 @@ def test_identity_js_has_both_platforms():
 
 
 def test_identity_js_is_valid_string():
-    for platform, js in IDENTITY_JS.items():
+    for _platform, js in IDENTITY_JS.items():
         assert isinstance(js, str)
         assert len(js) > 50
         assert "status" in js
@@ -257,8 +257,10 @@ async def test_too_fast_short_gap_is_absorbed(tmp_db):
         con.commit()
         con.close()
 
-    with patch.object(_hook_mod, "SocialRateLimiter", lambda: SocialRateLimiter(db_path=tmp_db)), \
-         patch.object(_hook_mod.asyncio, "sleep", fake_sleep):
+    with (
+        patch.object(_hook_mod, "SocialRateLimiter", lambda: SocialRateLimiter(db_path=tmp_db)),
+        patch.object(_hook_mod.asyncio, "sleep", fake_sleep),
+    ):
         result = await before_run(mod, bsc, bridge)
 
     assert result is None  # absorbed, script proceeds
@@ -284,9 +286,11 @@ async def test_too_fast_long_gap_still_bounces(tmp_db):
     con.close()
 
     slept = AsyncMock()
-    with patch.object(_hook_mod, "SocialRateLimiter", lambda: SocialRateLimiter(db_path=tmp_db)), \
-         patch.object(_rl, "_min_delay", lambda p, a: 300.0), \
-         patch.object(_hook_mod.asyncio, "sleep", slept):
+    with (
+        patch.object(_hook_mod, "SocialRateLimiter", lambda: SocialRateLimiter(db_path=tmp_db)),
+        patch.object(_rl, "_min_delay", lambda p, a: 300.0),
+        patch.object(_hook_mod.asyncio, "sleep", slept),
+    ):
         result = await before_run(mod, bsc, bridge)
 
     assert result is not None and result["status"] == "rate_limited"

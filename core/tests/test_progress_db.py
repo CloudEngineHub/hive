@@ -248,8 +248,7 @@ def test_claim_by_id_does_not_steal_unrelated_rows(tmp_path: Path) -> None:
     con = sqlite3.connect(str(db), isolation_level=None)
     try:
         con.execute(
-            "UPDATE tasks SET status='claimed', worker_id='w1', "
-            "claimed_at=datetime('now') WHERE id=? AND status='pending'",
+            "UPDATE tasks SET status='claimed', worker_id='w1', claimed_at=datetime('now') WHERE id=? AND status='pending'",
             (target,),
         )
         statuses = dict(con.execute("SELECT goal, status FROM tasks").fetchall())
@@ -402,8 +401,7 @@ def test_reclaim_stale_fails_after_max_retries(tmp_path: Path) -> None:
     con = sqlite3.connect(str(db), isolation_level=None)
     try:
         con.execute(
-            "UPDATE tasks SET status='claimed', worker_id='w1', retry_count=2, "
-            "claimed_at=datetime('now', '-20 minutes') WHERE id=?",
+            "UPDATE tasks SET status='claimed', worker_id='w1', retry_count=2, claimed_at=datetime('now', '-20 minutes') WHERE id=?",
             (tid,),
         )
     finally:

@@ -796,9 +796,7 @@ class MCPClient:
             except (httpx.ConnectError, httpx.ReadTimeout) as retry_error:
                 raise original_error from retry_error
 
-    async def _call_tool_stdio_async(
-        self, tool_name: str, arguments: dict[str, Any], conn: _StdioConnection | None = None
-    ) -> Any:
+    async def _call_tool_stdio_async(self, tool_name: str, arguments: dict[str, Any], conn: _StdioConnection | None = None) -> Any:
         """Call tool via STDIO protocol using persistent session."""
         conn = conn if conn is not None else self._conn
         session = conn.session if conn is not None else None

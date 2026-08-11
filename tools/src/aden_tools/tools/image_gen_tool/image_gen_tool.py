@@ -210,9 +210,7 @@ def _postprocess_image(raw: bytes, fmt: str) -> bytes:
         from PIL import Image, ImageChops, ImageFilter
 
         im = Image.open(BytesIO(raw))
-        had_alpha = im.mode in ("RGBA", "LA") or (
-            im.mode == "P" and "transparency" in im.info
-        )
+        had_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
         if had_alpha and fmt != "jpeg":  # JPEG has no alpha channel
             im = im.convert("RGBA")
             alpha = im.getchannel("A")
@@ -230,9 +228,7 @@ def _postprocess_image(raw: bytes, fmt: str) -> bytes:
         result = Image.composite(base, den, edge)
 
         # 2. Crispen.
-        result = result.filter(
-            ImageFilter.UnsharpMask(radius=1.1, percent=110, threshold=2)
-        )
+        result = result.filter(ImageFilter.UnsharpMask(radius=1.1, percent=110, threshold=2))
 
         if alpha is not None:
             result = result.convert("RGBA")
@@ -297,10 +293,7 @@ def register_tools(mcp: FastMCP) -> None:
         """
         token = os.environ.get("HIVE_API_KEY")
         if not token:
-            return _err(
-                "Image generation unavailable: missing Hive proxy token. "
-                "Sign in to refresh credentials, then retry."
-            )
+            return _err("Image generation unavailable: missing Hive proxy token. Sign in to refresh credentials, then retry.")
 
         # Normalize / clamp inputs (the proxy validates further upstream).
         n = max(1, min(int(n), MAX_N))

@@ -95,17 +95,11 @@ def test_router_splits_chatter_from_queen_but_keeps_meta(tmp_path) -> None:
 
     bus = EventBus()
     bus.set_session_log(queen_path)
-    bus.set_worker_log_resolver(
-        lambda sid: worker_path if sid == "worker:w1" else None
-    )
+    bus.set_worker_log_resolver(lambda sid: worker_path if sid == "worker:w1" else None)
 
     async def drive():
         async def pub(t, sid, **data):
-            await bus.publish(
-                AgentEvent(
-                    type=t, stream_id=sid, node_id="n", execution_id="e", data=data
-                )
-            )
+            await bus.publish(AgentEvent(type=t, stream_id=sid, node_id="n", execution_id="e", data=data))
 
         await pub(EventType.LLM_TEXT_DELTA, "queen", iteration=1, text="hi")
         await pub(EventType.LLM_TURN_COMPLETE, "queen", iteration=1)
@@ -125,15 +119,11 @@ def test_router_splits_chatter_from_queen_but_keeps_meta(tmp_path) -> None:
     assert "execution_started" in queen_types
     assert "subagent_report" in queen_types
     # ...and none of the worker's chatter.
-    assert not any(
-        e["type"] in {"llm_text_delta", "tool_call_started"}
-        and e["stream_id"].startswith("worker")
-        for e in _read(queen_path)
-    ), f"worker chatter leaked into the queen's log: {queen_types}"
+    assert not any(e["type"] in {"llm_text_delta", "tool_call_started"} and e["stream_id"].startswith("worker") for e in _read(queen_path)), (
+        f"worker chatter leaked into the queen's log: {queen_types}"
+    )
     # Queen's OWN prose is untouched by the routing.
-    assert "llm_text_delta" in [
-        e["type"] for e in _read(queen_path) if e["stream_id"] == "queen"
-    ]
+    assert "llm_text_delta" in [e["type"] for e in _read(queen_path) if e["stream_id"] == "queen"]
 
     # Worker's log is complete: chatter AND its meta.
     assert "llm_text_delta" in worker_types
@@ -151,9 +141,7 @@ def test_worker_log_handle_closed_on_report(tmp_path) -> None:
 
     async def drive():
         async def pub(t, sid):
-            await bus.publish(
-                AgentEvent(type=t, stream_id=sid, node_id="n", execution_id="e", data={})
-            )
+            await bus.publish(AgentEvent(type=t, stream_id=sid, node_id="n", execution_id="e", data={}))
 
         await pub(EventType.TOOL_CALL_STARTED, "worker:w1")
         assert "worker:w1" in bus._worker_logs

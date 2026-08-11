@@ -28,10 +28,11 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from framework import config
 from framework.server import compaction_status
@@ -158,7 +159,7 @@ def assert_safe_target(path: Path) -> None:
     try:
         rel = resolved.relative_to(hive_home)
     except ValueError:
-        raise ValueError(f"janitor target escapes HIVE_HOME: {path}")
+        raise ValueError(f"janitor target escapes HIVE_HOME: {path}") from None
     if rel.parts and rel.parts[0] in KEEP_ALWAYS:
         raise ValueError(f"janitor refusing protected target: {path}")
 
@@ -380,9 +381,7 @@ class SafetyContext:
         candidates.append(_safe_stat_mtime(session_dir / "conversations" / "parts"))
         return max(candidates)
 
-    def is_safe_to_prune(
-        self, session_dir: Path, *, min_age_days: float, ignore_janitor_lock: bool = False
-    ) -> tuple[bool, str]:
+    def is_safe_to_prune(self, session_dir: Path, *, min_age_days: float, ignore_janitor_lock: bool = False) -> tuple[bool, str]:
         """(touchable, reason_if_not) for one session dir.
 
         ``ignore_janitor_lock`` is for the post-lock re-check: after this
@@ -795,13 +794,7 @@ def find_orphan_spillovers(session_dir: Path, *, min_age_days: float, now: float
     if not data_dir.is_dir():
         return []
     try:
-        candidates = [
-            p
-            for p in data_dir.iterdir()
-            if p.is_file()
-            and p.suffix in (".txt", ".json")
-            and not p.name.startswith("conversation_")
-        ]
+        candidates = [p for p in data_dir.iterdir() if p.is_file() and p.suffix in (".txt", ".json") and not p.name.startswith("conversation_")]
     except OSError:
         return []
     if not candidates:
@@ -979,9 +972,7 @@ def prune_queen_session(
     """
     report = TargetReport(name="queen_hygiene", tier=3)
 
-    for orphan in find_orphan_spillovers(
-        session_dir, min_age_days=cfg.queen_hygiene_days, now=safety.now
-    ):
+    for orphan in find_orphan_spillovers(session_dir, min_age_days=cfg.queen_hygiene_days, now=safety.now):
         item = PruneItem(
             path=str(orphan),
             bytes=0,
@@ -1022,9 +1013,7 @@ def prune_queen_session(
         # janitor's own lock is excluded so the liveness/age clauses
         # actually run instead of short-circuiting on it.
         safety.refresh()
-        ok, _reason = safety.is_safe_to_prune(
-            session_dir, min_age_days=cfg.queen_hygiene_days, ignore_janitor_lock=True
-        )
+        ok, _reason = safety.is_safe_to_prune(session_dir, min_age_days=cfg.queen_hygiene_days, ignore_janitor_lock=True)
         if not ok:
             report.skipped += 1
             return report

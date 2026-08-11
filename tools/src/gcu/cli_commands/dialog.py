@@ -35,11 +35,18 @@ async def cmd_dialog_respond(args: argparse.Namespace) -> dict:
 
     try:
         nav_result = await bridge.handle_javascript_dialog(target_tab, accept=(action == "accept"), prompt_text=args.prompt_text)
-        log_tool_call("browser_dialog_respond", params, result=nav_result, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("dialog", action))
+        log_tool_call(
+            "browser_dialog_respond",
+            params,
+            result=nav_result,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            tab_id=target_tab,
+            action=("dialog", action),
+        )
         return nav_result
     except Exception as e:
         result = {"ok": False, "error": str(e)}
-        log_tool_call("browser_dialog_respond", params, error=e, duration_ms=(time.perf_counter() - start) * 1000,
-                      tab_id=target_tab, action=("dialog", action))
+        log_tool_call(
+            "browser_dialog_respond", params, error=e, duration_ms=(time.perf_counter() - start) * 1000, tab_id=target_tab, action=("dialog", action)
+        )
         return result

@@ -10,11 +10,10 @@ from __future__ import annotations
 import json
 
 import pytest
-
-from aden_tools.credentials.store_adapter import CredentialStoreAdapter
 from framework.agent_loop.internals import credential_tool as ct
 from framework.orchestrator.prompting import build_credentials_summary
 
+from aden_tools.credentials.store_adapter import CredentialStoreAdapter
 
 # ---------------------------------------------------------------------------
 # Tool definition + help
@@ -54,9 +53,7 @@ def test_collect_default_field_is_secret_api_key():
     assert err is None
     assert payload["credential_id"] == "my_custom_service"
     assert payload["account"] == "default"
-    assert payload["fields"] == [
-        {"name": "api_key", "label": "API key", "secret": True, "required": True, "placeholder": ""}
-    ]
+    assert payload["fields"] == [{"name": "api_key", "label": "API key", "secret": True, "required": True, "placeholder": ""}]
 
 
 def test_collect_default_field_for_known_spec():
@@ -89,9 +86,7 @@ def test_collect_infers_secret_from_field_name():
 
 def test_collect_payload_carries_no_values():
     """The collect payload must never contain entered secret values."""
-    payload, err = ct.validate_collect_input(
-        {"credential_id": "stripe", "fields": [{"name": "api_key", "secret": True}]}
-    )
+    payload, err = ct.validate_collect_input({"credential_id": "stripe", "fields": [{"name": "api_key", "secret": True}]})
     assert err is None
     blob = json.dumps(payload)
     # Field specs only — keys describing the field, never a "value" of a secret.
@@ -101,9 +96,7 @@ def test_collect_payload_carries_no_values():
 
 
 def test_collect_rejects_bad_field():
-    payload, err = ct.validate_collect_input(
-        {"credential_id": "stripe", "fields": [{"label": "no name here"}]}
-    )
+    payload, err = ct.validate_collect_input({"credential_id": "stripe", "fields": [{"label": "no name here"}]})
     assert payload is None
     assert err
 

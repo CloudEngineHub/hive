@@ -83,6 +83,7 @@ def _zero_dispatch_hint(out: dict[str, Any]) -> str | None:
         "(row['url']), not the list."
     )
 
+
 # Keep references to in-flight playbook tasks so asyncio doesn't GC them.
 _PLAYBOOK_TASKS: set[asyncio.Task] = set()
 
@@ -96,10 +97,7 @@ _RUNNING_PLAYBOOKS: dict[str, dict[str, Any]] = {}
 async def _stop_batch_workers(colony: Any, batch_id: str) -> int:
     """Stop every still-active worker belonging to a playbook's batch."""
     workers = list(getattr(colony, "_workers", {}).values())
-    targets = [
-        w for w in workers
-        if getattr(w, "batch_id", "") == batch_id and getattr(w, "is_active", False)
-    ]
+    targets = [w for w in workers if getattr(w, "batch_id", "") == batch_id and getattr(w, "is_active", False)]
     for w in targets:
         try:
             await colony.stop_worker(getattr(w, "id", None))
@@ -129,11 +127,7 @@ async def stop_playbooks_for_colony(colony: Any) -> list[str]:
     """
     if colony is None:
         return []
-    targets = [
-        (run_id, entry)
-        for run_id, entry in list(_RUNNING_PLAYBOOKS.items())
-        if entry.get("colony") is colony
-    ]
+    targets = [(run_id, entry) for run_id, entry in list(_RUNNING_PLAYBOOKS.items()) if entry.get("colony") is colony]
     cancelled: list[str] = []
     for run_id, entry in targets:
         task = entry.get("task")
@@ -605,7 +599,7 @@ def register_playbook_tools(registry: Any, session: Any = None) -> int:
             "      await converge(\n"
             "          pending=pending,\n"
             "          dispatch=lambda chunk, i: worker(\n"
-            "              task=f\"Enrich EACH of these, upserting its row + done_at "
+            '              task=f"Enrich EACH of these, upserting its row + done_at '
             "as you go: {chunk['urls']}\",\n"
             "              goal=f\"Researching {len(chunk['ids'])} leads' websites\",\n"
             '              profile="acct-1", skill="enrich", schema=RECEIPT,\n'
@@ -694,9 +688,7 @@ def register_playbook_tools(registry: Any, session: Any = None) -> int:
         """Kill a running playbook by run_id: stop dispatching + stop its workers."""
         entry = _RUNNING_PLAYBOOKS.get(run_id)
         if entry is None:
-            return json.dumps(
-                {"status": "not_running", "run_id": run_id, "message": "No running playbook with that run_id (already finished?)."}
-            )
+            return json.dumps({"status": "not_running", "run_id": run_id, "message": "No running playbook with that run_id (already finished?)."})
         # Cancel the convergence loop (no more dispatch), then stop in-flight workers.
         entry["task"].cancel()
         stopped = await _stop_batch_workers(entry["colony"], run_id)
@@ -803,10 +795,7 @@ def _resolve_script(
         p = playbooks_dir / f"{_sanitize_name(playbook_name)}.play.py"
         if not p.is_file():
             saved = _saved_playbook_names(playbooks_dir)
-            return "", None, (
-                f"no saved playbook named '{playbook_name}'. "
-                f"Saved playbooks in this colony: {saved or '(none yet)'}."
-            )
+            return "", None, (f"no saved playbook named '{playbook_name}'. Saved playbooks in this colony: {saved or '(none yet)'}.")
         try:
             return p.read_text(encoding="utf-8"), str(p), None
         except OSError as exc:
@@ -914,13 +903,7 @@ async def _notify_complete(
         return
     log_line = f"<log_db>{log_db}</log_db>\n" if log_db else ""
     if error is not None:
-        msg = (
-            "[PLAYBOOK_COMPLETE]\n"
-            f"<run_id>{run_id}</run_id>\n"
-            "<status>error</status>\n"
-            f"{log_line}"
-            f"<error>{error}</error>"
-        )
+        msg = f"[PLAYBOOK_COMPLETE]\n<run_id>{run_id}</run_id>\n<status>error</status>\n{log_line}<error>{error}</error>"
     else:
         out = out or {}
         result = out.get("result")

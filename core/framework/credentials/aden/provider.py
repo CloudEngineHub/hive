@@ -188,8 +188,7 @@ class AdenSyncProvider(CredentialProvider):
 
             if e.requires_reauthorization:
                 raise CredentialRefreshError(
-                    f"Integration '{credential.id}' requires re-authorization. "
-                    f"Visit: {e.reauthorization_url or 'your Aden dashboard'}"
+                    f"Integration '{credential.id}' requires re-authorization. Visit: {e.reauthorization_url or 'your Aden dashboard'}"
                 ) from e
 
             raise CredentialRefreshError(f"Failed to refresh credential '{credential.id}': {e}") from e

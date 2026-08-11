@@ -30,9 +30,7 @@ _MAX_OUTPUT_BYTES = 256 * 1024
 # Build/cache dirs that are almost never what the model wants to walk. Mirrors
 # files-tools' _SEARCH_SKIP_DIRS so both finders prune the same noise. Only used
 # by the os.walk fallback — ``rg --files`` prunes via .gitignore on its own.
-_SKIP_DIRS = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", ".tox", ".mypy_cache", ".ruff_cache"}
-)
+_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", ".tox", ".mypy_cache", ".ruff_cache"})
 
 _GLOB_META_RE = re.compile(r"[*?\[]")
 
@@ -268,12 +266,7 @@ def _walk_grep(
         for root_dir, dirs, fnames in os.walk(path):
             # Prune build/cache dirs (unless no_ignore) and hidden dirs
             # (unless hidden) — approximates what .gitignore would skip.
-            dirs[:] = [
-                d
-                for d in dirs
-                if (hidden or not d.startswith("."))
-                and (no_ignore or d not in _SKIP_DIRS)
-            ]
+            dirs[:] = [d for d in dirs if (hidden or not d.startswith(".")) and (no_ignore or d not in _SKIP_DIRS)]
             if max_depth is not None:
                 depth = root_dir.rstrip(os.sep).count(os.sep) - base_depth
                 if depth >= max_depth - 1:
@@ -293,10 +286,7 @@ def _walk_grep(
         "exit_code": 0,
         "stderr": "",
         "fallback": "python-walk",
-        "note": (
-            "ripgrep not installed; used a best-effort Python walk "
-            "(no .gitignore awareness; context/extra_args flags ignored)."
-        ),
+        "note": ("ripgrep not installed; used a best-effort Python walk (no .gitignore awareness; context/extra_args flags ignored)."),
     }
 
 

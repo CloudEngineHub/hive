@@ -42,10 +42,7 @@ def _cloud_config() -> tuple[str, str]:
     jwt = os.environ.get("HIVE_CLOUD_JWT", "").strip()
     base = os.environ.get("HIVE_CLOUD_BASE", "").strip()
     if not jwt or not base:
-        raise NotSignedInError(
-            "Sign in to use the shared global DB — no cloud session "
-            "(HIVE_CLOUD_JWT / HIVE_CLOUD_BASE unset)."
-        )
+        raise NotSignedInError("Sign in to use the shared global DB — no cloud session (HIVE_CLOUD_JWT / HIVE_CLOUD_BASE unset).")
     return base.rstrip("/"), jwt
 
 
@@ -146,9 +143,7 @@ async def list_changes(since: str | None = None) -> Any:
 
 
 async def list_rows(table: str, *, params: dict[str, Any] | None = None) -> Any:
-    return await request(
-        "GET", f"/v1/global-db/tables/{quote(table, safe='')}/rows", params=params
-    )
+    return await request("GET", f"/v1/global-db/tables/{quote(table, safe='')}/rows", params=params)
 
 
 async def update_row(table: str, pk: dict[str, Any], updates: dict[str, Any]) -> Any:

@@ -405,9 +405,7 @@ def format_queen_identity_prompt(profile: dict[str, Any], *, max_examples: int |
         if anti_stereotype:
             psych_lines.append(f"- Anti-Stereotype Rules: {anti_stereotype}")
         if psych_lines:
-            sections.append(
-                "<psychological_profile>\n" + "\n".join(psych_lines) + "\n</psychological_profile>"
-            )
+            sections.append("<psychological_profile>\n" + "\n".join(psych_lines) + "\n</psychological_profile>")
 
     # Pillar 4: Behavior rules
     trigger_lines = []
@@ -474,7 +472,7 @@ _QUEEN_SELECTOR_DESCRIPTIONS: dict[str, str] = {
     "queen_finance_fundraising": "Financial modeling, fundraising, investor relations, cap tables, unit economics, budgeting",
     "queen_legal": "Contracts, IP, compliance, corporate governance, employment law, regulatory matters",
     "queen_brand_design": "Brand identity, visual design, UX, design systems, creative direction, messaging",
-    "queen_sales": "The CRM itself — pipeline stages, fields, the shape of the sales process — plus pipeline and forecast ownership, deal qualification, enterprise/mid-market selling, sales coaching, comp design, channel and partnership sales",
+    "queen_sales": "The CRM itself — pipeline stages, fields, the shape of the sales process — plus pipeline and forecast ownership, deal qualification, enterprise/mid-market selling, sales coaching, comp design, channel and partnership sales",  # noqa: E501
     "queen_talent": "Hiring, recruiting, team building, culture, compensation, organizational design",
     "queen_operations": "Founder coaching, strategic decisions, leadership challenges, company growth, pivots",
 }
@@ -489,10 +487,7 @@ def _allowed_queen_ids(active_queen_ids: list[str] | None) -> list[str]:
 
 
 def _queen_selector_system_prompt(allowed_ids: list[str]) -> str:
-    queen_lines = "\n".join(
-        f"- {qid}: {_QUEEN_SELECTOR_DESCRIPTIONS.get(qid) or DEFAULT_QUEENS[qid].get('title') or qid}"
-        for qid in allowed_ids
-    )
+    queen_lines = "\n".join(f"- {qid}: {_QUEEN_SELECTOR_DESCRIPTIONS.get(qid) or DEFAULT_QUEENS[qid].get('title') or qid}" for qid in allowed_ids)
     return f"""\
 You are a routing classifier acting as the CEO of the company.
 
@@ -619,12 +614,13 @@ _COLONY_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 _COLONY_NAME_MAX_LEN = 64
 _DEFAULT_COLONY_NAME = "new_colony"
 
+
 def _colony_selector_system_prompt(allowed_ids: list[str]) -> str:
     return (
         _queen_selector_system_prompt(allowed_ids).replace(
-            'Reply with ONLY a valid JSON object — no markdown, no prose:\n'
+            "Reply with ONLY a valid JSON object — no markdown, no prose:\n"
             '{"reason": "<reason and thinking of selecting who will take the request>", "queen_id": "<one of the IDs above>"}',
-            'You are also spinning up a dedicated colony (a project workspace) to own this goal.\n'
+            "You are also spinning up a dedicated colony (a project workspace) to own this goal.\n"
             "Give the colony a short, human-friendly name that captures the goal.\n\n"
             "Reply with ONLY a valid JSON object — no markdown, no prose:\n"
             '{"reason": "<why this queen and colony name>", "queen_id": "<one of the IDs above>", '

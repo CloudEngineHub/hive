@@ -69,12 +69,7 @@ class TableCountCache:
         self._dirty = False
 
     def _fresh(self) -> bool:
-        return (
-            self._counts is not None
-            and self._mono is not None
-            and not self._dirty
-            and (time.monotonic() - self._mono) <= self._ttl
-        )
+        return self._counts is not None and self._mono is not None and not self._dirty and (time.monotonic() - self._mono) <= self._ttl
 
     async def snapshot(self, *, force: bool = False) -> CountSnapshot | None:
         """Return current counts, refreshing lazily when dirty/stale/forced.

@@ -66,9 +66,7 @@ def test_colony_prompt_tells_queen_to_probe_uncertain_fanout() -> None:
     assert "unverified assumption" in _queen_behavior_colony
     # The queen probes uncertain shared behavior herself, not via a worker.
     assert "probe it yourself first" in _queen_behavior_colony
-    assert "Do not spend a worker to test what you can verify directly" in (
-        _queen_behavior_colony
-    )
+    assert "Do not spend a worker to test what you can verify directly" in (_queen_behavior_colony)
 
 
 def test_colony_prompt_preserves_latest_constraints_in_worker_skill() -> None:

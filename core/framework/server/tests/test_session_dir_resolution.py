@@ -43,17 +43,13 @@ def _colony_dir(hive: Path) -> Path:
 
 
 def test_colony_id_read_off_the_session_path():
-    assert sm._colony_id_for_session_dir(
-        Path("/h/colonies/acme/queens/queen_growth/sessions/s1")
-    ) == "acme"
+    assert sm._colony_id_for_session_dir(Path("/h/colonies/acme/queens/queen_growth/sessions/s1")) == "acme"
 
 
 def test_queen_dm_session_path_has_no_colony():
     """A DM session is not owned by a colony — the distinction the resume guard
     turns on, so it must not be inferred from an unrelated path component."""
-    assert sm._colony_id_for_session_dir(
-        Path("/h/queens/queen_growth/sessions/s1")
-    ) is None
+    assert sm._colony_id_for_session_dir(Path("/h/queens/queen_growth/sessions/s1")) is None
 
 
 def test_generator_finds_a_colony_only_session(monkeypatch, tmp_path):

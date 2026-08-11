@@ -58,9 +58,7 @@ def _build_worker(colony: str = "c1", wid: str = _WID, age_days: float = 30.0) -
     (wdir / "reminder_state.json").write_text('{"turns_total": 3}', encoding="utf-8")
     (wdir / "os").write_text("%!PS-Adobe-3.0 stray junk", encoding="utf-8")
     parts = wdir / "conversations" / "parts"
-    (parts / "0000000001.json").write_text(
-        json.dumps({"seq": 1, "role": "user", "content": "task"}), encoding="utf-8"
-    )
+    (parts / "0000000001.json").write_text(json.dumps({"seq": 1, "role": "user", "content": "task"}), encoding="utf-8")
     (parts / "0000000002.json").write_text(
         json.dumps({"seq": 2, "role": "assistant", "content": "working on it"}),
         encoding="utf-8",
@@ -224,9 +222,7 @@ def test_archive_failure_keeps_source(monkeypatch) -> None:
 
     wdir = _build_worker()
     disposer = ArchiveDisposer()
-    monkeypatch.setattr(
-        ArchiveDisposer, "_archive_one", lambda self, path: (_ for _ in ()).throw(OSError("disk full"))
-    )
+    monkeypatch.setattr(ArchiveDisposer, "_archive_one", lambda self, path: (_ for _ in ()).throw(OSError("disk full")))
     import pytest
 
     with pytest.raises(OSError):

@@ -1027,12 +1027,7 @@ class NodeConversation:
             if open_tool_calls:
                 for stale_id in list(open_tool_calls):
                     real_result = next(
-                        (
-                            later
-                            for later in msgs[i:]
-                            if later.get("role") == "tool"
-                            and later.get("tool_call_id") == stale_id
-                        ),
+                        (later for later in msgs[i:] if later.get("role") == "tool" and later.get("tool_call_id") == stale_id),
                         None,
                     )
                     repaired.append(

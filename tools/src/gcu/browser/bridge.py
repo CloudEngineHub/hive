@@ -876,8 +876,7 @@ class BeelineBridge:
             if len(self._conns) == 1:
                 only = next(iter(self._conns.values()))
                 logger.info(
-                    "resolve_connection: pinned label %r not connected; using the "
-                    "sole live connection %r (stale label after extension reinstall?)",
+                    "resolve_connection: pinned label %r not connected; using the sole live connection %r (stale label after extension reinstall?)",
                     label,
                     only.label,
                 )
@@ -1277,10 +1276,7 @@ class BeelineBridge:
             # doesn't talk to the bridge, it spawns gcu MCPs that do. A
             # bridge with control_rpc_clients=0 may be running, but nobody
             # on the runtime side is using it (orphaned-bridge case).
-            "control_rpc_clients": (
-                getattr(self._rpc_server, "active_client_count", 0)
-                if self._rpc_server is not None else 0
-            ),
+            "control_rpc_clients": (getattr(self._rpc_server, "active_client_count", 0) if self._rpc_server is not None else 0),
             "bind_errors": dict(self._bind_errors),
         }
 
@@ -1468,7 +1464,9 @@ class BeelineBridge:
                     + b"Content-Type: application/json\r\n"
                     + b"Access-Control-Allow-Origin: *\r\n"
                     + b"Access-Control-Allow-Headers: *\r\n"
-                    + b"Content-Length: " + str(len(body_out)).encode() + b"\r\n"
+                    + b"Content-Length: "
+                    + str(len(body_out)).encode()
+                    + b"\r\n"
                     + b"Connection: close\r\n\r\n"
                     + body_out
                 )
@@ -1508,7 +1506,9 @@ class BeelineBridge:
                     + b"Content-Type: application/json\r\n"
                     + b"Access-Control-Allow-Origin: *\r\n"
                     + b"Access-Control-Allow-Headers: *\r\n"
-                    + b"Content-Length: " + str(len(body_out)).encode() + b"\r\n"
+                    + b"Content-Length: "
+                    + str(len(body_out)).encode()
+                    + b"\r\n"
                     + b"Connection: close\r\n\r\n"
                     + body_out
                 )
@@ -1537,7 +1537,9 @@ class BeelineBridge:
                     + b"Content-Type: application/json\r\n"
                     + b"Access-Control-Allow-Origin: *\r\n"
                     + b"Access-Control-Allow-Headers: *\r\n"
-                    + b"Content-Length: " + str(len(body_out)).encode() + b"\r\n"
+                    + b"Content-Length: "
+                    + str(len(body_out)).encode()
+                    + b"\r\n"
                     + b"Connection: close\r\n\r\n"
                     + body_out
                 )
@@ -1566,7 +1568,9 @@ class BeelineBridge:
                     + b"Content-Type: application/json\r\n"
                     + b"Access-Control-Allow-Origin: *\r\n"
                     + b"Access-Control-Allow-Headers: *\r\n"
-                    + b"Content-Length: " + str(len(body_out)).encode() + b"\r\n"
+                    + b"Content-Length: "
+                    + str(len(body_out)).encode()
+                    + b"\r\n"
                     + b"Connection: close\r\n\r\n"
                     + body_out
                 )
@@ -1595,7 +1599,9 @@ class BeelineBridge:
                     + b"Content-Type: application/json\r\n"
                     + b"Access-Control-Allow-Origin: *\r\n"
                     + b"Access-Control-Allow-Headers: *\r\n"
-                    + b"Content-Length: " + str(len(body_out)).encode() + b"\r\n"
+                    + b"Content-Length: "
+                    + str(len(body_out)).encode()
+                    + b"\r\n"
                     + b"Connection: close\r\n\r\n"
                     + body_out
                 )
@@ -2102,9 +2108,7 @@ class BeelineBridge:
             # that's not in any group yet).
             _in_flight_profile = self._tab_to_profile.get(_tab)
             if _in_flight_profile:
-                self._context_in_flight[_in_flight_profile] = (
-                    self._context_in_flight.get(_in_flight_profile, 0) + 1
-                )
+                self._context_in_flight[_in_flight_profile] = self._context_in_flight.get(_in_flight_profile, 0) + 1
 
         try:
             await conn.ws.send(json.dumps({"id": msg_id, "type": type_, **params}))
@@ -2237,11 +2241,7 @@ class BeelineBridge:
                 # is already named in the cached snapshot.
                 try:
                     err_str = str(e).lower()
-                    if (
-                        "chrome-extension://" in err_str
-                        and "different extension" in err_str
-                        and not self._snapshot_has_foreign_frame(tab_id)
-                    ):
+                    if "chrome-extension://" in err_str and "different extension" in err_str and not self._snapshot_has_foreign_frame(tab_id):
                         asyncio.create_task(self._reaudit_for_foreign_frame(tab_id))
                 except Exception:
                     pass
@@ -2340,7 +2340,9 @@ class BeelineBridge:
                     if isinstance(prev, int):
                         logger.info(
                             "Hive anchor window for %s moved %s -> %s (previous window closed)",
-                            conn.label, prev, win,
+                            conn.label,
+                            prev,
+                            win,
                         )
                     self._hive_window_by_conn[conn.label] = win
         if recycle_id is not None:
@@ -2529,9 +2531,7 @@ class BeelineBridge:
                 # claims — orphans left by a crash/SIGKILL/registry-wipe. Close them.
                 orphan_groups_pending = orphan_groups_reaped = 0
                 try:
-                    orphan_groups_pending, orphan_groups_reaped = await self._forward_reap_orphans(
-                        groups, browser_profile=label
-                    )
+                    orphan_groups_pending, orphan_groups_reaped = await self._forward_reap_orphans(groups, browser_profile=label)
                 except Exception as exc:
                     logger.debug("Forward orphan reap skipped for label=%s: %s", label, exc)
                 # Ungrouped escapees the group reaper can't see (renderer leak
@@ -2540,9 +2540,7 @@ class BeelineBridge:
                 ungrouped_total = ungrouped_candidates = ungrouped_reaped = 0
                 if (conn.protocol_version or 0) >= 6:
                     try:
-                        ungrouped_total, ungrouped_candidates, ungrouped_reaped = await self._reap_ungrouped_orphans(
-                            browser_profile=label
-                        )
+                        ungrouped_total, ungrouped_candidates, ungrouped_reaped = await self._reap_ungrouped_orphans(browser_profile=label)
                     except Exception as exc:
                         logger.debug("Ungrouped orphan reap skipped for label=%s: %s", label, exc)
                 # One structured line per profile per sweep — the only way to see
@@ -2588,8 +2586,7 @@ class BeelineBridge:
         owned = {
             meta.get("groupId")
             for meta in self._context_registry.values()
-            if meta.get("groupId") is not None
-            and (browser_profile is None or meta.get("browser_profile") == browser_profile)
+            if meta.get("groupId") is not None and (browser_profile is None or meta.get("browser_profile") == browser_profile)
         }
         # Empty saved chips we already know Chrome won't let us delete — don't
         # spin trying to close them every sweep; they're held for recycling.
@@ -2650,11 +2647,7 @@ class BeelineBridge:
         # Was-ours AND now-ungrouped AND not attributed to a live context. Tab
         # ids are unique per Chrome session, so intersecting with THIS
         # connection's ungrouped set scopes the reap to the right profile.
-        candidates = {
-            tid
-            for tid in (self._hive_tab_ids & ungrouped)
-            if self._tab_to_profile.get(tid) is None
-        }
+        candidates = {tid for tid in (self._hive_tab_ids & ungrouped) if self._tab_to_profile.get(tid) is None}
 
         # Drop debounce counters for ids no longer candidates (re-grouped, etc.).
         for tid in list(self._ungrouped_seen):
@@ -2743,9 +2736,7 @@ class BeelineBridge:
             # before any agent has had a chance to act on it.
             effective_active_ms = last_active
             registered_at_ms = meta.get("registered_at_ms")
-            if effective_active_ms is None or (
-                registered_at_ms is not None and registered_at_ms > effective_active_ms
-            ):
+            if effective_active_ms is None or (registered_at_ms is not None and registered_at_ms > effective_active_ms):
                 effective_active_ms = registered_at_ms
             if effective_active_ms is None:
                 # No floor and no activity stamps — extremely unlikely
@@ -2754,9 +2745,7 @@ class BeelineBridge:
                 # so we don't blank the list on a pre-upgrade registry.
                 entry["dormant"] = False
             else:
-                entry["dormant"] = (
-                    (time.time() * 1000) - effective_active_ms
-                ) > self._DORMANT_AFTER_MS
+                entry["dormant"] = ((time.time() * 1000) - effective_active_ms) > self._DORMANT_AFTER_MS
             # Roll per-tab health blockers up into the context entry, deduped
             # by kind across all tabs in the group. The side panel renders
             # one row per blocker; the agent's tool error can echo the same
@@ -2822,11 +2811,13 @@ class BeelineBridge:
         shared = set.intersection(*per_profile_kinds.values())
         if not shared:
             return None
+
         # Stable choice if multiple kinds are universal (rare): pick the
         # one with the lowest priority value (matches health.classify's
         # first-match-wins semantics).
         def _priority(k: str) -> int:
             return int(sample_by_kind[k].get("priority", 100))
+
         chosen = min(shared, key=_priority)
         return sample_by_kind[chosen]
 
@@ -2858,12 +2849,14 @@ class BeelineBridge:
         if buf is None:
             buf = deque(maxlen=self._TAB_ACTION_BUFFER_SIZE)
             self._tab_actions[tab_id] = buf
-        buf.append({
-            "ts_ms": ts_ms if ts_ms is not None else time.time() * 1000,
-            "verb": verb,
-            "target": target or "",
-            "ok": bool(ok),
-        })
+        buf.append(
+            {
+                "ts_ms": ts_ms if ts_ms is not None else time.time() * 1000,
+                "verb": verb,
+                "target": target or "",
+                "ok": bool(ok),
+            }
+        )
 
     def get_tab_actions(
         self,
@@ -3123,9 +3116,7 @@ class BeelineBridge:
             if isinstance(seed_candidate, int) and seed_candidate != tab_id:
                 seed_tab_to_close = seed_candidate
         info = await self._send("tab.get", tabId=tab_id, browser_profile=owner_label)
-        notify_title = (
-            str(info.get("title") or "") if from_user and isinstance(info, dict) else ""
-        )
+        notify_title = str(info.get("title") or "") if from_user and isinstance(info, dict) else ""
         current_group = info.get("groupId")
         if isinstance(current_group, int) and current_group >= 0:
             if current_group == group_id:
@@ -3689,8 +3680,7 @@ class BeelineBridge:
         # whose document.title is the bare hostname — a fabricated "success".
         # Some failures surface only here (not via errorText), so guard the URL too.
         if isinstance(resolved_url, str) and resolved_url.startswith("chrome-error://"):
-            return {"ok": False, "tabId": tab_id, "error": "navigation_failed",
-                    "url": url, "resolved_url": resolved_url}
+            return {"ok": False, "tabId": tab_id, "error": "navigation_failed", "url": url, "resolved_url": resolved_url}
 
         return {
             "ok": True,
@@ -5276,16 +5266,20 @@ class BeelineBridge:
         payload = (result or {}).get("result") or {}
 
         if not payload.get("found"):
-            return {"ok": False, "action": "select", "selector": selector,
-                    "error": f"Element not found: {selector}"}
+            return {"ok": False, "action": "select", "selector": selector, "error": f"Element not found: {selector}"}
 
         options = payload.get("options", [])
         selected = payload.get("selected", [])
         invalid = [v for v in values if v not in options]
         if invalid:
-            return {"ok": False, "action": "select", "selector": selector,
-                    "error": f"value(s) {invalid} not in this select's options: {options}",
-                    "selected": selected, "options": options}
+            return {
+                "ok": False,
+                "action": "select",
+                "selector": selector,
+                "error": f"value(s) {invalid} not in this select's options: {options}",
+                "selected": selected,
+                "options": options,
+            }
 
         # Highlight the select element
         rect_result = await self.evaluate(
@@ -5401,10 +5395,7 @@ class BeelineBridge:
         and only when the error fingerprint indicates a foreign frame.
         """
         err_str = str(exc)
-        is_foreign_frame_err = (
-            "chrome-extension://" in err_str.lower()
-            and "different extension" in err_str.lower()
-        )
+        is_foreign_frame_err = "chrome-extension://" in err_str.lower() and "different extension" in err_str.lower()
         # Synchronous re-audit for the foreign-frame case so the response
         # we hand back to the agent names the offender (priority-20 rule)
         # rather than the generic error-only fallback (priority-21).
@@ -6002,7 +5993,8 @@ class BeelineBridge:
                         r = sq.get("rect") if sq.get("ok") else None
                         if r and r.get("w") and r.get("h"):
                             clip_rect = {
-                                "x": r["x"], "y": r["y"],
+                                "x": r["x"],
+                                "y": r["y"],
                                 "width": min(r["w"], _MAX_CLIP_PX),
                                 "height": min(r["h"], _MAX_CLIP_PX),
                                 "scale": 1,
@@ -6028,7 +6020,7 @@ class BeelineBridge:
                     # Chrome's 2^15 max texture size and the total stays well under a
                     # crash-inducing pixel count. The result is downscaled to 800px
                     # wide anyway, so a reduced-scale capture is lossless to output.
-                    _FP_MAX_SIDE = 16000        # < 2^15 (16384) with headroom
+                    _FP_MAX_SIDE = 16000  # < 2^15 (16384) with headroom
                     _FP_MAX_PIXELS = 16_000_000  # ~16 MP — far below the ~330 MP that was observed safe
                     fp_scale = min(1.0, _FP_MAX_SIDE / fp_w, _FP_MAX_SIDE / fp_h)
                     if fp_w * fp_h * fp_scale * fp_scale > _FP_MAX_PIXELS:
@@ -6058,11 +6050,15 @@ class BeelineBridge:
                     # into one surface can crash the whole browser. Give the agent an
                     # actionable error instead of the opaque CDP code.
                     h = (params.get("clip") or {}).get("height")
-                    return {"ok": False, "error": (
-                        f"Full-page screenshot exceeded Chrome's capture limit "
-                        f"(page is ~{h}px tall). Use a default screenshot (the visible "
-                        f"viewport), a --selector screenshot of the region you need, or "
-                        f"scroll and capture in sections.")}
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Full-page screenshot exceeded Chrome's capture limit "
+                            f"(page is ~{h}px tall). Use a default screenshot (the visible "
+                            f"viewport), a --selector screenshot of the region you need, or "
+                            f"scroll and capture in sections."
+                        ),
+                    }
 
                 try:
                     result = await self._cdp(

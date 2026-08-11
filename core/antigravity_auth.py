@@ -205,9 +205,7 @@ def wait_for_callback(port: int, timeout: int = 300) -> tuple[str | None, str | 
     return None, None, "timeout"
 
 
-def exchange_code_for_tokens(
-    code: str, redirect_uri: str, client_id: str, client_secret: str | None
-) -> dict[str, Any] | None:
+def exchange_code_for_tokens(code: str, redirect_uri: str, client_id: str, client_secret: str | None) -> dict[str, Any] | None:
     """Exchange authorization code for tokens."""
     data = {
         "code": code,
@@ -288,9 +286,7 @@ def validate_credentials(access_token: str, project_id: str = _DEFAULT_PROJECT_I
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3"
-        ),
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3"),
         "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     }
 

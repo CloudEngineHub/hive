@@ -630,8 +630,8 @@ async def test_upload_over_cap_returns_413(colonies_dir: Path, monkeypatch) -> N
 # ---------------------------------------------------------------------------
 
 
-import hashlib
-import json
+import hashlib  # noqa: E402
+import json  # noqa: E402
 
 
 def _staging_pointed_at(tmp_path: Path, monkeypatch) -> Path:
@@ -882,9 +882,7 @@ async def test_gc_of_stale_uploads(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(routes_colonies, "_UPLOAD_TTL_SECONDS", 1)
     stale_id = "0" * 16
     (staging / f"{stale_id}.data").write_bytes(b"junk")
-    (staging / f"{stale_id}.meta.json").write_text(
-        json.dumps({"created_at": 0, "total_bytes": 4, "received_bytes": 4, "sha256": "d" * 64})
-    )
+    (staging / f"{stale_id}.meta.json").write_text(json.dumps({"created_at": 0, "total_bytes": 4, "received_bytes": 4, "sha256": "d" * 64}))
     async with await _client(_app()) as c:
         init = await c.post(
             "/api/colonies/import/init",
@@ -1035,18 +1033,19 @@ async def test_staging_dir_is_under_hive_home(tmp_path, monkeypatch) -> None:
     """Regression guard for finding #6: staging must be on the same disk
     as HIVE_HOME, not under tempfile.gettempdir() (which is tmpfs on many
     systemd hosts and would balance 2 GiB uploads on RAM)."""
-    from framework.config import HIVE_HOME
     # By default in the runtime, _UPLOAD_STAGING_DIR is HIVE_HOME/tmp/colony_uploads.
     # Tests monkeypatch this per-test, but the module default at import time
     # is what matters — read it via a fresh import path.
     import importlib
+
+    from framework.config import HIVE_HOME
+
     fresh = importlib.reload(routes_colonies)
     # Undo the reload's global-state effect on other tests.
     try:
         expected = HIVE_HOME / "tmp" / "colony_uploads"
         assert fresh._UPLOAD_STAGING_DIR == expected, (
-            f"staging dir {fresh._UPLOAD_STAGING_DIR} must be under HIVE_HOME "
-            f"({HIVE_HOME}), not tempfile.gettempdir()"
+            f"staging dir {fresh._UPLOAD_STAGING_DIR} must be under HIVE_HOME ({HIVE_HOME}), not tempfile.gettempdir()"
         )
     finally:
         importlib.reload(routes_colonies)

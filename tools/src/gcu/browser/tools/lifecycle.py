@@ -64,9 +64,7 @@ async def _await_bridge_reconnect() -> Any | None:
     return bridge if (bridge and bridge.is_connected) else None
 
 
-def _enqueue_dead_letter(
-    profile_name: str, group_id: int, name: str | None, reason: str, browser_profile: str | None = None
-) -> None:
+def _enqueue_dead_letter(profile_name: str, group_id: int, name: str | None, reason: str, browser_profile: str | None = None) -> None:
     """Queue a deferred close for later retry. Deduped by (profile, groupId)."""
     for entry in _DEAD_LETTER:
         if entry.get("profile") == profile_name and entry.get("groupId") == group_id:
@@ -591,9 +589,7 @@ async def _lookup_remote_profile(profile_name: str) -> dict[str, Any] | None:
     return None
 
 
-async def close_profile_context(
-    profile_name: str, *, reason: str = "stop", browser_profile: str | None = None
-) -> dict[str, Any]:
+async def close_profile_context(profile_name: str, *, reason: str = "stop", browser_profile: str | None = None) -> dict[str, Any]:
     """Close one profile's tab group from non-MCP code (worker reaper, etc.).
 
     Same effect as the ``browser_stop`` MCP tool's teardown but callable
@@ -812,10 +808,7 @@ def register_lifecycle_tools(mcp: FastMCP) -> None:
             status = "Extension is connected and ready. Call browser_open(url) to begin."
             if len(profiles) > 1:
                 labels = ", ".join(p.get("label") for p in profiles if p.get("label"))
-                status += (
-                    f" {len(profiles)} Chrome profiles are connected ({labels}); pass "
-                    "browser_profile=<label> to browser_open to choose one."
-                )
+                status += f" {len(profiles)} Chrome profiles are connected ({labels}); pass browser_profile=<label> to browser_open to choose one."
             return {
                 "ok": True,
                 "connected": True,

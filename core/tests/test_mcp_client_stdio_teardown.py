@@ -67,9 +67,7 @@ _SLOW_SERVER = textwrap.dedent(
 
 def _child_pids() -> set[str]:
     try:
-        out = subprocess.run(
-            ["pgrep", "-P", str(os.getpid())], capture_output=True, text=True
-        ).stdout
+        out = subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True).stdout
         return set(out.split())
     except Exception:
         return set()
@@ -78,11 +76,7 @@ def _child_pids() -> set[str]:
 def test_stdio_connect_call_disconnect_is_clean(tmp_path, caplog) -> None:
     script = tmp_path / "echo_server.py"
     script.write_text(_ECHO_SERVER)
-    client = MCPClient(
-        MCPServerConfig(
-            name="echo", transport="stdio", command=sys.executable, args=[str(script)]
-        )
-    )
+    client = MCPClient(MCPServerConfig(name="echo", transport="stdio", command=sys.executable, args=[str(script)]))
 
     caplog.set_level(logging.DEBUG, logger="framework.loader.mcp_client")
     baseline = _child_pids()
@@ -96,12 +90,7 @@ def test_stdio_connect_call_disconnect_is_clean(tmp_path, caplog) -> None:
         client.disconnect()
 
     # THE FIX: no cross-task anyio cancel-scope error during teardown.
-    offending = [
-        r.getMessage()
-        for r in caplog.records
-        if "cancel scope" in r.getMessage().lower()
-        or "different task" in r.getMessage().lower()
-    ]
+    offending = [r.getMessage() for r in caplog.records if "cancel scope" in r.getMessage().lower() or "different task" in r.getMessage().lower()]
     assert not offending, f"cancel-scope teardown errors leaked: {offending}"
 
     # And no leaked MCP server subprocess after disconnect.

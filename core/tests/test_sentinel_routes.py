@@ -141,7 +141,8 @@ async def test_telegram_validate_bad_token(http, monkeypatch):
 async def test_telegram_detect_chat(http, monkeypatch):
     monkeypatch.setattr(notifier, "telegram_token", lambda: "T")
     monkeypatch.setattr(
-        httpx, "AsyncClient",
+        httpx,
+        "AsyncClient",
         _fake_httpx({"ok": True, "result": [{"message": {"chat": {"id": 555, "first_name": "Rich"}, "from": {"id": 555, "username": "rich"}}}]}),
     )
     resp = await http.post("/api/sentinel/telegram/detect-chat", json={})

@@ -42,9 +42,7 @@ async def _connected_browser_labels() -> set[str] | None:
     bridge_port = int(os.environ.get("HIVE_BRIDGE_PORT", "14829"))
     for status_port in (bridge_port + 1, 9230):  # primary, then legacy
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", status_port), timeout=0.5
-            )
+            reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", status_port), timeout=0.5)
             writer.write(b"GET /profiles HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
             await writer.drain()
             raw = await asyncio.wait_for(reader.read(65536), timeout=0.5)
@@ -404,13 +402,18 @@ class Worker:
                 exec_ctx_fields["colony_id"] = binding.name
             # Acting identity for the CRM, derived from the two fields above and
             # stamped here so it reaches the `hive-crm` CLI subprocess (which has
-            # no execution context of its own) as a CONTEXT_PARAM.
-            from framework.crm.principal import for_agent as _principal_for
+            # no execution context of its own) as a CONTEXT_PARAM. The CRM package
+            # is optional — its absence or failure must NOT abort execution-context
+            # stamping, which the tracker binding depends on (without the binding
+            # on the contextvar, worker tracker tools can't resolve the colony DB).
+            try:
+                from framework.crm.principal import for_agent as _principal_for
 
-            principal = _principal_for(
-                agent_id, binding.name if binding is not None else None)
-            if principal:
-                exec_ctx_fields["principal"] = principal
+                principal = _principal_for(agent_id, binding.name if binding is not None else None)
+                if principal:
+                    exec_ctx_fields["principal"] = principal
+            except Exception:
+                logger.debug("Worker %s: CRM principal lookup unavailable", self.id, exc_info=True)
             ToolRegistry.set_execution_context(**exec_ctx_fields)
         except Exception:
             logger.debug(
@@ -816,9 +819,7 @@ class Worker:
             # is idempotent so the colony backstop overlapping with this
             # is harmless.
             try:
-                result = await close_profile_context(
-                    self.id, reason="worker_shutdown", browser_profile=self._browser_profile or "default"
-                )
+                result = await close_profile_context(self.id, reason="worker_shutdown", browser_profile=self._browser_profile or "default")
                 self._reap_result = result
             except Exception as exc:
                 logger.warning("Browser reap raised for worker %s: %s", self.id, exc)

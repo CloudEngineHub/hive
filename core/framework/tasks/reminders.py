@@ -488,9 +488,7 @@ class TaskReminderSource(ReminderSource):
             # the first run after this feature ships (no persisted file yet).
             self._state.task_tool_ever_used = True
         if rctx.point is ReminderPoint.POST_TOOL_USE:
-            body = self._render_drift_or_snapshot(
-                records, snapshot_gated=True, goal=goal, tool_names=rctx.tool_names
-            )
+            body = self._render_drift_or_snapshot(records, snapshot_gated=True, goal=goal, tool_names=rctx.tool_names)
         elif rctx.point is ReminderPoint.STOP:
             body = self._render_stop(records, goal=goal)
         else:
@@ -527,11 +525,7 @@ class TaskReminderSource(ReminderSource):
         completed_count = sum(1 for r in records if r.status == TaskStatus.COMPLETED)
         names = set(tool_names or [])
         update_only = bool(names & TASK_WRITE_TOOLS) and TASK_CREATE not in names
-        snap_due = (
-            s.snapshot_due(fp, has_tasks=bool(records), ignore_fingerprint=update_only)
-            if snapshot_gated
-            else bool(records)
-        )
+        snap_due = s.snapshot_due(fp, has_tasks=bool(records), ignore_fingerprint=update_only) if snapshot_gated else bool(records)
         # Drift needs no guard against firing on a task-write turn:
         # observe_turn() ticks earlier in the same inner turn (in
         # _run_turn_loop, before this POST_TOOL_USE fire), so a write has

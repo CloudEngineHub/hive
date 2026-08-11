@@ -91,13 +91,9 @@ def _wipe_unreadable_credentials() -> None:
         for enc in cred_dir.glob("*.enc"):
             try:
                 enc.unlink()
-                logger.error(
-                    "credential-self-heal: removed unreadable %s", enc.name
-                )
+                logger.error("credential-self-heal: removed unreadable %s", enc.name)
             except OSError as exc:
-                logger.warning(
-                    "credential-self-heal: failed to remove %s: %s", enc, exc
-                )
+                logger.warning("credential-self-heal: failed to remove %s: %s", enc, exc)
 
     metadata_dir = HIVE_HOME / "credentials" / "metadata"
     if metadata_dir.is_dir():
@@ -107,9 +103,7 @@ def _wipe_unreadable_credentials() -> None:
                 index_path.unlink()
                 logger.error("credential-self-heal: removed stale index.json")
             except OSError as exc:
-                logger.warning(
-                    "credential-self-heal: failed to remove index.json: %s", exc
-                )
+                logger.warning("credential-self-heal: failed to remove index.json: %s", exc)
 
 
 def _get_allowed_agent_roots() -> tuple[Path, ...]:
@@ -922,9 +916,7 @@ def create_app(model: str | None = None) -> web.Application:
                 )
 
                 generate_and_save_credential_key()
-                logger.info(
-                    "Generated and persisted HIVE_CREDENTIAL_KEY to ~/.hive/secrets/credential_key"
-                )
+                logger.info("Generated and persisted HIVE_CREDENTIAL_KEY to ~/.hive/secrets/credential_key")
             except Exception as exc:
                 logger.warning("Could not auto-persist HIVE_CREDENTIAL_KEY: %s", exc)
 
@@ -1031,6 +1023,7 @@ def create_app(model: str | None = None) -> web.Application:
     from framework.server.routes_credentials import register_routes as register_credential_routes
     from framework.server.routes_events import register_routes as register_event_routes
     from framework.server.routes_execution import register_routes as register_execution_routes
+    from framework.server.routes_maintenance import register_routes as register_maintenance_routes
     from framework.server.routes_mcp import register_routes as register_mcp_routes
     from framework.server.routes_memories import register_routes as register_memory_routes
     from framework.server.routes_messages import register_routes as register_message_routes
@@ -1040,7 +1033,6 @@ def create_app(model: str | None = None) -> web.Application:
     from framework.server.routes_sentinel import register_routes as register_sentinel_routes
     from framework.server.routes_sessions import register_routes as register_session_routes
     from framework.server.routes_skills import register_routes as register_skills_routes
-    from framework.server.routes_maintenance import register_routes as register_maintenance_routes
     from framework.server.routes_tasks import register_routes as register_task_routes
     from framework.server.routes_workers import register_routes as register_worker_routes
 

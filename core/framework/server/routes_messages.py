@@ -62,17 +62,11 @@ async def handle_classify_colony(request: web.Request) -> web.Response:
         # Active roster from the frontend (queens not decommissioned by the
         # user). Missing/malformed → None → selector uses the full catalog.
         raw_ids = body.get("active_queen_ids")
-        active_queen_ids = (
-            [qid for qid in raw_ids if isinstance(qid, str)]
-            if isinstance(raw_ids, list)
-            else None
-        )
+        active_queen_ids = [qid for qid in raw_ids if isinstance(qid, str)] if isinstance(raw_ids, list) else None
 
         ensure_default_queens()
         llm = manager.build_llm()
-        selection = await select_queen_and_colony(
-            message, llm, active_queen_ids=active_queen_ids
-        )
+        selection = await select_queen_and_colony(message, llm, active_queen_ids=active_queen_ids)
 
         return web.json_response(
             {

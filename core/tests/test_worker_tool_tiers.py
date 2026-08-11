@@ -23,11 +23,11 @@ def _tool(name: str, desc: str = "") -> Tool:
 
 
 def _tier(**kw) -> ToolTierState:
-    defaults = dict(
-        pool=[_tool("browser_interact"), _tool("browser_upload"), _tool("send_email"), _tool("task_update")],
-        always_enabled_names={"browser_interact"},
-        gateable_names={"browser_interact", "browser_upload", "send_email"},
-    )
+    defaults = {
+        "pool": [_tool("browser_interact"), _tool("browser_upload"), _tool("send_email"), _tool("task_update")],
+        "always_enabled_names": {"browser_interact"},
+        "gateable_names": {"browser_interact", "browser_upload", "send_email"},
+    }
     defaults.update(kw)
     t = ToolTierState(**defaults)
     t.rebuild()
@@ -102,9 +102,11 @@ class TestSearchToolsFactory:
 
     @pytest.mark.asyncio
     async def test_keyword_match(self):
-        t = _tier(pool=[_tool("send_email", "Send an email via the configured sender"), _tool("browser_interact")],
-                  always_enabled_names={"browser_interact"},
-                  gateable_names={"send_email", "browser_interact"})
+        t = _tier(
+            pool=[_tool("send_email", "Send an email via the configured sender"), _tool("browser_interact")],
+            always_enabled_names={"browser_interact"},
+            gateable_names={"send_email", "browser_interact"},
+        )
         _s, handler = build_search_tools(t)
         payload = json.loads(await handler(query="send email"))
         assert payload["loaded"] == ["send_email"]
@@ -194,8 +196,7 @@ class TestDynamicRefreshSynthetics:
 
     def test_provider_supplied_search_tools_not_duplicated(self):
         # Queen path: provider output already contains search_tools.
-        t = _tier(pool=[_tool("search_tools"), _tool("browser_interact")],
-                  always_enabled_names=set(), gateable_names=set())
+        t = _tier(pool=[_tool("search_tools"), _tool("browser_interact")], always_enabled_names=set(), gateable_names=set())
         tools = list(t.get_current_tools())
         ctx = SimpleNamespace(dynamic_tools_provider=t.get_current_tools)
         AgentLoop._refresh_dynamic_tools(SimpleNamespace(_DYNAMIC_REFRESH_SYNTHETIC_NAMES=AgentLoop._DYNAMIC_REFRESH_SYNTHETIC_NAMES), ctx, tools)

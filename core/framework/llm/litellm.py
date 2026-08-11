@@ -1967,15 +1967,13 @@ class LiteLLMProvider(LLMProvider):
                     # background streamtoken_refresh loop hasn't ticked
                     # yet but the proxy already rejected. Single retry
                     # so a persistent backend outage doesn't loop.
-                    if (
-                        _is_hive_stream_token_invalid(llm_exc)
-                        and not kwargs.get("_hive_token_refresh_attempted")
-                    ):
+                    if _is_hive_stream_token_invalid(llm_exc) and not kwargs.get("_hive_token_refresh_attempted"):
                         kwargs["_hive_token_refresh_attempted"] = True
                         try:
                             from framework.server.streamtoken_refresh import (
                                 try_refresh_now,
                             )
+
                             new_token = await try_refresh_now()
                         except Exception:
                             logger.warning(
@@ -1985,8 +1983,7 @@ class LiteLLMProvider(LLMProvider):
                             new_token = None
                         if new_token:
                             logger.info(
-                                "[hive-auth] hive_stream_token_invalid on %s → "
-                                "refreshed token + retrying ONCE",
+                                "[hive-auth] hive_stream_token_invalid on %s → refreshed token + retrying ONCE",
                                 kwargs.get("model"),
                             )
                             kwargs["api_key"] = new_token
@@ -3149,8 +3146,7 @@ class LiteLLMProvider(LLMProvider):
                         if not _saw_reasoning:
                             _saw_reasoning = True
                             logger.info(
-                                "[reasoning] model=%s streaming reasoning deltas "
-                                "(surfacing as ReasoningDeltaEvent)",
+                                "[reasoning] model=%s streaming reasoning deltas (surfacing as ReasoningDeltaEvent)",
                                 self.model,
                             )
                         yield ReasoningDeltaEvent(content=_reason_chunk)

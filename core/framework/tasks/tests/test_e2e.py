@@ -170,9 +170,7 @@ async def test_rest_clear_completed_archives_and_reports_ids(http_client: TestCl
 
     store = get_task_store()
     await store.ensure_task_list("s1")
-    await store.create_tasks_batch(
-        "s1", [{"subject": "done-1"}, {"subject": "done-2"}, {"subject": "open"}]
-    )
+    await store.create_tasks_batch("s1", [{"subject": "done-1"}, {"subject": "done-2"}, {"subject": "open"}])
     await store.update_task("s1", 1, status=TaskStatus.COMPLETED)
     await store.update_task("s1", 2, status=TaskStatus.COMPLETED)
 
@@ -259,9 +257,7 @@ async def test_rest_clear_completed_then_unarchive_round_trip(
     cleared = await (await http_client.post("/api/sessions/s1/tasks/clear-completed")).json()
     assert cleared["archived"] == [1]
 
-    resp = await http_client.post(
-        "/api/sessions/s1/tasks/unarchive", json={"task_ids": [1]}
-    )
+    resp = await http_client.post("/api/sessions/s1/tasks/unarchive", json={"task_ids": [1]})
     assert resp.status == 200
     assert (await resp.json())["restored"] == [1]
 

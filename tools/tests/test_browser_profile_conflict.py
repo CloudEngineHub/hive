@@ -40,9 +40,7 @@ def _bound(label: str = "nimble-cyan-tapir") -> dict:
 def _bridge(created_label: str = "product-testing") -> MagicMock:
     b = MagicMock()
     b.is_connected = True
-    b.create_context = AsyncMock(
-        return_value={"groupId": 9, "tabId": 90, "browser_profile": created_label}
-    )
+    b.create_context = AsyncMock(return_value={"groupId": 9, "tabId": 90, "browser_profile": created_label})
     return b
 
 
@@ -83,7 +81,7 @@ async def test_omitted_profile_reuses_binding():
 
 
 async def test_default_request_means_dont_care():
-    """"default" is the caller declining to choose, not a claim about which one."""
+    """ "default" is the caller declining to choose, not a claim about which one."""
     ctx = _bound("nimble-cyan-tapir")
     lc._contexts["s1"] = ctx
 

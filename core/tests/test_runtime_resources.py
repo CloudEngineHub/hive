@@ -133,9 +133,9 @@ def _mk(avail_mb, renderers, total_mb=16000):
 def test_classify_thresholds():
     # Desktop-class 16 GiB: warn @ 4000 MiB, crit @ 2400 MiB.
     assert rr._classify(_mk(10000, 10))[0] == "ok"
-    assert rr._classify(_mk(3500, 10))[0] == "warn"       # avail < 25% warn
-    assert rr._classify(_mk(2000, 10))[0] == "critical"   # avail < 15% crit
-    assert rr._classify(_mk(10000, 50))[0] == "warn"      # renderers > warn
+    assert rr._classify(_mk(3500, 10))[0] == "warn"  # avail < 25% warn
+    assert rr._classify(_mk(2000, 10))[0] == "critical"  # avail < 15% crit
+    assert rr._classify(_mk(10000, 50))[0] == "warn"  # renderers > warn
     assert rr._classify(_mk(10000, 70))[0] == "critical"  # renderers > crit
     # worst-of-dimensions: warn memory + critical renderers → critical
     assert rr._classify(_mk(3500, 70))[0] == "critical"
@@ -172,12 +172,12 @@ def test_history_is_bounded():
 def test_verdict_transition_logs_once(caplog):
     m = rr.ResourceMonitor()
     with caplog.at_level("INFO", logger="framework.host.runtime_resources"):
-        m.record(_sample("ok"))       # init -> ok  (one transition, INFO)
-        m.record(_sample("ok"))       # no change   (silent)
-        m.record(_sample("warn"))     # ok -> warn  (WARNING)
-        m.record(_sample("critical")) # warn -> crit (ERROR)
-        m.record(_sample("critical")) # no change   (silent)
-        m.record(_sample("ok"))       # crit -> ok  (INFO)
+        m.record(_sample("ok"))  # init -> ok  (one transition, INFO)
+        m.record(_sample("ok"))  # no change   (silent)
+        m.record(_sample("warn"))  # ok -> warn  (WARNING)
+        m.record(_sample("critical"))  # warn -> crit (ERROR)
+        m.record(_sample("critical"))  # no change   (silent)
+        m.record(_sample("ok"))  # crit -> ok  (INFO)
     transitions = [r for r in caplog.records if "verdict" in r.getMessage()]
     assert len(transitions) == 4  # init->ok, ok->warn, warn->crit, crit->ok
     levels = [r.levelname for r in transitions]
@@ -309,14 +309,14 @@ def test_classify_threshold_boundaries():
     TOTAL = 16000
     W = int(TOTAL * rr._WARN_AVAIL_FRAC)
     C = int(TOTAL * rr._CRIT_AVAIL_FRAC)
-    assert rr._classify(_mk(W, 10))[0] == "ok"          # avail == warn → ok (strict <)
+    assert rr._classify(_mk(W, 10))[0] == "ok"  # avail == warn → ok (strict <)
     assert rr._classify(_mk(W - 1, 10))[0] == "warn"
-    assert rr._classify(_mk(C, 10))[0] == "warn"        # avail == crit → warn (strict <)
+    assert rr._classify(_mk(C, 10))[0] == "warn"  # avail == crit → warn (strict <)
     assert rr._classify(_mk(C - 1, 10))[0] == "critical"
     wr, cr = rr._WARN_RENDERERS, rr._CRIT_RENDERERS
-    assert rr._classify(_mk(10000, wr))[0] == "ok"      # == warn → ok (strict >)
+    assert rr._classify(_mk(10000, wr))[0] == "ok"  # == warn → ok (strict >)
     assert rr._classify(_mk(10000, wr + 1))[0] == "warn"
-    assert rr._classify(_mk(10000, cr))[0] == "warn"    # == crit → warn (strict >)
+    assert rr._classify(_mk(10000, cr))[0] == "warn"  # == crit → warn (strict >)
     assert rr._classify(_mk(10000, cr + 1))[0] == "critical"
 
 

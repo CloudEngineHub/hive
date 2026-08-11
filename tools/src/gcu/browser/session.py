@@ -26,9 +26,7 @@ _active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("hive_gcu_
 # user a command targets). Distinct from _active_profile. Normally supplied per
 # tool call as the injected ``browser_profile`` CONTEXT_PARAM; this var is the
 # fallback default for gcu-internal helpers that run without that arg.
-_active_browser_profile: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "hive_gcu_browser_profile", default="default"
-)
+_active_browser_profile: contextvars.ContextVar[str] = contextvars.ContextVar("hive_gcu_browser_profile", default="default")
 
 
 def set_active_profile(profile: str) -> contextvars.Token:

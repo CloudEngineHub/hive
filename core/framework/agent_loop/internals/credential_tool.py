@@ -275,7 +275,7 @@ def browse(query: str | None = None) -> str:
             lines.append(f"… and {len(connectable) - _MAX_BROWSE_PROVIDERS} more (use a query to filter).")
         lines.append("")
 
-    lines.append("Use action=inspect for details, action=attach to pin one to this session, " "or action=collect to add a new one.")
+    lines.append("Use action=inspect for details, action=attach to pin one to this session, or action=collect to add a new one.")
     return "\n".join(lines)
 
 
@@ -317,7 +317,7 @@ def inspect(credential_id: str, account: str = "") -> str:
             logger.debug("credentials.inspect: store lookup failed", exc_info=True)
 
     out.append("")
-    out.append("To use it, pass account=<alias> to the relevant tool. " "Use action=reveal only if you must read the raw value.")
+    out.append("To use it, pass account=<alias> to the relevant tool. Use action=reveal only if you must read the raw value.")
     return "\n".join(out)
 
 

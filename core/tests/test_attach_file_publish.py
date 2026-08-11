@@ -116,9 +116,7 @@ class TestPublishAttachFileResult:
         source = tmp_path / "report.pdf"
         source.write_bytes(b"%PDF-1.4\n%%EOF")
         payload = {
-            "attached": [
-                {"path": str(source), "resolved": str(source), "filename": "report.pdf"}
-            ],
+            "attached": [{"path": str(source), "resolved": str(source), "filename": "report.pdf"}],
             "errors": [],
         }
         out = _publish_attach_file_result(_make_result(payload), conversation_store=None)
@@ -135,9 +133,7 @@ class TestPublishAttachFileResult:
         source = tmp_path / "report.pdf"
         source.write_bytes(b"%PDF-1.4\n%%EOF")
         payload = {
-            "attached": [
-                {"path": str(source), "resolved": str(source), "filename": "report.pdf"}
-            ],
+            "attached": [{"path": str(source), "resolved": str(source), "filename": "report.pdf"}],
             "errors": [],
         }
         out = _publish_attach_file_result(_make_result(payload), store)
@@ -147,9 +143,7 @@ class TestPublishAttachFileResult:
 
     def test_unparseable_content_returns_error_result(self, tmp_path: Path):
         store = _make_store(tmp_path / "session")
-        result = ToolResult(
-            tool_use_id="tu", content="not json at all", is_error=False
-        )
+        result = ToolResult(tool_use_id="tu", content="not json at all", is_error=False)
         out = _publish_attach_file_result(result, store)
         assert out.is_error is True
         out_payload = _summary(out.content)
@@ -171,9 +165,7 @@ class TestPublishAttachFileResult:
         store = _make_store(tmp_path / "session")
         ghost = tmp_path / "ghost.pdf"  # never created
         payload = {
-            "attached": [
-                {"path": str(ghost), "resolved": str(ghost), "filename": "ghost.pdf"}
-            ],
+            "attached": [{"path": str(ghost), "resolved": str(ghost), "filename": "ghost.pdf"}],
             "errors": [],
         }
         out = _publish_attach_file_result(_make_result(payload), store)

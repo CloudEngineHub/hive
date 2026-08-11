@@ -118,9 +118,7 @@ def build_prompt_spec(
         binding_prompt=binding_prompt,
         agent_type=ctx.agent_spec.agent_type,
         output_keys=tuple(ctx.agent_spec.output_keys or ()),
-        report_schema_instruction=build_structured_output_instruction(
-            getattr(ctx.agent_spec, "report_schema", None)
-        ),
+        report_schema_instruction=build_structured_output_instruction(getattr(ctx.agent_spec, "report_schema", None)),
     )
 
 

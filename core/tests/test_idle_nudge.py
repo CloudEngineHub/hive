@@ -114,9 +114,7 @@ def test_park_reason_is_silent_park_disjoint_from_external_wait() -> None:
     categories — a park is at most one. The idle nudge applies them as
     separate gates; overlap would be a classifier bug."""
     for reason in ParkReason:
-        assert not (reason.is_silent_park and reason.is_external_wait), (
-            f"{reason} cannot be both silent and external_wait"
-        )
+        assert not (reason.is_silent_park and reason.is_external_wait), f"{reason} cannot be both silent and external_wait"
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +309,7 @@ async def test_render_skips_when_park_is_turn_done() -> None:
     )
     # Idle far past the awaiting budget — would normally fire
     # parked_no_question. Silent-park gate suppresses.
-    out = await src.render(
-        _ctx(idle_seconds=999.0, awaiting_input=True, park_reason=ParkReason.TURN_DONE)
-    )
+    out = await src.render(_ctx(idle_seconds=999.0, awaiting_input=True, park_reason=ParkReason.TURN_DONE))
     assert out is None
 
 
@@ -329,9 +325,7 @@ async def test_render_still_fires_for_broken_parks() -> None:
         broken_budget_seconds=5.0,
     )
     for broken in (ParkReason.LLM_ERROR, ParkReason.DOOM_LOOP, ParkReason.EMPTY_RESPONSES):
-        out = await src.render(
-            _ctx(idle_seconds=10.0, awaiting_input=True, park_reason=broken)
-        )
+        out = await src.render(_ctx(idle_seconds=10.0, awaiting_input=True, park_reason=broken))
         assert isinstance(out, Reminder), f"broken park {broken} should still nudge"
         assert out.meta["substate"] == "parked_broken"
         # Reset rate-limiter between probes (the test src is shared).
@@ -349,9 +343,7 @@ async def test_silent_park_gate_logs_once_across_ticks(caplog) -> None:
     src = IdleNudgeSource(budget_seconds=120.0, max_nudges=3, awaiting_budget_seconds=5.0)
     with caplog.at_level("INFO", logger="framework.agent_loop.idle_nudge"):
         for idle in (450.0, 495.0, 505.0, 600.0):
-            out = await src.render(
-                _ctx(idle_seconds=idle, awaiting_input=True, park_reason=ParkReason.TURN_DONE)
-            )
+            out = await src.render(_ctx(idle_seconds=idle, awaiting_input=True, park_reason=ParkReason.TURN_DONE))
             assert out is None
     silent_lines = [r for r in caplog.records if "gate=silent_park" in r.message]
     assert len(silent_lines) == 1, f"expected one silent_park line, got {len(silent_lines)}"
@@ -475,9 +467,7 @@ async def test_capped_park_does_not_rescan_every_tick(monkeypatch) -> None:
     src = IdleNudgeSource(budget_seconds=120.0, max_nudges=1, awaiting_budget_seconds=120.0)
 
     async def _tick():
-        return await src.render(
-            _ctx(idle_seconds=999.0, awaiting_input=True, park_reason=ParkReason.UNKNOWN)
-        )
+        return await src.render(_ctx(idle_seconds=999.0, awaiting_input=True, park_reason=ParkReason.UNKNOWN))
 
     # First poll of the window: passes the budget gate, does ONE lookup, fires.
     assert await _tick() is not None

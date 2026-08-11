@@ -54,9 +54,7 @@ async def _call(phase_state) -> dict:
     manager = types.SimpleNamespace(get_session=lambda sid: session)
     app = web.Application()
     app["manager"] = manager
-    req = make_mocked_request(
-        "GET", "/api/sessions/s1/live_tools", match_info={"session_id": "s1"}, app=app
-    )
+    req = make_mocked_request("GET", "/api/sessions/s1/live_tools", match_info={"session_id": "s1"}, app=app)
     resp = await handle_session_live_tools(req)
     return json.loads(resp.body)
 
@@ -102,8 +100,6 @@ async def test_missing_session_returns_404():
     manager = types.SimpleNamespace(get_session=lambda sid: None)
     app = web.Application()
     app["manager"] = manager
-    req = make_mocked_request(
-        "GET", "/api/sessions/nope/live_tools", match_info={"session_id": "nope"}, app=app
-    )
+    req = make_mocked_request("GET", "/api/sessions/nope/live_tools", match_info={"session_id": "nope"}, app=app)
     resp = await handle_session_live_tools(req)
     assert resp.status == 404

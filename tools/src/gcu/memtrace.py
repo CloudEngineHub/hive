@@ -127,9 +127,7 @@ def maybe_start() -> None:
         logger.propagate = False
         logger.setLevel(logging.WARNING)
     tracemalloc.start(frames)
-    threading.Thread(
-        target=_loop, args=(interval_s, top_n), name="gcu-memtrace", daemon=True
-    ).start()
+    threading.Thread(target=_loop, args=(interval_s, top_n), name="gcu-memtrace", daemon=True).start()
     _started = True
     logger.warning(
         "gcu memtrace ENABLED (interval=%.0fs frames=%d top=%d) — set GCU_LOG_FILE to capture it",

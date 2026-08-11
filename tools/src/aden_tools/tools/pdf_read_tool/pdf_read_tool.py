@@ -63,15 +63,9 @@ def _terminal_next_step(reason: str, path: Path | str) -> str:
         # pdfinfo probes the file structurally and prints the real error.
         return f"terminal_exec: pdfinfo '{p}'"
     if reason == "pdf_encrypted":
-        return (
-            f"terminal_exec: qpdf --decrypt --password=<pw> '{p}' /tmp/decrypted.pdf "
-            "(then call pdf_read again on /tmp/decrypted.pdf)"
-        )
+        return f"terminal_exec: qpdf --decrypt --password=<pw> '{p}' /tmp/decrypted.pdf (then call pdf_read again on /tmp/decrypted.pdf)"
     if reason == "pdf_extract_empty":
-        return (
-            f"attach_file(paths='{p}') — scanned PDFs read directly on vision "
-            "models. For non-vision: terminal_exec pdfimages + tesseract."
-        )
+        return f"attach_file(paths='{p}') — scanned PDFs read directly on vision models. For non-vision: terminal_exec pdfimages + tesseract."
     return f"terminal_exec: pdfinfo '{p}'"
 
 
@@ -97,6 +91,7 @@ def _yield_to_terminal(
     if page_count is not None:
         out["page_count"] = page_count
     return out
+
 
 # SSRF deny-list. pdf_read is callable by an agent with an arbitrary URL,
 # so we refuse to fetch from loopback / link-local / RFC1918 ranges to
@@ -327,9 +322,7 @@ def _read_single_pdf(
                 # terminal-hint fields so the agent still gets a path
                 # forward via qpdf.
                 yielded = _yield_to_terminal(path, reason="pdf_encrypted")
-                yielded["error"] = (
-                    "Cannot read encrypted PDF: wrong password or no password supplied."
-                )
+                yielded["error"] = "Cannot read encrypted PDF: wrong password or no password supplied."
                 return yielded
             yielded = _yield_to_terminal(path, reason="pdf_open_failed")
             yielded["error"] = f"Failed to open PDF: {exc!s}"
@@ -431,9 +424,7 @@ def _extract_with_pdfplumber(
                 "creator": meta.get("Creator") or meta.get("/Creator"),
                 "producer": meta.get("Producer") or meta.get("/Producer"),
                 "created": (
-                    str(meta.get("CreationDate") or meta.get("/CreationDate"))
-                    if (meta.get("CreationDate") or meta.get("/CreationDate"))
-                    else None
+                    str(meta.get("CreationDate") or meta.get("/CreationDate")) if (meta.get("CreationDate") or meta.get("/CreationDate")) else None
                 ),
                 "modified": (str(meta.get("ModDate") or meta.get("/ModDate")) if (meta.get("ModDate") or meta.get("/ModDate")) else None),
             }

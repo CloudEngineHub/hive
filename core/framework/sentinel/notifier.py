@@ -171,9 +171,7 @@ async def resolve_hive_session(session_id: str, resolved_by: str = "external") -
         return False
 
 
-async def _send_telegram(
-    target: dict[str, Any], text: str, thread_ref: dict[str, Any] | None
-) -> NotifierResult:
+async def _send_telegram(target: dict[str, Any], text: str, thread_ref: dict[str, Any] | None) -> NotifierResult:
     token = telegram_token()
     if not token:
         return NotifierResult(ok=False, error="telegram token not configured")
@@ -198,9 +196,7 @@ async def _send_telegram(
         return NotifierResult(ok=False, error=str(e))
 
 
-async def _send_slack(
-    target: dict[str, Any], text: str, thread_ref: dict[str, Any] | None
-) -> NotifierResult:
+async def _send_slack(target: dict[str, Any], text: str, thread_ref: dict[str, Any] | None) -> NotifierResult:
     token = slack_bot_token()
     if not token:
         return NotifierResult(ok=False, error="slack token not configured")

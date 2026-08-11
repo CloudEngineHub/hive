@@ -62,8 +62,7 @@ def _write_notifications(root, colony, allowlist):
     d = root / colony
     d.mkdir(parents=True, exist_ok=True)
     (d / "notifications.json").write_text(
-        json.dumps({"sentinel_enabled": True, "channel": "telegram",
-                    "target": {"chat_id": "9"}, "allowlist": allowlist}),
+        json.dumps({"sentinel_enabled": True, "channel": "telegram", "target": {"chat_id": "9"}, "allowlist": allowlist}),
         encoding="utf-8",
     )
 
@@ -71,8 +70,13 @@ def _write_notifications(root, colony, allowlist):
 def _open_record(colony="c1", esc="esc_1", session="s1"):
     tok = token.make_token(esc)
     rec = store_mod.EscalationRecord(
-        escalation_id=esc, colony_id=colony, session_id=session, correlation_token=tok,
-        park_reason="ask_user", question_text="continue?", channel="telegram",
+        escalation_id=esc,
+        colony_id=colony,
+        session_id=session,
+        correlation_token=tok,
+        park_reason="ask_user",
+        question_text="continue?",
+        channel="telegram",
         thread_ref={"message_id": 5},
     )
     store_mod.write_escalation(rec)
@@ -215,12 +219,19 @@ async def test_report_supersedes_prior_open_for_session(colonies, monkeypatch):
 
     monkeypatch.setattr(notifier_mod, "send", fake_send)
     mgr = SentinelManager(_FakeSM({}))
-    await mgr._handle_escalation({
-        "escalation_id": "esc_new", "colony_id": "c1", "session_id": "s1",
-        "correlation_token": token.make_token("esc_new"), "kind": "progress",
-        "question_text": "working on Y", "channel": "telegram",
-        "target": {"chat_id": "1"}, "thread": {},
-    })
+    await mgr._handle_escalation(
+        {
+            "escalation_id": "esc_new",
+            "colony_id": "c1",
+            "session_id": "s1",
+            "correlation_token": token.make_token("esc_new"),
+            "kind": "progress",
+            "question_text": "working on Y",
+            "channel": "telegram",
+            "target": {"chat_id": "1"},
+            "thread": {},
+        }
+    )
     assert store_mod.load_escalation("c1", "esc_old").status == store_mod.STATUS_RESOLVED
     assert store_mod.load_escalation("c1", "esc_new").status == store_mod.STATUS_OPEN
     # A different session is untouched.

@@ -36,6 +36,7 @@ _PRIVILEGED_SCHEMES = (
 def _is_privileged_scheme(url: str) -> bool:
     return isinstance(url, str) and url.startswith(_PRIVILEGED_SCHEMES)
 
+
 logger = logging.getLogger(__name__)
 
 

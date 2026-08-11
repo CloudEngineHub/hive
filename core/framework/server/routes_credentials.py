@@ -297,7 +297,8 @@ async def handle_save_credential(request: web.Request) -> web.Response:
         # this from a transient 500.
         logger.error(
             "save_credential rejected by read-only store for id=%s: %s",
-            credential_id, exc,
+            credential_id,
+            exc,
         )
         return web.json_response(
             {

@@ -74,16 +74,14 @@ def test_comparison_filter():
 
 
 def test_contains_filter_escapes_like_metachars():
-    clause = gq.build_filter_clause(
-        [{"column": "name", "op": "contains", "value": "50%_off"}], COLS
-    )
+    clause = gq.build_filter_clause([{"column": "name", "op": "contains", "value": "50%_off"}], COLS)
     # % and _ are escaped so they match literally, with ESCAPE declared.
     assert clause == "CAST(\"name\" AS TEXT) ILIKE '%50\\%\\_off%' ESCAPE '\\'"
 
 
 def test_is_empty_filter():
     clause = gq.build_filter_clause([{"column": "email", "op": "is_empty"}], COLS)
-    assert clause == "(\"email\" IS NULL OR CAST(\"email\" AS TEXT) = '')"
+    assert clause == '("email" IS NULL OR CAST("email" AS TEXT) = \'\')'
 
 
 def test_unknown_op_rejected():
@@ -104,7 +102,7 @@ def test_multiple_filters_anded():
         ],
         COLS,
     )
-    assert clause == "\"status\" = 'won' AND \"amount\" > 0"
+    assert clause == '"status" = \'won\' AND "amount" > 0'
 
 
 # --- search ----------------------------------------------------------------
@@ -137,10 +135,7 @@ def test_build_select_full():
         limit=50,
         offset=100,
     )
-    assert sql == (
-        'SELECT * FROM "leads" WHERE "status" = \'new\' '
-        'ORDER BY "amount" DESC LIMIT 50 OFFSET 100'
-    )
+    assert sql == ('SELECT * FROM "leads" WHERE "status" = \'new\' ORDER BY "amount" DESC LIMIT 50 OFFSET 100')
 
 
 def test_build_select_no_filters():
@@ -161,10 +156,7 @@ def test_build_count_with_search():
 
 def test_build_group_counts_basic():
     sql = gq.build_group_counts("leads", COLS, group_by="status")
-    assert sql == (
-        'SELECT "status" AS value, count(*) AS count FROM "leads" '
-        'GROUP BY "status" ORDER BY count(*) DESC, "status" ASC'
-    )
+    assert sql == ('SELECT "status" AS value, count(*) AS count FROM "leads" GROUP BY "status" ORDER BY count(*) DESC, "status" ASC')
 
 
 def test_build_group_counts_with_filters_and_limit():
@@ -175,9 +167,7 @@ def test_build_group_counts_with_filters_and_limit():
         filters=[{"column": "email", "op": "contains", "value": "rick"}],
         limit=200,
     )
-    assert sql.startswith(
-        'SELECT "status" AS value, count(*) AS count FROM "leads" WHERE '
-    )
+    assert sql.startswith('SELECT "status" AS value, count(*) AS count FROM "leads" WHERE ')
     assert 'CAST("email" AS TEXT) ILIKE' in sql  # the filter reached the WHERE
     assert sql.endswith('GROUP BY "status" ORDER BY count(*) DESC, "status" ASC LIMIT 200')
 

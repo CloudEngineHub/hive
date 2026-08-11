@@ -33,6 +33,7 @@ from framework.loader.preload_validation import credential_errors_to_json
 
 if TYPE_CHECKING:
     from framework.host.agent_host import AgentHost
+    from framework.host.event_bus import EventBus
     from framework.loader.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ _MAX_STOP_GRACE_SEC = 25.0
 # Matcher/manifest helpers moved to framework.tools.tool_tiers so the worker
 # tiering path shares them. Re-exported here because existing tests and call
 # sites import them from this module.
-from framework.tools.tool_tiers import (  # noqa: E402  (re-export)
+from framework.tools.tool_tiers import (  # noqa: E402, F401  (re-export)
     _first_line,
     _match_names,
     _match_searchable_tools,
@@ -783,7 +784,6 @@ async def resolve_missed(
     return results
 
 
-
 async def _start_trigger_timer(session: Any, trigger_id: str, tdef: Any) -> None:
     """Start an asyncio background task that fires the trigger on a timer."""
     from framework.agent_loop.agent_loop import TriggerEvent
@@ -1031,7 +1031,6 @@ def register_queen_lifecycle_tools(
         registry.register("search_tools", _search_tools_tool, lambda inputs: _search_tools_handler(**inputs))
         tools_registered += 1
 
-
     # ``start_worker`` was removed in the Phase 4 unification — its
     # bare-bones spawn duplicated ``run_agent_with_input`` (which has
     # credential preflight, concurrency guard, and phase tracking on
@@ -1235,9 +1234,7 @@ def register_queen_lifecycle_tools(
                 # registry and would have stopped the queen too).
                 stop_summary = await colony.stop_workers()
                 if stop_summary.get("timed_out"):
-                    errors.append(
-                        f"force-stopped (unresponsive): {stop_summary['timed_out']}"
-                    )
+                    errors.append(f"force-stopped (unresponsive): {stop_summary['timed_out']}")
             except Exception as e:
                 errors.append(f"unified: {e}")
                 logger.warning(
@@ -1262,8 +1259,7 @@ def register_queen_lifecycle_tools(
 
         total_workers_stopped = len(live_ids) + len(queued_ids)
         logger.info(
-            "stop_worker: stopped %d worker(s) (%d queued), cancelled %d "
-            "playbook(s), %d report(s) collected. reason=%s",
+            "stop_worker: stopped %d worker(s) (%d queued), cancelled %d playbook(s), %d report(s) collected. reason=%s",
             total_workers_stopped,
             len(queued_ids),
             len(playbooks_stopped),
@@ -2511,10 +2507,7 @@ def register_queen_lifecycle_tools(
                 "tool_filter": {"type": "array", "items": {"type": "string"}},
                 "browser_profile": {
                     "type": "string",
-                    "description": (
-                        "Chrome profile label this profile's browser tools "
-                        "target (from list_browser_profiles). Empty clears it."
-                    ),
+                    "description": ("Chrome profile label this profile's browser tools target (from list_browser_profiles). Empty clears it."),
                 },
             },
             "required": ["colony_id", "profile_name"],
@@ -2547,9 +2540,7 @@ def register_queen_lifecycle_tools(
         bridge_port = int(os.environ.get("HIVE_BRIDGE_PORT", "14829"))
         for status_port in (bridge_port + 1, 9230):
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection("127.0.0.1", status_port), timeout=0.5
-                )
+                reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", status_port), timeout=0.5)
                 writer.write(b"GET /profiles HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
                 await writer.drain()
                 raw = await asyncio.wait_for(reader.read(65536), timeout=0.5)

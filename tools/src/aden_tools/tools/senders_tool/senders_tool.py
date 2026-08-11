@@ -79,11 +79,7 @@ def _text_to_html(text: str) -> str:
     becomes broken markup.
     """
     paragraphs = re.split(r"\n\s*\n", text.strip())
-    return "".join(
-        "<p>" + "<br>".join(escape(line) for line in p.split("\n")) + "</p>"
-        for p in paragraphs
-        if p.strip()
-    )
+    return "".join("<p>" + "<br>".join(escape(line) for line in p.split("\n")) + "</p>" for p in paragraphs if p.strip())
 
 
 def _html_to_text(html: str) -> str:
@@ -194,10 +190,7 @@ def _send_tracked(
             out["guidance"] = "Already sent to this recipient. Do NOT retry or use another sender."
         elif reservation.get("denied_because") == "suppressed":
             out["suppressed"] = True
-            out["guidance"] = (
-                "This person must not be contacted, by any sender. Remove them from "
-                "the campaign; do not try again."
-            )
+            out["guidance"] = "This person must not be contacted, by any sender. Remove them from the campaign; do not try again."
         elif reservation.get("denied_because") == "daily_limit":
             out["guidance"] = "This sender is exhausted for today. A different sender may still have budget."
         return out
@@ -246,8 +239,7 @@ def _send_tracked(
         result["conversation"] = token
     elif not sender.can_receive:
         result["reply_tracking"] = (
-            f"none — '{sender.name}' has no inbox, so a reply from {to_email} "
-            f"will not reach you. Use a mailbox sender for conversations."
+            f"none — '{sender.name}' has no inbox, so a reply from {to_email} will not reach you. Use a mailbox sender for conversations."
         )
     return result
 
@@ -348,10 +340,17 @@ def register_tools(
             if not body_html:
                 return {"error": "Provide a body: `html`, or `text` for a plain-text message."}
 
-        outcome = _send_tracked(registry, resolved, to_email, subject, body_html, colony_id,
-                                text=body_text,
-                                hubspot_email_id=hubspot_email_id or None,
-                                campaign_id=campaign_id)
+        outcome = _send_tracked(
+            registry,
+            resolved,
+            to_email,
+            subject,
+            body_html,
+            colony_id,
+            text=body_text,
+            hubspot_email_id=hubspot_email_id or None,
+            campaign_id=campaign_id,
+        )
         if outcome.get("success"):
             outcome["sender"] = resolved.name
         return outcome
@@ -520,11 +519,7 @@ def register_tools(
 
         registry.refresh()  # the new limit must apply to the very next send
 
-        changed = {
-            k: {"from": getattr(resolved, k, None), "to": v}
-            for k, v in patch.items()
-            if getattr(resolved, k, None) != v
-        }
+        changed = {k: {"from": getattr(resolved, k, None), "to": v} for k, v in patch.items() if getattr(resolved, k, None) != v}
         return {
             "sender": updated.get("name", resolved.name),
             "sender_id": resolved.id,

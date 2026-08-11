@@ -190,10 +190,7 @@ def test_too_many_completed_fires_over_threshold() -> None:
     # At the threshold: not yet ("more than", not "at least").
     assert s.drift_trigger(open_task_count=1, completed_task_count=COMPLETED_CLEANUP_THRESHOLD) is None
     # Over it → cleanup nudge, ahead of any stale/all_done kind.
-    assert (
-        s.drift_trigger(open_task_count=1, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1)
-        == "too_many_completed"
-    )
+    assert s.drift_trigger(open_task_count=1, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1) == "too_many_completed"
 
 
 def test_too_many_completed_takes_priority_over_all_done() -> None:
@@ -202,10 +199,7 @@ def test_too_many_completed_takes_priority_over_all_done() -> None:
     task', and the agent creates new work after archiving anyway."""
     s = ReminderState(task_tool_ever_used=True, turns_total=REMINDER_WARMUP_TURNS)
     s.turns_since_task_op = 1
-    assert (
-        s.drift_trigger(open_task_count=0, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1)
-        == "too_many_completed"
-    )
+    assert s.drift_trigger(open_task_count=0, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1) == "too_many_completed"
 
 
 def test_too_many_completed_respects_cooldown() -> None:
@@ -235,10 +229,7 @@ def test_too_many_completed_takes_priority_over_untracked() -> None:
     resumed session can inherit a pile without task_tool_ever_used set)."""
     s = ReminderState(task_tool_ever_used=False, turns_total=REMINDER_WARMUP_TURNS)
     s.turns_since_task_op = UNTRACKED_TURNS + 5  # untracked would fire
-    assert (
-        s.drift_trigger(open_task_count=1, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1)
-        == "too_many_completed"
-    )
+    assert s.drift_trigger(open_task_count=1, completed_task_count=COMPLETED_CLEANUP_THRESHOLD + 1) == "too_many_completed"
 
 
 def test_drift_respects_warmup() -> None:
@@ -607,9 +598,7 @@ async def test_task_source_nudges_cleanup_on_completing_write_turn(task_store) -
     # The write turn itself: observe_turn ticks first (as in _run_turn_loop),
     # then POST_TOOL_USE renders with the write's tool names.
     src.observe_turn(["task_update"])
-    body = await src.render(
-        ReminderContext(ReminderPoint.POST_TOOL_USE, ctx, tool_names=["task_update"])
-    )
+    body = await src.render(ReminderContext(ReminderPoint.POST_TOOL_USE, ctx, tool_names=["task_update"]))
     assert body is not None
     assert f"{COMPLETED_CLEANUP_THRESHOLD + 1} completed tasks" in body
     assert "status='archived'" in body
@@ -622,9 +611,7 @@ async def test_task_source_stop_nudges_cleanup(task_store) -> None:
     await _seed_completed_pile(task_store, session_id, COMPLETED_CLEANUP_THRESHOLD + 1)
     src = TaskReminderSource()
     src._state.turns_total = REMINDER_WARMUP_TURNS
-    body = await src.render(
-        ReminderContext(ReminderPoint.STOP, SimpleNamespace(session_id=session_id))
-    )
+    body = await src.render(ReminderContext(ReminderPoint.STOP, SimpleNamespace(session_id=session_id)))
     assert body is not None and "completed tasks are piling up" in body
 
 

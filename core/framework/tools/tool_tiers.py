@@ -167,8 +167,7 @@ class ToolTierState:
         """
         if self.enabled_allowlist is not None and not self.gateable_names:
             logger.warning(
-                "ToolTierState.rebuild: gateable_names is empty but allowlist has "
-                "%d entries — allowlist cannot be applied.",
+                "ToolTierState.rebuild: gateable_names is empty but allowlist has %d entries — allowlist cannot be applied.",
                 len(self.enabled_allowlist),
             )
         self._filtered_pool = [t for t in self.pool if self.passes_allowlist(t.name)]

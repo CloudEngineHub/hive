@@ -178,23 +178,24 @@ async def before_run(module: Any, bsc: Any, bridge: Any) -> dict | None:
         # WAITS OUT the user-configured limit (never bypasses it) and only
         # for small gaps — hourly/daily caps still short-circuit below so
         # the agent schedules a trigger instead of blocking for an hour.
-        if (
-            not check["allowed"]
-            and check.get("reason") == "too_fast"
-            and 0 < float(check.get("retry_after_seconds") or 0) <= _TOO_FAST_ABSORB_S
-        ):
+        if not check["allowed"] and check.get("reason") == "too_fast" and 0 < float(check.get("retry_after_seconds") or 0) <= _TOO_FAST_ABSORB_S:
             wait_s = float(check["retry_after_seconds"]) + 1.0
             logger.info(
-                "rate_limit_hook absorbing too_fast gap: platform=%s account=%s "
-                "action=%s wait=%.1fs",
-                action.get("platform", platform), account_id, action_type, wait_s,
+                "rate_limit_hook absorbing too_fast gap: platform=%s account=%s action=%s wait=%.1fs",
+                action.get("platform", platform),
+                account_id,
+                action_type,
+                wait_s,
             )
             await asyncio.sleep(wait_s)
             check = limiter.check(action.get("platform", platform), account_id, action_type)
         if not check["allowed"]:
             logger.info(
                 "rate_limit_hook blocked: platform=%s account=%s action=%s reason=%s",
-                action.get("platform", platform), account_id, action_type, check.get("reason"),
+                action.get("platform", platform),
+                account_id,
+                action_type,
+                check.get("reason"),
             )
             return {
                 "status": "rate_limited",

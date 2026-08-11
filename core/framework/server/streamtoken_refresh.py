@@ -56,7 +56,8 @@ import base64
 import json
 import logging
 import os
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 from pydantic import SecretStr
@@ -163,9 +164,7 @@ async def post_refresh(
     mocked httpx client without monkey-patching the module.
     """
     url = f"{base_url.rstrip('/')}/user/refresh-stream-token-from-stream"
-    factory: Callable[[], httpx.AsyncClient] = client_factory or (
-        lambda: httpx.AsyncClient(timeout=15.0)
-    )
+    factory: Callable[[], httpx.AsyncClient] = client_factory or (lambda: httpx.AsyncClient(timeout=15.0))
     try:
         async with factory() as client:
             resp = await client.post(url, json={"streamToken": current_token})
@@ -243,9 +242,7 @@ async def _refresh_loop(
 
     base_url = os.environ.get("HIVE_CLOUD_BASE", "").rstrip("/")
     if not base_url:
-        logger.info(
-            "streamtoken_refresh: disabled (no HIVE_CLOUD_BASE — runtime not in cloud mode)"
-        )
+        logger.info("streamtoken_refresh: disabled (no HIVE_CLOUD_BASE — runtime not in cloud mode)")
         return
 
     store = app.get("credential_store") if hasattr(app, "get") else app["credential_store"]
@@ -283,11 +280,7 @@ async def _refresh_loop(
                 continue
             current_exp = decode_jwt_exp(current)
             now_unix = now()
-            if (
-                current_exp is not None
-                and current_exp - now_unix > REFRESH_BEFORE_SECONDS
-                and not force_event.is_set()
-            ):
+            if current_exp is not None and current_exp - now_unix > REFRESH_BEFORE_SECONDS and not force_event.is_set():
                 # Someone else (desktop) just refreshed it. Re-loop and
                 # compute the new sleep from this fresher exp.
                 continue
@@ -324,7 +317,7 @@ async def _sleep_with_force(
     seeing hive_stream_token_invalid."""
     try:
         await asyncio.wait_for(force_event.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
     else:
         # Cleared inside the loop after action.
@@ -385,11 +378,11 @@ async def try_refresh_now() -> str | None:
         # might be the very token the caller was just rejected for,
         # so we still need to refresh.
         import time as _time
+
         exp = decode_jwt_exp(current)
         if exp is not None and exp - _time.time() > REFRESH_BEFORE_SECONDS:
             logger.debug(
-                "streamtoken_refresh: forced refresh skipped — credential "
-                "was already refreshed concurrently (exp=%s)",
+                "streamtoken_refresh: forced refresh skipped — credential was already refreshed concurrently (exp=%s)",
                 exp,
             )
             return current

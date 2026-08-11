@@ -1347,13 +1347,7 @@ async def create_queen(
     # keeps the original order (always → independent) because there is
     # no contradiction to resolve there.
     phase_state.prompt_colony = finalize_queen_prompt(
-        (
-            _queen_character_core
-            + _queen_role_colony
-            + _queen_tools_colony
-            + _queen_behavior_colony
-            + _queen_behavior_always
-        ),
+        (_queen_character_core + _queen_role_colony + _queen_tools_colony + _queen_behavior_colony + _queen_behavior_always),
         _has_vision,
     )
 
@@ -1735,8 +1729,7 @@ async def create_queen(
             # inherits the user's own permissions.
             from framework.crm.principal import for_agent as _principal_for
 
-            principal = _principal_for(
-                queen_agent_id, binding.name if binding is not None else None)
+            principal = _principal_for(queen_agent_id, binding.name if binding is not None else None)
             if principal:
                 exec_ctx_fields["principal"] = principal
             ToolRegistry.set_execution_context(**exec_ctx_fields)
@@ -1750,6 +1743,7 @@ async def create_queen(
             # task", so it loops — re-triggering painting and spamming QQ. Cap it
             # via env HIVE_MAX_ITER (e.g. 3) for single-reply chat deployments.
             import os as _os
+
             _iter_cap = _os.environ.get("HIVE_MAX_ITER")
             _default_max_iter = int(_iter_cap) if (_iter_cap and _iter_cap.isdigit()) else 999_999
             queen_loop_config = LoopConfig(

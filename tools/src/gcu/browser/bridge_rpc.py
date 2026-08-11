@@ -268,10 +268,7 @@ class BridgeRpcServer:
         as unknown (the BeelineBridge layer falls back to its env-derived
         hint in that case).
         """
-        identified = [
-            info["owner_pid"] for info in self._clients.values()
-            if info.get("owner_pid") is not None
-        ]
+        identified = [info["owner_pid"] for info in self._clients.values() if info.get("owner_pid") is not None]
         if not identified:
             return None
         return any(_pid_alive(pid) for pid in identified)
@@ -324,12 +321,14 @@ class BridgeRpcServer:
         delivered to. Subscribers whose socket has already gone are
         silently skipped — the next reap pass will drop them.
         """
-        frame = json.dumps({
-            "type": "notify",
-            "profile": profile,
-            "text": text,
-            **extra,
-        })
+        frame = json.dumps(
+            {
+                "type": "notify",
+                "profile": profile,
+                "text": text,
+                **extra,
+            }
+        )
         delivered = 0
         for ws, info in list(self._clients.items()):
             if not info.get("wants_notify"):
@@ -401,10 +400,7 @@ class BridgeRpcServer:
             except asyncio.CancelledError:
                 return
             now = time.monotonic()
-            zombies = [
-                (ws, info) for ws, info in list(self._clients.items())
-                if not self._client_alive(info, now)
-            ]
+            zombies = [(ws, info) for ws, info in list(self._clients.items()) if not self._client_alive(info, now)]
             for ws, info in zombies:
                 reason = "owner_dead" if info.get("owner_pid") is not None else "no_identify"
                 logger.info("reaper: closing zombie client (%s, owner_pid=%r)", reason, info.get("owner_pid"))
@@ -622,10 +618,7 @@ class BridgeClient:
                     if handler is not None:
                         profile = msg.get("profile") or ""
                         text = msg.get("text") or ""
-                        extra = {
-                            k: v for k, v in msg.items()
-                            if k not in ("type", "profile", "text")
-                        }
+                        extra = {k: v for k, v in msg.items() if k not in ("type", "profile", "text")}
                         asyncio.create_task(self._safe_notify(handler, profile, text, extra))
                     continue
                 fut = self._pending.pop(msg.get("rpc_id"), None)

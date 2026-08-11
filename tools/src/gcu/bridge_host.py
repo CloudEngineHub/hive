@@ -271,8 +271,7 @@ async def _idle_exit_watchdog(bridge, stop: asyncio.Event) -> None:
         if idle_since is None:
             idle_since = now
             logger.info(
-                "bridge has no gcu RPC clients and desktop is gone — starting "
-                "%.0fs grace before self-exit",
+                "bridge has no gcu RPC clients and desktop is gone — starting %.0fs grace before self-exit",
                 _IDLE_GRACE_S,
             )
             continue
@@ -317,8 +316,7 @@ async def _run_worker() -> int:
     if not bridge.has_public_listeners():
         errs = "; ".join(f"{k}: {v}" for k, v in (bridge._bind_errors or {}).items()) or "unknown"
         logger.error(
-            "bridge worker came up without its public ports (%s) — another bridge "
-            "is holding them; exiting for supervisor respawn",
+            "bridge worker came up without its public ports (%s) — another bridge is holding them; exiting for supervisor respawn",
             errs,
         )
         try:

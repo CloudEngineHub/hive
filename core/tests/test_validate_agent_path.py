@@ -254,73 +254,13 @@ class TestAllowedRootsImmutability:
 
 
 class TestHTTPEndpointsRejectMaliciousPaths:
-    """Test that HTTP route handlers return 400 for paths outside allowed roots."""
+    """Test that HTTP route handlers return 400 for paths outside allowed roots.
 
-    @pytest.mark.asyncio
-    async def test_create_session_rejects_outside_path(self, tmp_path):
-        import framework.server.app as app_module
-
-        exports = tmp_path / "exports"
-        exports.mkdir()
-        app_module._ALLOWED_AGENT_ROOTS = (exports,)
-        try:
-            app = create_app()
-            async with TestClient(TestServer(app)) as client:
-                resp = await client.post(
-                    "/api/sessions",
-                    json={"agent_path": "/tmp/evil"},
-                )
-                assert resp.status == 400
-                body = await resp.json()
-                assert "allowed directory" in body["error"]
-        finally:
-            _reset_allowed_roots()
-
-    @pytest.mark.asyncio
-    async def test_create_session_rejects_traversal(self, tmp_path):
-        import framework.server.app as app_module
-
-        exports = tmp_path / "exports"
-        exports.mkdir()
-        app_module._ALLOWED_AGENT_ROOTS = (exports,)
-        try:
-            app = create_app()
-            async with TestClient(TestServer(app)) as client:
-                resp = await client.post(
-                    "/api/sessions",
-                    json={"agent_path": "exports/../../tmp/evil"},
-                )
-                assert resp.status == 400
-                body = await resp.json()
-                assert "allowed directory" in body["error"]
-        finally:
-            _reset_allowed_roots()
-
-    @pytest.mark.asyncio
-    async def test_load_colony_rejects_outside_path(self, tmp_path):
-        import framework.server.app as app_module
-
-        exports = tmp_path / "exports"
-        exports.mkdir()
-        app_module._ALLOWED_AGENT_ROOTS = (exports,)
-        try:
-            app = create_app()
-            async with TestClient(TestServer(app)) as client:
-                # First create a queen-only session
-                create_resp = await client.post("/api/sessions", json={})
-                if create_resp.status != 201:
-                    pytest.skip(f"Cannot create queen-only session (status={create_resp.status})")
-                session_id = (await create_resp.json())["session_id"]
-
-                resp = await client.post(
-                    f"/api/sessions/{session_id}/colony",
-                    json={"agent_path": "/tmp/evil"},
-                )
-                assert resp.status == 400
-                body = await resp.json()
-                assert "allowed directory" in body["error"]
-        finally:
-            _reset_allowed_roots()
+    Note: the session/colony create endpoints no longer accept an ``agent_path``
+    (they take a ``colony_id``/``queen_name``), so the arbitrary-path surface
+    there is gone. ``validate_agent_path`` is still exercised directly by the
+    unit tests above and by the credential-check endpoint below.
+    """
 
     @pytest.mark.asyncio
     async def test_check_agent_credentials_rejects_traversal(self, tmp_path):
@@ -338,28 +278,6 @@ class TestHTTPEndpointsRejectMaliciousPaths:
                 )
                 assert resp.status == 400
                 body = await resp.json()
-                assert "allowed directory" in body["error"]
-        finally:
-            _reset_allowed_roots()
-
-    @pytest.mark.asyncio
-    async def test_error_message_does_not_leak_resolved_path(self, tmp_path):
-        import framework.server.app as app_module
-
-        exports = tmp_path / "exports"
-        exports.mkdir()
-        app_module._ALLOWED_AGENT_ROOTS = (exports,)
-        try:
-            app = create_app()
-            async with TestClient(TestServer(app)) as client:
-                resp = await client.post(
-                    "/api/sessions",
-                    json={"agent_path": "/tmp/evil"},
-                )
-                body = await resp.json()
-                # The error message should not contain the resolved absolute path
-                # It should use the generic allowlist message
-                assert "/tmp/evil" not in body["error"]
                 assert "allowed directory" in body["error"]
         finally:
             _reset_allowed_roots()

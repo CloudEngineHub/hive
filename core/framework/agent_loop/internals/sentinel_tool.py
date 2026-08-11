@@ -104,10 +104,7 @@ def build_sentinel_setup_tool() -> Tool:
                 "provider": {
                     "type": "string",
                     "enum": ["slack", "slack_app", "telegram"],
-                    "description": (
-                        "For store_token: which token. 'slack' = bot xoxb-, "
-                        "'slack_app' = app-level xapp-, 'telegram' = bot token."
-                    ),
+                    "description": ("For store_token: which token. 'slack' = bot xoxb-, 'slack_app' = app-level xapp-, 'telegram' = bot token."),
                 },
                 "token": {
                     "type": "string",
@@ -120,10 +117,7 @@ def build_sentinel_setup_tool() -> Tool:
                 },
                 "target": {
                     "type": "object",
-                    "description": (
-                        "For configure/test: destination. Slack: {\"channel\": \"C0123ABC\"}. "
-                        "Telegram: {\"chat_id\": \"123456789\"}."
-                    ),
+                    "description": ('For configure/test: destination. Slack: {"channel": "C0123ABC"}. Telegram: {"chat_id": "123456789"}.'),
                 },
                 "enabled": {
                     "type": "boolean",
@@ -140,10 +134,7 @@ def build_sentinel_setup_tool() -> Tool:
                 },
                 "colony_id": {
                     "type": "string",
-                    "description": (
-                        "For configure/test: target colony's on-disk directory name. "
-                        "Defaults to the colony bound to this session."
-                    ),
+                    "description": ("For configure/test: target colony's on-disk directory name. Defaults to the colony bound to this session."),
                 },
             },
             "required": [],
@@ -226,7 +217,7 @@ async def _validate_telegram(token: str) -> tuple[bool, str | None, str | None]:
 def _format_detected(chat_id: Any, chat_title: Any, sender_id: Any, sender_name: Any) -> str:
     return (
         f'Detected Telegram chat "{chat_title or "chat"}": chat_id={chat_id}; '
-        f'sender={sender_name or "user"} (id {sender_id}). '
+        f"sender={sender_name or 'user'} (id {sender_id}). "
         f'Configure with target={{"chat_id": "{chat_id}"}} and '
         f'allowlist=["{sender_id}"], then enable.'
     )
@@ -300,8 +291,7 @@ async def _detect_chat() -> str:
     updates = data.get("result", [])
     if not updates:
         return (
-            "PENDING: no message yet — ask the user to open the bot in Telegram and "
-            "send it any message (or tap Start), then run detect_chat again."
+            "PENDING: no message yet — ask the user to open the bot in Telegram and send it any message (or tap Start), then run detect_chat again."
         )
     msg = updates[-1].get("message", {}) or {}
     chat = msg.get("chat", {}) or {}

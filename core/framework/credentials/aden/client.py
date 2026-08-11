@@ -109,10 +109,7 @@ class AdenClientConfig:
         if self.api_key is None:
             self.api_key = os.environ.get("ADEN_API_KEY")
             if not self.api_key:
-                raise ValueError(
-                    "Aden API key not provided. Either pass api_key to AdenClientConfig "
-                    "or set the ADEN_API_KEY environment variable."
-                )
+                raise ValueError("Aden API key not provided. Either pass api_key to AdenClientConfig or set the ADEN_API_KEY environment variable.")
 
 
 @dataclass

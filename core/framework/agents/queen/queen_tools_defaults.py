@@ -411,9 +411,7 @@ _CATEGORY_ADDITIONS: dict[str, dict[str, str]] = {
 # user-added custom queen IDs that we don't know about.
 
 QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
-    queen_id: list(profile["default_tool_categories"])
-    for queen_id, profile in DEFAULT_QUEENS.items()
-    if profile.get("default_tool_categories")
+    queen_id: list(profile["default_tool_categories"]) for queen_id, profile in DEFAULT_QUEENS.items() if profile.get("default_tool_categories")
 }
 
 
@@ -518,9 +516,7 @@ def configured_always_enabled_categories() -> frozenset[str]:
     try:
         from framework.config import get_hive_config
 
-        override = (
-            get_hive_config().get("queen_tools", {}).get("always_enabled_categories")
-        )
+        override = get_hive_config().get("queen_tools", {}).get("always_enabled_categories")
         if isinstance(override, list) and all(isinstance(x, str) for x in override):
             return frozenset(override)
     except Exception:  # noqa: BLE001 — config is best-effort; fall back to default
@@ -584,9 +580,7 @@ def configured_worker_always_enabled_categories() -> frozenset[str]:
     try:
         from framework.config import get_hive_config
 
-        override = (
-            get_hive_config().get("worker_tools", {}).get("always_enabled_categories")
-        )
+        override = get_hive_config().get("worker_tools", {}).get("always_enabled_categories")
         if isinstance(override, list) and all(isinstance(x, str) for x in override):
             return frozenset(override)
     except Exception:  # noqa: BLE001 — config is best-effort; fall back to default

@@ -35,9 +35,7 @@ async def test_tools_run_on_dedicated_hive_tool_pool() -> None:
         seen["thread"] = threading.current_thread().name
         return ToolResult(tool_use_id=tool_use.id, content="ok")
 
-    res = await execute_tool(
-        tool_executor=exec_, tc=_ToolCallEvent("t", {}), timeout=10
-    )
+    res = await execute_tool(tool_executor=exec_, tc=_ToolCallEvent("t", {}), timeout=10)
     assert res.content == "ok"
     assert seen["thread"].startswith("hive-tool"), seen["thread"]
 
@@ -45,9 +43,7 @@ async def test_tools_run_on_dedicated_hive_tool_pool() -> None:
 @pytest.mark.asyncio
 async def test_hung_tools_do_not_starve_the_default_pool(monkeypatch) -> None:
     # Shrink the tool pool to 2 so we can saturate it cheaply.
-    small = concurrent.futures.ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="hive-tool-test"
-    )
+    small = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hive-tool-test")
     monkeypatch.setattr(trh, "_TOOL_EXECUTOR", small)
 
     release = threading.Event()
@@ -57,12 +53,7 @@ async def test_hung_tools_do_not_starve_the_default_pool(monkeypatch) -> None:
         return ToolResult(tool_use_id=tool_use.id, content="done")
 
     # Fill both tool-pool threads with hung tool calls (don't await yet).
-    hung = [
-        asyncio.create_task(
-            execute_tool(tool_executor=hung_exec, tc=_ToolCallEvent("t", {}), timeout=30)
-        )
-        for _ in range(2)
-    ]
+    hung = [asyncio.create_task(execute_tool(tool_executor=hung_exec, tc=_ToolCallEvent("t", {}), timeout=30)) for _ in range(2)]
     await asyncio.sleep(0.15)  # let both grab a tool thread
 
     # The DEFAULT pool — what the HTTP API's asyncio.to_thread reads use — must

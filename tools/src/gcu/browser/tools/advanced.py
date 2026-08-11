@@ -48,11 +48,7 @@ async def _resolve_blockers(bridge, tab_id: int, error_str: str | None) -> list[
             except Exception:
                 blockers = []
 
-        looks_foreign_frame = (
-            isinstance(error_str, str)
-            and "chrome-extension://" in error_str.lower()
-            and "different extension" in error_str.lower()
-        )
+        looks_foreign_frame = isinstance(error_str, str) and "chrome-extension://" in error_str.lower() and "different extension" in error_str.lower()
         if not blockers and looks_foreign_frame and bridge is not None:
             try:
                 # Synchronous audit → names the offender by reading the
@@ -73,6 +69,7 @@ async def _resolve_blockers(bridge, tab_id: int, error_str: str | None) -> list[
         return blockers
     except Exception:
         return []
+
 
 # ── browser_evaluate prompts ─────────────────────────────────────
 
@@ -153,10 +150,7 @@ holds afterwards (often empty for sites that clear it after consuming the
 files). `accepted` is None if it couldn't be read back."""
 
 BROWSER_UPLOAD_PARAMS = {
-    "selector": (
-        "CSS selector for the file input. In triggered mode this matches the "
-        "input created after the click (commonly input[type=file])."
-    ),
+    "selector": ("CSS selector for the file input. In triggered mode this matches the input created after the click (commonly input[type=file])."),
     "file_paths": "List of file paths to upload",
     "trigger_selector": (
         "Optional CSS selector for the element to click to open the file picker "
@@ -303,9 +297,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
     async def browser_upload(
         selector: Annotated[str, Field(description=BROWSER_UPLOAD_PARAMS["selector"])],
         file_paths: Annotated[list[str], Field(description=BROWSER_UPLOAD_PARAMS["file_paths"])],
-        trigger_selector: Annotated[
-            str | None, Field(description=BROWSER_UPLOAD_PARAMS["trigger_selector"])
-        ] = None,
+        trigger_selector: Annotated[str | None, Field(description=BROWSER_UPLOAD_PARAMS["trigger_selector"])] = None,
         tab_id: Annotated[int | None, Field(description=BROWSER_UPLOAD_PARAMS["tab_id"])] = None,
         profile: Annotated[str | None, Field(description=BROWSER_UPLOAD_PARAMS["profile"])] = None,
         timeout_ms: Annotated[int, Field(description=BROWSER_UPLOAD_PARAMS["timeout_ms"])] = 30000,
@@ -398,9 +390,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             # listener *before* setting the files to capture that.
             object_id = None
             try:
-                resolved = await bridge._cdp(
-                    target_tab, "DOM.resolveNode", {"nodeId": node_id}
-                )
+                resolved = await bridge._cdp(target_tab, "DOM.resolveNode", {"nodeId": node_id})
                 object_id = resolved.get("object", {}).get("objectId")
                 if object_id:
                     await bridge._cdp(

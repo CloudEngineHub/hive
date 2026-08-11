@@ -200,9 +200,7 @@ async def handle_telegram_detect_chat(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "error": data.get("description", "getUpdates failed")})
         updates = data.get("result", [])
         if not updates:
-            return web.json_response(
-                {"ok": False, "pending": True, "error": "No message yet — send any message to your bot, then retry."}
-            )
+            return web.json_response({"ok": False, "pending": True, "error": "No message yet — send any message to your bot, then retry."})
         msg = updates[-1].get("message", {})
         chat = msg.get("chat", {})
         sender = msg.get("from", {})

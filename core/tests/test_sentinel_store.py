@@ -49,8 +49,7 @@ def test_notifications_enabled_by_default_via_hive(colonies):
 
 
 def test_notifications_enabled_reads_per_colony_opt_in(colonies):
-    _write_notifications(colonies, "c1", {"sentinel_enabled": True, "channel": "telegram",
-                                          "target": {"chat_id": "9"}, "allowlist": ["42"]})
+    _write_notifications(colonies, "c1", {"sentinel_enabled": True, "channel": "telegram", "target": {"chat_id": "9"}, "allowlist": ["42"]})
     cfg = store.load_notifications_config("c1")
     assert cfg.sentinel_enabled is True
     assert cfg.channel == "telegram"
@@ -61,8 +60,11 @@ def test_notifications_enabled_reads_per_colony_opt_in(colonies):
 def test_update_notifications_config_writes_and_merges(colonies):
     (colonies / "c1").mkdir()
     store.update_notifications_config(
-        "c1", sentinel_enabled=True, channel="telegram",
-        target={"chat_id": "9"}, allowlist=["42", 7],
+        "c1",
+        sentinel_enabled=True,
+        channel="telegram",
+        target={"chat_id": "9"},
+        allowlist=["42", 7],
     )
     cfg = store.load_notifications_config("c1")
     assert cfg.sentinel_enabled is True
@@ -82,22 +84,33 @@ def test_per_colony_classify_after_seconds_round_trip(colonies):
     (colonies / "c1").mkdir()
     # Unset by default → inherit global (None).
     store.update_notifications_config(
-        "c1", sentinel_enabled=True, channel="slack",
-        target={"channel": "C1"}, allowlist=["U1"],
+        "c1",
+        sentinel_enabled=True,
+        channel="slack",
+        target={"channel": "C1"},
+        allowlist=["U1"],
     )
     assert store.load_notifications_config("c1").classify_after_seconds is None
 
     # Set a per-colony override; persisted and clamped to the >=1s floor.
     store.update_notifications_config(
-        "c1", sentinel_enabled=True, channel="slack",
-        target={"channel": "C1"}, allowlist=["U1"], classify_after_seconds=300.0,
+        "c1",
+        sentinel_enabled=True,
+        channel="slack",
+        target={"channel": "C1"},
+        allowlist=["U1"],
+        classify_after_seconds=300.0,
     )
     assert store.load_notifications_config("c1").classify_after_seconds == 300.0
 
     # Passing None again clears the override back to inherit-global.
     store.update_notifications_config(
-        "c1", sentinel_enabled=True, channel="slack",
-        target={"channel": "C1"}, allowlist=["U1"], classify_after_seconds=None,
+        "c1",
+        sentinel_enabled=True,
+        channel="slack",
+        target={"channel": "C1"},
+        allowlist=["U1"],
+        classify_after_seconds=None,
     )
     assert store.load_notifications_config("c1").classify_after_seconds is None
 
@@ -106,14 +119,11 @@ def test_update_notifications_config_missing_colony(colonies):
     import pytest as _pytest
 
     with _pytest.raises(FileNotFoundError):
-        store.update_notifications_config(
-            "ghost", sentinel_enabled=True, channel="telegram", target={}, allowlist=[]
-        )
+        store.update_notifications_config("ghost", sentinel_enabled=True, channel="telegram", target={}, allowlist=[])
 
 
 def test_update_thread_preserves_settings(colonies):
-    _write_notifications(colonies, "c1", {"sentinel_enabled": True, "channel": "slack",
-                                          "target": {"channel": "C1"}, "allowlist": ["U1"]})
+    _write_notifications(colonies, "c1", {"sentinel_enabled": True, "channel": "slack", "target": {"channel": "C1"}, "allowlist": ["U1"]})
     store.update_notifications_thread("c1", {"ts": "123.456"})
     cfg = store.load_notifications_config("c1")
     assert cfg.thread == {"ts": "123.456"}

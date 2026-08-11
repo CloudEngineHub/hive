@@ -254,9 +254,7 @@ class TaskStore:
         """
         return await asyncio.to_thread(self._archive_completed_sync, session_id)
 
-    async def unarchive_tasks(
-        self, session_id: str, task_ids: list[int]
-    ) -> list[int]:
+    async def unarchive_tasks(self, session_id: str, task_ids: list[int]) -> list[int]:
         """Restore archived tasks to their pre-archive status; return the
         restored ids.
 
@@ -267,9 +265,7 @@ class TaskStore:
         ``archived_*`` markers, and touches ``updated_at``. Ids not found
         or not currently archived are skipped.
         """
-        return await asyncio.to_thread(
-            self._unarchive_sync, session_id, list(task_ids)
-        )
+        return await asyncio.to_thread(self._unarchive_sync, session_id, list(task_ids))
 
     # ----- task CRUD ----------------------------------------------------
 

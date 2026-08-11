@@ -28,17 +28,9 @@ def main():
     try:
         # Connect to database
         if USERNAME and PASSWORD:
-            connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={SERVER};"
-                f"DATABASE={DATABASE};"
-                f"UID={USERNAME};"
-                f"PWD={PASSWORD};"
-            )
+            connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};UID={USERNAME};PWD={PASSWORD};"
         else:
-            connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};Trusted_Connection=yes;"
-            )
+            connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};Trusted_Connection=yes;"
 
         connection = pyodbc.connect(connection_string)
         cursor = connection.cursor()

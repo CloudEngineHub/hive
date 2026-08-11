@@ -93,11 +93,7 @@ async def _open_tasks(agent_ctx: object) -> list:
     # "Open" = active and unfinished. Archived tasks are parked in History,
     # not the working plan — counting them (they're != completed) as open
     # would keep the idle nudge firing after the plan is actually clear.
-    return [
-        r
-        for r in (records or [])
-        if r.status not in (TaskStatus.COMPLETED, TaskStatus.ARCHIVED)
-    ]
+    return [r for r in (records or []) if r.status not in (TaskStatus.COMPLETED, TaskStatus.ARCHIVED)]
 
 
 async def _session_goal(agent_ctx: object) -> str | None:

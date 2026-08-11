@@ -254,11 +254,7 @@ def _privileged_scheme(snap: dict, err: str | None, ctx: dict) -> Blocker | None
     # the new-tab URL under a handful of aliases depending on version and
     # profile state (chrome://newtab/, chrome://new-tab-page/, the legacy
     # chrome-search://local-ntp/…), so match all of them.
-    if (
-        url.startswith("chrome://newtab")
-        or url.startswith("chrome://new-tab-page")
-        or url.startswith("chrome-search://local-ntp")
-    ):
+    if url.startswith("chrome://newtab") or url.startswith("chrome://new-tab-page") or url.startswith("chrome-search://local-ntp"):
         return None
     for prefix in _PRIVILEGED_PREFIXES:
         if url.startswith(prefix):
@@ -267,9 +263,7 @@ def _privileged_scheme(snap: dict, err: str | None, ctx: dict) -> Blocker | None
                 kind="privileged_scheme",
                 severity="block",
                 title="Privileged Chrome page",
-                detail=(
-                    f"This tab is on {scheme}, which Chrome forbids extensions from automating."
-                ),
+                detail=(f"This tab is on {scheme}, which Chrome forbids extensions from automating."),
                 fix="Navigate to a regular http(s) page or open a new tab.",
                 priority=10,
                 context={"url": url, "scheme": scheme},
@@ -331,13 +325,6 @@ def _foreign_extension_blocker(
     extensions_url = f"chrome://extensions/?id={first}"
     extra_count = f" (+{len(foreign_ids) - 1} more)" if len(foreign_ids) > 1 else ""
 
-    host = ""
-    if site_url:
-        try:
-            host = (urlparse(site_url).hostname or "").lower()
-        except Exception:
-            host = ""
-
     # Capitalised subject for sentence-start (detail), bare name for the
     # title and the fix's mid-sentence reference. "an unknown extension"
     # capitalises naturally to "An unknown extension"; "Calendly" stays
@@ -345,19 +332,13 @@ def _foreign_extension_blocker(
     subject_start = name[0].upper() + name[1:] if name else name
 
     title = f"Blocked by {name}"
-    detail = (
-        f"{subject_start} ({store_url}) injected a frame into this tab"
-        f"{extra_count}, which prevents Hive from automating the page."
-    )
+    detail = f"{subject_start} ({store_url}) injected a frame into this tab{extra_count}, which prevents Hive from automating the page."
     fix = f"Open {extensions_url}, turn it off, and reload this tab."
     # Agent instruction. Only the policy bits the LLM can't infer from
     # title/detail/fix: don't auto-navigate the user's tab (chrome://extensions
     # is a context switch); ask first, then use ``browser_open`` if they agree
     # (it's been patched to accept chrome:// URLs).
-    agent_action = (
-        "Surface the blocker, then ask before opening chrome://extensions — "
-        "call browser_open with the fix URL only if the user agrees."
-    )
+    agent_action = "Surface the blocker, then ask before opening chrome://extensions — call browser_open with the fix URL only if the user agrees."
     return Blocker(
         kind="foreign_extension_frame",
         severity="block",
@@ -457,11 +438,7 @@ def _devtools_attached(snap: dict, err: str | None, ctx: dict) -> Blocker | None
         return None
     e = err.lower()
     # Chromium phrasings observed in the wild.
-    hit = (
-        ("another debugger" in e)
-        or ("debugger is already attached" in e)
-        or ("cannot attach" in e and "devtools" in e)
-    )
+    hit = ("another debugger" in e) or ("debugger is already attached" in e) or ("cannot attach" in e and "devtools" in e)
     if not hit:
         return None
     return Blocker(
@@ -505,10 +482,7 @@ def _file_access_denied(snap: dict, err: str | None, ctx: dict) -> Blocker | Non
         severity="block",
         title="File access not allowed",
         detail="The Hive extension isn't permitted to operate on file:// URLs.",
-        fix=(
-            "Open chrome://extensions, find Hive Browser Bridge → Details, "
-            'and enable "Allow access to file URLs".'
-        ),
+        fix=('Open chrome://extensions, find Hive Browser Bridge → Details, and enable "Allow access to file URLs".'),
         priority=50,
     )
 

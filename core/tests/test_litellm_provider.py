@@ -827,7 +827,9 @@ class TestOpenRouterToolCompatFallback:
 
         compat_response = MagicMock()
         compat_response.choices = [MagicMock()]
-        compat_response.choices[0].message.content = (
+        compat_response.choices[
+            0
+        ].message.content = (
             '{"assistant_response":"","tool_calls":[{"name":"web_search","arguments":{"query":"Python 3.13 release notes","num_results":3}}]}'
         )
         compat_response.choices[0].finish_reason = "stop"

@@ -81,9 +81,7 @@ class EventLogFile:
             self._fh = None
             if not self._broken:
                 self._broken = True
-                logger.warning(
-                    "Event log reopen failed for %s: %s", self.path, second_err
-                )
+                logger.warning("Event log reopen failed for %s: %s", self.path, second_err)
 
     def flush(self) -> None:
         if self._fh is None:

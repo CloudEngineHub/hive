@@ -38,9 +38,7 @@ def patched_store(monkeypatch):
     monkeypatch.setattr(
         store_mod,
         "load_notifications_config",
-        lambda cid: NotificationsConfig(
-            sentinel_enabled=True, channel="telegram", target={"chat_id": "1"}, allowlist=[], thread={}
-        ),
+        lambda cid: NotificationsConfig(sentinel_enabled=True, channel="telegram", target={"chat_id": "1"}, allowlist=[], thread={}),
     )
 
 
@@ -52,7 +50,17 @@ class _Clock:
         return self.t
 
 
-def _make_source(*, verdict=VERDICT_CONTINUE, errored=False, open_tasks=("t1",), goal="enrich 1000 leads", ui=False, clock=None, forbid_classify=False, running_workers=()):
+def _make_source(
+    *,
+    verdict=VERDICT_CONTINUE,
+    errored=False,
+    open_tasks=("t1",),
+    goal="enrich 1000 leads",
+    ui=False,
+    clock=None,
+    forbid_classify=False,
+    running_workers=(),
+):
     escalated: list[dict] = []
     clock = clock or _Clock()
 
@@ -72,7 +80,7 @@ def _make_source(*, verdict=VERDICT_CONTINUE, errored=False, open_tasks=("t1",),
 
     src = EscalationSource(
         park_context_provider=provider,
-        on_escalate=lambda p: (escalated.append(p) or True),
+        on_escalate=lambda p: escalated.append(p) or True,
         has_attached_ui=lambda sid: ui,
         classify_fn=classify,
         now_fn=clock,
@@ -125,9 +133,7 @@ async def test_nudge_surfaces_running_workers(patched_store):
     # — otherwise the resumed queen re-dispatches the same tasks.
     src, _, _ = _make_source(
         verdict=VERDICT_CONTINUE,
-        running_workers=[
-            {"worker_id": "w1", "status": "running", "task": "scrape influencer A", "elapsed_seconds": 750}
-        ],
+        running_workers=[{"worker_id": "w1", "status": "running", "task": "scrape influencer A", "elapsed_seconds": 750}],
     )
     out = await src.render(_ctx())
     assert isinstance(out, Reminder)
@@ -181,8 +187,12 @@ async def test_per_colony_budget_overrides_global(monkeypatch):
         store_mod,
         "load_notifications_config",
         lambda cid: NotificationsConfig(
-            sentinel_enabled=True, channel="telegram", target={"chat_id": "1"},
-            allowlist=[], thread={}, classify_after_seconds=500.0,
+            sentinel_enabled=True,
+            channel="telegram",
+            target={"chat_id": "1"},
+            allowlist=[],
+            thread={},
+            classify_after_seconds=500.0,
         ),
     )
     src, escalated, _ = _make_source(verdict=VERDICT_NEEDS_HUMAN)
@@ -304,7 +314,8 @@ async def test_done_reports_completion(patched_store):
 @pytest.mark.asyncio
 async def test_disabled_per_colony(patched_store, monkeypatch):
     monkeypatch.setattr(
-        store_mod, "load_notifications_config",
+        store_mod,
+        "load_notifications_config",
         lambda cid: NotificationsConfig(sentinel_enabled=False),
     )
     src, escalated, _ = _make_source(verdict=VERDICT_NEEDS_HUMAN)
@@ -391,7 +402,8 @@ def test_idle_nudge_defers_to_active_autopilot(monkeypatch):
     from framework.agent_loop.idle_nudge import _sentinel_autopilot_active
 
     monkeypatch.setattr(
-        store_mod, "load_notifications_config",
+        store_mod,
+        "load_notifications_config",
         lambda cid: NotificationsConfig(sentinel_enabled=True),
     )
     assert _sentinel_autopilot_active(SimpleNamespace(is_queen_stream=True, colony_id="c1")) is True
@@ -400,7 +412,8 @@ def test_idle_nudge_defers_to_active_autopilot(monkeypatch):
     assert _sentinel_autopilot_active(SimpleNamespace(is_queen_stream=True, colony_id=None)) is False
 
     monkeypatch.setattr(
-        store_mod, "load_notifications_config",
+        store_mod,
+        "load_notifications_config",
         lambda cid: NotificationsConfig(sentinel_enabled=False),
     )
     assert _sentinel_autopilot_active(SimpleNamespace(is_queen_stream=True, colony_id="c1")) is False

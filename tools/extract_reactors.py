@@ -3,7 +3,10 @@
 Extract reactor profile URLs and names from a saved LinkedIn reactions dialog HTML file.
 Usage: python3 extract_reactors.py <html_file>
 """
-import re, sys, json
+
+import json
+import re
+import sys
 
 filepath = sys.argv[1]
 html = open(filepath).read()
@@ -29,25 +32,21 @@ seen = set()
 # Pattern: <a href="/in/slug..."> ... name text ...
 link_pattern = r'<a[^>]*href="(/in/([^"?/]+)[^"]*)"[^>]*>(.*?)</a>'
 for match in re.finditer(link_pattern, html, re.DOTALL):
-    slug_path = match.group(1).split('?')[0]
+    slug_path = match.group(1).split("?")[0]
     slug_name = match.group(2)
     inner_html = match.group(3)
-    
+
     # Extract display name from inner text
-    text = re.sub(r'<[^>]+>', ' ', inner_html)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
+    text = re.sub(r"<[^>]+>", " ", inner_html)
+    text = re.sub(r"\s+", " ", text).strip()
+
     # Usually the first part before • is the name
-    name = text.split('•')[0].strip() if '•' in text else text.split('reacted')[0].strip()
-    
+    name = text.split("•")[0].strip() if "•" in text else text.split("reacted")[0].strip()
+
     if slug_path not in seen and name and len(name) > 1:
         seen.add(slug_path)
         profile_url = f"https://www.linkedin.com{slug_path}"
-        results.append({
-            "name": name,
-            "profile_url": profile_url,
-            "slug": slug_name
-        })
+        results.append({"name": name, "profile_url": profile_url, "slug": slug_name})
 
 # Output as JSON
 print(json.dumps(results, indent=2, ensure_ascii=False))

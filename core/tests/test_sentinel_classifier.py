@@ -121,9 +121,7 @@ async def test_running_workers_reach_classifier():
     # waiting. The classifier must see the live workers (and be licensed to
     # answer "continue"), or it can misread a healthy wait as a blocker.
     ctx = _ctx()
-    ctx.running_workers = [
-        {"worker_id": "w1", "status": "running", "task": "scrape influencer A", "elapsed_seconds": 750}
-    ]
+    ctx.running_workers = [{"worker_id": "w1", "status": "running", "task": "scrape influencer A", "elapsed_seconds": 750}]
     llm = _CapturingLLM()
     await classify_park(ctx, llm)
     assert "w1" in llm.user_prompt and "scrape influencer A" in llm.user_prompt

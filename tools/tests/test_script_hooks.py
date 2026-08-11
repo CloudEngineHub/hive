@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import types
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -29,13 +27,17 @@ def _make_hook(*, before_result=None, after_transform=None):
     """Create a hook module with optional before_run/after_run."""
     hook = types.ModuleType("test_hook")
     if before_result is not None:
+
         async def before_run(module, bsc, bridge):
             return before_result
+
         hook.before_run = before_run
     if after_transform is not None:
+
         async def after_run(module, bsc, bridge, result):
             result.update(after_transform)
             return result
+
         hook.after_run = after_run
     return hook
 

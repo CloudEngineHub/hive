@@ -12,9 +12,8 @@ import time
 from typing import Annotated, Literal
 
 from fastmcp import FastMCP
-from pydantic import Field
-
 from framework.rate_limiter import SocialRateLimiter
+from pydantic import Field
 
 from ..bridge import connection_error, get_bridge
 from ..telemetry import log_tool_call
@@ -35,10 +34,22 @@ _INSTAGRAM_PROFILE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_IG_NON_PROFILE_PATHS = frozenset({
-    "explore", "direct", "reels", "stories", "accounts", "p", "reel",
-    "tv", "about", "legal", "developer", "static",
-})
+_IG_NON_PROFILE_PATHS = frozenset(
+    {
+        "explore",
+        "direct",
+        "reels",
+        "stories",
+        "accounts",
+        "p",
+        "reel",
+        "tv",
+        "about",
+        "legal",
+        "developer",
+        "static",
+    }
+)
 
 
 def _is_instagram_profile_url(url: str) -> bool:
@@ -160,9 +171,12 @@ def register_navigation_tools(mcp: FastMCP) -> None:
             if not check["allowed"]:
                 logger.info(
                     "browser_navigate blocked: %s profile_view limit for account=%s reason=%s",
-                    _profile_platform, _nav_account_id, check.get("reason"),
+                    _profile_platform,
+                    _nav_account_id,
+                    check.get("reason"),
                 )
                 from ..hooks.rate_limit_hook import RATE_LIMIT_GUIDANCE
+
                 result = {
                     "ok": False,
                     "error": "rate_limited",
@@ -172,8 +186,7 @@ def register_navigation_tools(mcp: FastMCP) -> None:
                     **{k: v for k, v in check.items() if k != "allowed"},
                     "guidance": RATE_LIMIT_GUIDANCE,
                 }
-                log_tool_call("browser_navigate", params, result=result,
-                              duration_ms=(time.perf_counter() - start) * 1000)
+                log_tool_call("browser_navigate", params, result=result, duration_ms=(time.perf_counter() - start) * 1000)
                 return result
 
         try:

@@ -291,8 +291,7 @@ def _relax_strict_input_validation(server: FastMCP) -> None:
         low.call_tool(validate_input=False)(server._mcp_call_tool)
     except Exception:
         logger.warning(
-            "could not relax strict MCP input validation; stringified "
-            "tool arguments may be rejected",
+            "could not relax strict MCP input validation; stringified tool arguments may be rejected",
             exc_info=True,
         )
 

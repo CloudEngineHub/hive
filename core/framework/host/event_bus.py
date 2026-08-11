@@ -485,9 +485,7 @@ class EventBus:
         self._session_log_write_broken = False
         logger.info("Session event log → %s (iteration_offset=%d)", path, iteration_offset)
 
-    def set_worker_log_resolver(
-        self, resolver: Callable[[str], Path | None] | None
-    ) -> None:
+    def set_worker_log_resolver(self, resolver: Callable[[str], Path | None] | None) -> None:
         """Route worker-local events to per-worker logs instead of the queen's.
 
         ``resolver`` maps a worker ``stream_id`` (``"worker:<uuid>"``) to the
@@ -633,9 +631,7 @@ class EventBus:
 
         # A worker's log is closed on its terminal report — the one event every
         # worker is guaranteed to emit exactly once.
-        if event.type == EventType.SUBAGENT_REPORT and is_worker_stream(
-            event.stream_id
-        ):
+        if event.type == EventType.SUBAGENT_REPORT and is_worker_stream(event.stream_id):
             self._close_worker_log(event.stream_id or "")
 
     def _flush_pending_snapshots(
