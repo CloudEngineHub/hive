@@ -436,9 +436,17 @@ class ToolRegistry:
             registry_ref.resync_mcp_servers_if_needed()
 
             if tool_use.name not in registry_ref._tools:
+                import difflib
+
+                error_msg = f"Unknown tool: {tool_use.name}"
+                if registry_ref._tools:
+                    matches = difflib.get_close_matches(tool_use.name, registry_ref._tools.keys(), n=1, cutoff=0.6)
+                    if matches:
+                        error_msg += f". Did you mean '{matches[0]}'?"
+
                 return ToolResult(
                     tool_use_id=tool_use.id,
-                    content=json.dumps({"error": f"Unknown tool: {tool_use.name}"}),
+                    content=json.dumps({"error": error_msg}),
                     is_error=True,
                 )
 
