@@ -440,16 +440,22 @@ def test_tool_execution_error_logs_inputs(caplog):
 def test_unknown_tool_error_returns_proper_result():
     """ToolRegistry should return proper error for unknown tools and suggest closest match."""
     registry = ToolRegistry()
-    
+
     # Register a tool so it can be suggested
-    def existent_tool() -> str:
+    tool_meta = Tool(
+        name="existent_tool",
+        description="A tool that exists",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def existent_executor(input_data):
         return "ok"
-    
-    registry.register(existent_tool)
-    
+
+    registry.register(tool=tool_meta, executor=existent_executor)
+
     tool_use = ToolUse(
         id="unknown_call",
-        name="existant_tool", # typo
+        name="existant_tool",  # typo
         input={},
     )
 
