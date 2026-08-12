@@ -24,7 +24,14 @@ KNOWN_PHANTOM_TOOLS: set[str] = {"google_search"}
 
 # Modules that accept `credentials` to query the credential store itself
 # (meta-tools), not for external API auth. They don't need CredentialSpecs.
-CREDENTIAL_STORE_META_MODULES: set[str] = {"account_info_tool"}
+# senders_tool is credential-less at the MCP layer: it reads each sender's
+# secrets straight from the store rather than declaring its own CredentialSpec.
+CREDENTIAL_STORE_META_MODULES: set[str] = {"account_info_tool", "senders_tool"}
+
+# Credential specs used only by infrastructure (not by any MCP tool or node),
+# so they legitimately have empty tools AND node_types. e.g. slack_app is the
+# Slack App-Level (Socket Mode) token consumed by Sentinel's inbound listener.
+INFRA_ONLY_CREDENTIAL_SPECS: set[str] = {"slack_app"}
 
 # Community-contributed tool variants that are not registered in the central
 # __init__.py and therefore don't need CredentialSpecs. The project has its

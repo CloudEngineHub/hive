@@ -126,7 +126,9 @@ def _windows_cmd() -> str | None:
 
 def _kind_for_path(path: str) -> tuple[str, tuple[str, ...]]:
     """Derive ``(kind, argv_prefix)`` from an explicit shell path."""
-    base = os.path.basename(path).lower()
+    # Split on both separators so a Windows path (backslash) classifies
+    # correctly even on a POSIX host — os.path.basename only splits on "/".
+    base = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if "pwsh" in base or "powershell" in base:
         return "powershell", ("-NoProfile", "-NonInteractive", "-Command")
     if base in ("cmd", "cmd.exe"):

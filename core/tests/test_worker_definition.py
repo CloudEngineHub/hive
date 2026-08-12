@@ -121,7 +121,9 @@ class TestBuildInputData:
         # paths from layout assumptions.
         assert data["binding"] == binding.to_dict()
         assert data["binding"]["name"] == "colony_x"
-        assert data["binding"]["tracker_db"] == "/c/tracker/tracker.db"
+        # to_dict serializes paths with str(Path), so the separator is
+        # platform-specific (backslash on Windows) — compare accordingly.
+        assert data["binding"]["tracker_db"] == str(Path("/c/tracker/tracker.db"))
         assert "task_id" not in data
 
     def test_carries_task_id_when_provided(self) -> None:

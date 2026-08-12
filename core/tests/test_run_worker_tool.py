@@ -757,7 +757,8 @@ async def test_subagent_report_carries_batch_metadata(tmp_path: Path) -> None:
         assert sorted(r.get("batch_index") for r in captured) == [1, 2]
         for r in captured:
             assert r.get("batch_size") == 2
-            assert r.get("output_file", "").endswith("conversations/parts")
+            # Normalize separators — the path uses os.sep (backslash on Windows).
+            assert r.get("output_file", "").replace("\\", "/").endswith("conversations/parts")
     finally:
         await colony.stop()
 

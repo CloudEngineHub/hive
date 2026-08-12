@@ -72,7 +72,7 @@ def test_kill_and_launch_commands_blocked(cmd):
     assert msg is not None, f"guard MISSED: {cmd!r}"
     assert "BLOCKED" in msg
     # The message must teach the correct recovery, not just refuse.
-    assert "browser_close" in msg and "report_to_parent" in msg
+    assert "hive-browser tab close" in msg and "report_to_parent" in msg
 
 
 @pytest.mark.parametrize("cmd", BENIGN_COMMANDS)

@@ -12,6 +12,10 @@ import pytest
 from aden_tools.credentials import CREDENTIAL_SPECS
 from aden_tools.credentials.health_check import HEALTH_CHECKERS
 
+# Credential specs consumed only by infrastructure (no MCP tool/node), which
+# therefore legitimately declare neither tools nor node_types.
+_INFRA_ONLY_CREDENTIAL_SPECS: set[str] = {"slack_app"}
+
 
 class TestRegistryCompleteness:
     """Every credential with a health_check_endpoint must have a registered checker."""
@@ -71,6 +75,11 @@ class TestSpecRequiredFields:
         ids=list(CREDENTIAL_SPECS.keys()),
     )
     def test_has_tools_or_node_types(self, cred_name, spec):
+        # Infrastructure-only credentials (e.g. slack_app: the Slack Socket-Mode
+        # token used only by Sentinel's inbound listener) have no MCP tool/node
+        # by design, so they legitimately declare neither.
+        if cred_name in _INFRA_ONLY_CREDENTIAL_SPECS:
+            pytest.skip(f"{cred_name} is an infrastructure-only credential")
         assert spec.tools or spec.node_types, f"{cred_name}: must have at least one tool or node_type"
 
 

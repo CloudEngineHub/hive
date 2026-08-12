@@ -184,9 +184,12 @@ def test_refresher_blocks_mid_run_resume() -> None:
 
 def test_offline_execute_refused_when_server_marker_live() -> None:
     janitor.write_server_marker(port=1234)
-    # Marker must name a DIFFERENT live pid; pid 1 is always alive on Linux.
+    # Marker must name a DIFFERENT live pid. Use the parent pid: it is alive
+    # for the duration of the test and distinct from os.getpid(), and it is
+    # queryable on every platform (pid 1 is not a live/queryable process on
+    # Windows, so hardcoding it made this test Linux-only).
     marker = janitor.server_marker_path()
-    marker.write_text(json.dumps({"pid": 1, "started_at": time.time()}), encoding="utf-8")
+    marker.write_text(json.dumps({"pid": os.getppid(), "started_at": time.time()}), encoding="utf-8")
 
     cfg = _cfg()
     report = run_once(SafetyContext.for_offline(cfg), cfg, tiers={2, 3}, execute=True)

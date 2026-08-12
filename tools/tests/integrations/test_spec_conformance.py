@@ -32,6 +32,7 @@ from .conftest import (
     CREDENTIAL_STORE_META_MODULES,
     CREDENTIAL_TOOL_MODULE_IDS,
     CREDENTIAL_TOOL_MODULES,
+    INFRA_ONLY_CREDENTIAL_SPECS,
     KNOWN_PHANTOM_TOOLS,
     MODULE_TO_TOOLS,
     TOOL_MODULE_IDS,
@@ -124,6 +125,8 @@ class TestCredentialSpecFields:
     @pytest.mark.parametrize("spec_name", list(CREDENTIAL_SPECS.keys()))
     def test_tools_or_node_types_non_empty(self, spec_name: str):
         """CredentialSpec must have non-empty tools or node_types."""
+        if spec_name in INFRA_ONLY_CREDENTIAL_SPECS:
+            pytest.skip(f"'{spec_name}' is an infrastructure-only credential (no MCP tool/node by design)")
         spec = CREDENTIAL_SPECS[spec_name]
         assert spec.tools or spec.node_types, f"Spec '{spec_name}' has both empty tools and empty node_types"
 
