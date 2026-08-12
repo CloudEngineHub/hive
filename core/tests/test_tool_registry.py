@@ -451,7 +451,7 @@ def test_unknown_tool_error_returns_proper_result():
     def existent_executor(input_data):
         return "ok"
 
-    registry.register(tool=tool_meta, executor=existent_executor)
+    registry.register(name="existent_tool", tool=tool_meta, executor=existent_executor)
 
     tool_use = ToolUse(
         id="unknown_call",
