@@ -438,11 +438,18 @@ def test_tool_execution_error_logs_inputs(caplog):
 
 
 def test_unknown_tool_error_returns_proper_result():
-    """ToolRegistry should return proper error for unknown tools."""
+    """ToolRegistry should return proper error for unknown tools and suggest closest match."""
     registry = ToolRegistry()
+    
+    # Register a tool so it can be suggested
+    def existent_tool() -> str:
+        return "ok"
+    
+    registry.register(existent_tool)
+    
     tool_use = ToolUse(
         id="unknown_call",
-        name="nonexistent_tool",
+        name="existant_tool", # typo
         input={},
     )
 
@@ -451,7 +458,8 @@ def test_unknown_tool_error_returns_proper_result():
 
     assert result.is_error is True
     assert "Unknown tool" in result.content
-    assert "nonexistent_tool" in result.content
+    assert "existant_tool" in result.content
+    assert "Did you mean 'existent_tool'?" in result.content
 
 
 def test_tool_execution_error_truncates_large_inputs(caplog):
