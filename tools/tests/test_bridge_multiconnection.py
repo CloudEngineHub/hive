@@ -103,6 +103,10 @@ def test_resolve_default_zero_connections():
 def test_resolve_unknown_label():
     bridge = BeelineBridge()
     _add_conn(bridge, "A")
+    # Two connections make an unknown label genuinely ambiguous, so the bridge
+    # fails fast. (With a SINGLE connection it now falls back to it, treating
+    # the missing label as a stale id after an extension reinstall.)
+    _add_conn(bridge, "B")
     with pytest.raises(BridgeError) as ei:
         bridge.resolve_connection("ghost")
     assert ei.value.code == "no_browser_profile"
@@ -175,6 +179,10 @@ async def test_send_routes_by_tab_id():
 async def test_send_unknown_profile_raises_without_touching_sockets():
     bridge = BeelineBridge()
     a = _add_conn(bridge, "A")
+    # Multiple connections → an unknown profile is ambiguous and fails fast
+    # before any socket is touched (a single connection would be used as the
+    # stale-label fallback instead).
+    _add_conn(bridge, "B")
     with pytest.raises(BridgeError) as ei:
         await bridge._send("cdp", browser_profile="ghost", method="X")
     assert ei.value.code == "no_browser_profile"

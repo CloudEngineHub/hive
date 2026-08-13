@@ -390,7 +390,9 @@ class TestWebScrapeToolRobotsTxt:
         mock_rp.can_fetch.return_value = False
         mock_rp_cls.return_value = mock_rp
 
-        result, _ = await scrape("<html></html>", url="https://example.com/private")
+        # robots.txt is only consulted when explicitly opted in (the tool
+        # defaults respect_robots_txt=False).
+        result, _ = await scrape("<html></html>", url="https://example.com/private", respect_robots_txt=True)
         assert "robots.txt" in result["error"]
         assert result["skipped"] is True
 

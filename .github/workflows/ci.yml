@@ -88,6 +88,9 @@ jobs:
         working-directory: tools
         run: |
           uv sync --extra dev
+          # chart_tools renders ECharts/Mermaid via Playwright (headless
+          # Chromium); install the browser so those smoke tests can run.
+          uv run playwright install chromium
           uv run pytest tests/ -v
 
   validate:

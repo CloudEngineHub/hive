@@ -89,6 +89,10 @@ def test_generation_success_saves_and_previews(image_generate_fn, monkeypatch, t
         return DummyResponse(200, _ok_payload())
 
     monkeypatch.setattr(httpx, "post", mock_post)
+    # Bypass the Pillow re-encode (provenance/watermark strip) so this test can
+    # assert the exact bytes flow through the save/preview plumbing unchanged;
+    # _postprocess_image has its own coverage.
+    monkeypatch.setattr(image_gen_tool, "_postprocess_image", lambda raw, fmt: raw)
 
     result = image_generate_fn(prompt="a friendly robot logo")
     summary = _summary(result)

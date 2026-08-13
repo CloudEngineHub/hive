@@ -624,7 +624,7 @@ class TestInspection:
 
         # browser_screenshot returns list of content blocks
         assert isinstance(result, list)
-        mock_bridge.screenshot.assert_awaited_once_with(100, full_page=True, selector=None)
+        mock_bridge.screenshot.assert_awaited_once_with(100, full_page=True, selector=None, selector_timeout_ms=5000)
 
 
 class TestAdvancedTools:
