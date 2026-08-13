@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
@@ -68,6 +69,7 @@ def test_merge_stderr(job_tools):
     assert "stderr1" in result["data"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is POSIX-only; Windows has no equivalent exit code")
 def test_signal_term(job_tools):
     started = job_tools["start"](command="sleep 30")
     job_id = started["job_id"]

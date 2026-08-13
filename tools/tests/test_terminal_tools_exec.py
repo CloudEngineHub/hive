@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
@@ -46,6 +47,7 @@ def test_shell_kind_reported(exec_tool):
     assert piped["shell_kind"] in ("bash", "powershell", "cmd")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_grep_no_matches_is_ok_not_error(exec_tool, tmp_path):
     f = tmp_path / "haystack.txt"
     f.write_text("apples\nbananas\n")
@@ -55,6 +57,7 @@ def test_grep_no_matches_is_ok_not_error(exec_tool, tmp_path):
     assert "No matches found" in (result["semantic_message"] or "")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_diff_files_differ_is_ok_not_error(exec_tool, tmp_path):
     a = tmp_path / "a.txt"
     a.write_text("hi\n")
@@ -86,6 +89,7 @@ def test_destructive_warning_drop_table(exec_tool):
 # ── session_cwd injection (loose-optimistic default cwd) ──────────────────────
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_session_cwd_used_when_cwd_omitted(exec_tool, tmp_path):
     """Omitting cwd runs the command in the framework-injected session workdir."""
     import os
@@ -95,6 +99,7 @@ def test_session_cwd_used_when_cwd_omitted(exec_tool, tmp_path):
     assert os.path.realpath(result["stdout"].strip()) == os.path.realpath(str(tmp_path))
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_explicit_cwd_overrides_session_cwd(exec_tool, tmp_path):
     """An explicit cwd always wins over session_cwd — it's a default, not a jail."""
     import os
@@ -106,6 +111,7 @@ def test_explicit_cwd_overrides_session_cwd(exec_tool, tmp_path):
     assert os.path.realpath(result["stdout"].strip()) == os.path.realpath(str(sub))
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_no_cwd_no_session_cwd_uses_server_cwd(exec_tool):
     """With neither cwd nor session_cwd, behavior is unchanged (server cwd)."""
     import os
@@ -184,6 +190,7 @@ def test_timed_out_marker(exec_tool):
     assert result["timed_out"] is True
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Asserts POSIX shell semantics (exit codes, pwd path form, globbing) that differ on Windows")
 def test_auto_shell_for_pipelines(exec_tool):
     """Regression for the queen_technology session 152038 silent-mangling bug.
 

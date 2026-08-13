@@ -10,6 +10,8 @@ read-only process inspection untouched.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from terminal_tools.common.command_guard import check_command
@@ -134,6 +136,7 @@ def test_terminal_job_start_blocks(job_start_tool):
     assert "job_id" not in result
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY tools are POSIX-only (not supported on Windows)")
 def test_terminal_pty_run_blocks_both_modes(pty_tools):
     open_fn = pty_tools["terminal_pty_open"].fn
     run_fn = pty_tools["terminal_pty_run"].fn
