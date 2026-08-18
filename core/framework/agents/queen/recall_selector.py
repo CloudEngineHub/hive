@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from framework.config import get_aux_max_tokens
 from framework.agents.queen.queen_memory_v2 import (
     format_memory_manifest,
     global_memory_dir as _default_global_memory_dir,
@@ -86,9 +87,7 @@ async def select_memories(
         resp = await llm.acomplete(
             messages=[{"role": "user", "content": user_msg}],
             system=SELECT_MEMORIES_SYSTEM_PROMPT,
-            # Reasoning models spend budget thinking before the JSON appears;
-            # 1024 starved deepseek-v4-flash into empty responses every call.
-            max_tokens=8192,
+            max_tokens=get_aux_max_tokens(),
             response_format={"type": "json_object"},
         )
         raw = (resp.content or "").strip()

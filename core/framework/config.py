@@ -523,8 +523,12 @@ def get_worker_max_tokens() -> int:
     return get_max_tokens()
 
 
-def get_worker_max_context_tokens() -> int:
-    """Return max_context_tokens for the worker LLM, falling back to default."""
+def get_worker_max_context_tokens(fallback: int | None = None) -> int:
+    """Return max_context_tokens for the worker LLM, falling back to default.
+
+    ``fallback`` (when given) replaces the terminal default, letting a call
+    site keep its legacy literal while honoring config/catalog first.
+    """
     worker_llm = get_hive_config().get("worker_llm", {})
     if worker_llm and "max_context_tokens" in worker_llm:
         return worker_llm["max_context_tokens"]
@@ -532,6 +536,8 @@ def get_worker_max_context_tokens() -> int:
         catalog = _catalog_limits_for(worker_llm)
         if catalog is not None:
             return catalog[1]
+    if fallback is not None:
+        return get_max_context_tokens(fallback=fallback)
     return get_max_context_tokens()
 
 
@@ -547,16 +553,44 @@ def get_max_tokens() -> int:
     return DEFAULT_MAX_TOKENS
 
 
-def get_max_context_tokens() -> int:
+def get_max_context_tokens(fallback: int = DEFAULT_MAX_CONTEXT_TOKENS) -> int:
     """Return the configured max_context_tokens, falling back to the model's
-    catalog entry, then DEFAULT_MAX_CONTEXT_TOKENS."""
+    catalog entry, then ``fallback``.
+
+    ``fallback`` lets a call site keep its legacy terminal default (e.g. the
+    queen loop's 180k) while still honoring an explicit config key or the
+    model catalog's real window.
+    """
     llm = get_hive_config().get("llm", {})
     if "max_context_tokens" in llm:
         return llm["max_context_tokens"]
     catalog = _catalog_limits_for(llm)
     if catalog is not None:
         return catalog[1]
-    return DEFAULT_MAX_CONTEXT_TOKENS
+    return fallback
+
+
+def get_aux_max_tokens() -> int:
+    """Output budget for small utility LLM calls (``llm.aux_max_tokens``).
+
+    Covers memory-recall selection, queen routing, sentinel/edge classifiers,
+    evaluators, and skill-test invocations. One shared knob instead of
+    per-site literals: thinking models spend the budget on hidden reasoning
+    before any visible output, so the historic tiny caps (150-2048) silently
+    starved these calls into empty responses.
+    """
+    llm = get_hive_config().get("llm", {})
+    if "aux_max_tokens" in llm:
+        return llm["aux_max_tokens"]
+    return DEFAULT_MAX_TOKENS
+
+
+def get_max_tool_result_chars() -> int:
+    """Spillover threshold for tool results (``loop.max_tool_result_chars``)."""
+    loop = get_hive_config().get("loop", {})
+    if "max_tool_result_chars" in loop:
+        return loop["max_tool_result_chars"]
+    return 30_000
 
 
 def get_api_keys() -> list[str] | None:

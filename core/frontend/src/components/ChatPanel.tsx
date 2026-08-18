@@ -1361,7 +1361,7 @@ export function ReasoningRow({ content }: { content: string }) {
         className="flex items-center gap-1.5 text-muted-foreground/70 hover:text-muted-foreground transition-colors"
       >
         <Brain className="w-3.5 h-3.5 shrink-0" />
-        <span className="italic">{open ? "思考过程" : preview}</span>
+        <span className="italic">{open ? "Thinking" : preview}</span>
         <ChevronRight
           className={`w-3 h-3 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
         />

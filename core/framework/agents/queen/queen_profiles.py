@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from framework.config import QUEENS_DIR
+from framework.config import QUEENS_DIR, get_aux_max_tokens
 
 if TYPE_CHECKING:
     from framework.llm.provider import LLMProvider
@@ -602,7 +602,7 @@ async def select_queen_with_reason(user_message: str, llm: LLMProvider) -> Queen
         response = await llm.acomplete(
             messages=[{"role": "user", "content": user_message}],
             system=_queen_selector_system_prompt(list(DEFAULT_QUEENS)),
-            max_tokens=2048,
+            max_tokens=get_aux_max_tokens(),
             json_mode=True,
         )
     except Exception as exc:
@@ -738,7 +738,7 @@ async def select_queen_and_colony(
         response = await llm.acomplete(
             messages=[{"role": "user", "content": user_message}],
             system=_colony_selector_system_prompt(allowed_ids),
-            max_tokens=2048,
+            max_tokens=get_aux_max_tokens(),
             json_mode=True,
         )
     except Exception as exc:

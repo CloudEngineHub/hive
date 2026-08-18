@@ -1752,12 +1752,20 @@ async def create_queen(
 
             _iter_cap = _os.environ.get("HIVE_MAX_ITER")
             _default_max_iter = int(_iter_cap) if (_iter_cap and _iter_cap.isdigit()) else 999_999
+            from framework.config import (
+                get_max_context_tokens as _get_max_ctx,
+                get_max_tool_result_chars as _get_max_trc,
+            )
+
             queen_loop_config = LoopConfig(
                 max_iterations=lc.get("max_iterations", _default_max_iter),
                 tool_call_budget=lc.get("tool_call_budget", 30),
                 tool_call_hard_multiple=lc.get("tool_call_hard_multiple", 5),
-                max_context_tokens=lc.get("max_context_tokens", 180_000),
-                max_tool_result_chars=lc.get("max_tool_result_chars", 30_000),
+                # Config/catalog first (llm.max_context_tokens, model window),
+                # then the queen profile's legacy literal — a 32k local model
+                # must not run with a 180k compaction budget.
+                max_context_tokens=_get_max_ctx(fallback=lc.get("max_context_tokens", 180_000)),
+                max_tool_result_chars=_get_max_trc(),
                 spillover_dir=str(queen_dir / "data"),
                 hooks=lc.get("hooks", {}),
             )

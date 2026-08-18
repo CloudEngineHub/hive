@@ -99,7 +99,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         system: str = "",
         tools: list[Tool] | None = None,
-        max_tokens: int = 1024,
+        max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
         max_retries: int | None = None,
@@ -111,7 +111,9 @@ class LLMProvider(ABC):
             messages: Conversation history [{role: "user"|"assistant", content: str}]
             system: System prompt
             tools: Available tools for the LLM to use
-            max_tokens: Maximum tokens to generate
+            max_tokens: Maximum tokens to generate. ``None`` resolves to the
+                configured default (``llm.aux_max_tokens`` for completions,
+                ``llm.max_tokens`` for streams) in the concrete provider.
             response_format: Optional structured output format. Use:
                 - {"type": "json_object"} for basic JSON mode
                 - {"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}
@@ -130,7 +132,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         system: str = "",
         tools: list["Tool"] | None = None,
-        max_tokens: int = 1024,
+        max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
         max_retries: int | None = None,
@@ -169,7 +171,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         system: str = "",
         tools: list[Tool] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator["StreamEvent"]:
         """

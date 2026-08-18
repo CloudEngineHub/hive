@@ -37,7 +37,7 @@ from framework.agents.queen.queen_memory_v2 import (
     parse_frontmatter,
     scan_memory_files,
 )
-from framework.config import get_hive_config
+from framework.config import get_aux_max_tokens, get_hive_config
 from framework.llm.provider import LLMResponse, Tool
 from framework.tracker.llm_debug_logger import log_llm_turn
 
@@ -363,7 +363,7 @@ async def _reflection_loop(
                 # response, reflection lost). Floor keeps small configs sane.
                 max_tokens=max(
                     int(get_hive_config().get("llm", {}).get("max_tokens") or 0),
-                    4096,
+                    get_aux_max_tokens(),
                 ),
             )
         except asyncio.CancelledError:

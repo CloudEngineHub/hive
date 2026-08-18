@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from framework.config import (
+    get_aux_max_tokens,
     get_hive_config,
     get_vision_fallback_api_base,
     get_vision_fallback_api_key,
@@ -325,7 +326,10 @@ async def caption_tool_image(
     kwargs: dict[str, Any] = {
         "model": rewritten_model,
         "messages": messages,
-        "max_tokens": 8192,
+        "max_tokens": int(
+            get_hive_config().get("vision_fallback", {}).get("max_tokens")
+            or get_aux_max_tokens()
+        ),
         "timeout": timeout_s,
     }
     # Always pass api_key when we have one, even alongside proxy-rewritten

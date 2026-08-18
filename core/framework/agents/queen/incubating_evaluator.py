@@ -27,6 +27,7 @@ import re
 from typing import Any
 
 from framework.agent_loop.conversation import Message
+from framework.config import get_aux_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ async def evaluate(
         response = await llm.acomplete(
             messages=[{"role": "user", "content": user_msg}],
             system=_INCUBATING_EVALUATOR_SYSTEM_PROMPT,
-            max_tokens=1024,
+            max_tokens=get_aux_max_tokens(),
             response_format={"type": "json_object"},
         )
     except Exception as exc:  # noqa: BLE001 - fail-closed on any LLM failure
