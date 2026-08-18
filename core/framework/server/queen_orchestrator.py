@@ -1726,15 +1726,21 @@ async def create_queen(
             # Acting identity for the CRM: `dm:queen` in a DM session,
             # `colony:<name>:queen` once bound. The backend's capability model
             # keys off this — an unnamed caller resolves to the human and
-            # inherits the user's own permissions.
-            from framework.crm.principal import for_agent as _principal_for
+            # inherits the user's own permissions. The CRM package is optional —
+            # its absence or failure must NOT abort execution-context stamping,
+            # which session tools depend on (without session_id on the
+            # contextvar, task_create and friends can't resolve their store).
+            try:
+                from framework.crm.principal import for_agent as _principal_for
 
-            principal = _principal_for(queen_agent_id, binding.name if binding is not None else None)
-            if principal:
-                exec_ctx_fields["principal"] = principal
+                principal = _principal_for(queen_agent_id, binding.name if binding is not None else None)
+                if principal:
+                    exec_ctx_fields["principal"] = principal
+            except Exception:
+                logger.debug("Queen: CRM principal lookup unavailable", exc_info=True)
             ToolRegistry.set_execution_context(**exec_ctx_fields)
         except Exception:
-            logger.debug("Queen: failed to set execution context for session %s", session.id, exc_info=True)
+            logger.warning("Queen: failed to set execution context for session %s", session.id, exc_info=True)
         try:
             lc = _queen_loop_config
             # Bridge/roleplay: a queen is an unbounded autonomous task loop

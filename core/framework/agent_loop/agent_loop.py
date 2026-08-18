@@ -6451,7 +6451,7 @@ class AgentLoop(AgentProtocol):
             return preflight
 
         if tc.tool_name in (getattr(self._config, "background_tools", None) or set()):
-            return self._start_background_tool(tc)
+            return await self._start_background_tool(tc)
 
         return await self._execute_tool_inner(tc, self._resolve_tool_timeout(tc.tool_name))
 
@@ -6493,13 +6493,20 @@ class AgentLoop(AgentProtocol):
                 result = _attach_file_publish_failure(result, f"unexpected error: {exc}")
         return result
 
-    def _start_background_tool(self, tc: ToolCallEvent) -> ToolResult:
-        """Start a background tool's real call as a detached task and return a
-        handle. The agent collects the outcome later via ``collect_result``."""
-        self._bg_counter += 1
-        handle = f"bg_{self._bg_counter}"
+    async def _start_background_tool(self, tc: ToolCallEvent) -> ToolResult:
+        """Run a background tool's real call, returning a handle only if it's slow.
+
+        Backgrounding is not free: the handle costs the agent a whole extra
+        model turn to spend on ``collect_result``, and that turn is inference
+        latency, not tool time. So we wait ``background_tool_grace_seconds``
+        first: work that lands inside the window returns its real result on
+        the original call and never mints a handle; only genuinely slow work
+        (image generation, a long command) pays for the deferred path.
+        (Ported from the desktop runtime's async-job logic — without it,
+        terminal_exec ran foreground and slammed into the shared 60s tool
+        timeout, resetting the MCP connection.)
+        """
         timeout = float(getattr(self._config, "background_tool_timeout_seconds", 235.0))
-        task = asyncio.create_task(self._execute_tool_inner(tc, timeout))
 
         def _retrieve(t: asyncio.Task) -> None:
             # Retrieve any exception so a never-collected task doesn't log
@@ -6508,12 +6515,40 @@ class AgentLoop(AgentProtocol):
             if not t.cancelled():
                 t.exception()
 
+        # Register BEFORE the grace await, not after. CancelledError derives
+        # from BaseException, so a user stop landing inside the grace window
+        # propagates straight out of this coroutine — and anything not yet in
+        # ``_background_calls`` at that moment is a live subprocess nobody can
+        # reach or collect. Claiming the handle up front costs only a gap in
+        # handle numbering on the fast path, which the agent never sees.
+        self._bg_counter += 1
+        handle = f"bg_{self._bg_counter}"
+        task = asyncio.create_task(self._execute_tool_inner(tc, timeout))
         task.add_done_callback(_retrieve)
         self._background_calls[handle] = {
             "task": task,
             "tool": tc.tool_name,
             "started": time.time(),
         }
+
+        grace = float(getattr(self._config, "background_tool_grace_seconds", 5.0))
+        if grace > 0:
+            try:
+                # shield: a grace-window timeout must not cancel the in-flight
+                # work — it still has the full `timeout` budget to finish in.
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+            except asyncio.TimeoutError:
+                pass  # genuinely slow — fall through and hand back the handle
+            except Exception:
+                # Failed fast. Let collect_result surface it rather than
+                # duplicating the error shaping here.
+                pass
+            else:
+                # Beat the window: hand back the real result and retire the
+                # handle, since there is nothing left to collect.
+                self._background_calls.pop(handle, None)
+                return result
+
         logger.info("[AgentLoop] backgrounded tool '%s' as %s", tc.tool_name, handle)
         payload = {
             "status": "started",
