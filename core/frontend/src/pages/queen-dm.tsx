@@ -1809,6 +1809,15 @@ export default function QueenDM() {
           break;
         }
 
+        case "llm_reasoning_delta":
+        case "client_reasoning": {
+          // Live thinking bubble — the point is feedback DURING the silent
+          // reasoning phase, so these must upsert live, not only on replay.
+          for (const msg of emittedMessages) upsertMessage(msg);
+          setIsStreaming(true);
+          break;
+        }
+
         case "node_loop_started":
         case "node_loop_iteration":
           // Loop entered / iterated — queen is doing work. Some

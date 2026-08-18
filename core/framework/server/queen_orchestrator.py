@@ -1765,7 +1765,7 @@ async def create_queen(
                 # then the queen profile's legacy literal — a 32k local model
                 # must not run with a 180k compaction budget.
                 max_context_tokens=_get_max_ctx(fallback=lc.get("max_context_tokens", 180_000)),
-                max_tool_result_chars=_get_max_trc(),
+                max_tool_result_chars=_get_max_trc(fallback=lc.get("max_tool_result_chars", 30_000)),
                 spillover_dir=str(queen_dir / "data"),
                 hooks=lc.get("hooks", {}),
             )

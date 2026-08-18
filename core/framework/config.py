@@ -527,7 +527,10 @@ def get_worker_max_context_tokens(fallback: int | None = None) -> int:
     """Return max_context_tokens for the worker LLM, falling back to default.
 
     ``fallback`` (when given) replaces the terminal default, letting a call
-    site keep its legacy literal while honoring config/catalog first.
+    site keep its legacy literal while honoring explicit config first. In
+    fallback mode the QUEEN model's catalog window is deliberately NOT
+    consulted: a worker on an uncataloged local model must not inherit e.g.
+    an 872k opus window and never compact before its real 32k limit.
     """
     worker_llm = get_hive_config().get("worker_llm", {})
     if worker_llm and "max_context_tokens" in worker_llm:
@@ -537,7 +540,10 @@ def get_worker_max_context_tokens(fallback: int | None = None) -> int:
         if catalog is not None:
             return catalog[1]
     if fallback is not None:
-        return get_max_context_tokens(fallback=fallback)
+        llm = get_hive_config().get("llm", {})
+        if "max_context_tokens" in llm:
+            return llm["max_context_tokens"]
+        return fallback
     return get_max_context_tokens()
 
 
@@ -582,15 +588,22 @@ def get_aux_max_tokens() -> int:
     llm = get_hive_config().get("llm", {})
     if "aux_max_tokens" in llm:
         return llm["aux_max_tokens"]
-    return DEFAULT_MAX_TOKENS
+    # Clamp to the main model's output cap: strict local servers (vLLM,
+    # llama.cpp) reject requests whose prompt + max_tokens exceed the model
+    # window, so a small configured llm.max_tokens must bound aux calls too.
+    return min(DEFAULT_MAX_TOKENS, get_max_tokens())
 
 
-def get_max_tool_result_chars() -> int:
-    """Spillover threshold for tool results (``loop.max_tool_result_chars``)."""
+def get_max_tool_result_chars(fallback: int = 30_000) -> int:
+    """Spillover threshold for tool results (``loop.max_tool_result_chars``).
+
+    ``fallback`` lets a call site keep a profile-supplied legacy value when
+    the config key is unset.
+    """
     loop = get_hive_config().get("loop", {})
     if "max_tool_result_chars" in loop:
         return loop["max_tool_result_chars"]
-    return 30_000
+    return fallback
 
 
 def get_api_keys() -> list[str] | None:

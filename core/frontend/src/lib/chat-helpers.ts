@@ -489,6 +489,11 @@ export interface ReplayState {
    * the message wholesale, so ordering needs the bubble's original time,
    * not the latest snapshot's. */
   reasoningStartedAt: Record<string, number>;
+  /** Bubble ids whose final client_reasoning block has been applied. A
+   * coalesced llm_reasoning_delta can be flushed to disk AFTER the final
+   * block (tool-only turns flush at llm_turn_complete); its stale
+   * tail-capped snapshot must not overwrite the full text on replay. */
+  reasoningFinal: Set<string>;
 }
 
 export function newReplayState(): ReplayState {
@@ -506,6 +511,7 @@ export function newReplayState(): ReplayState {
     snapshotSeq: 0,
     snapshotAt: 0,
     reasoningStartedAt: {},
+    reasoningFinal: new Set<string>(),
   };
 }
 
@@ -810,6 +816,11 @@ export function replayEvent(
           : (event.data?.snapshot as string) || (event.data?.content as string) || "";
       if (!rText.trim()) break;
       const rMsgId = `reason-${streamId}-${event.execution_id || "exec"}-${rIter}-t${rInner}`;
+      if (event.type === "client_reasoning") {
+        state.reasoningFinal.add(rMsgId);
+      } else if (state.reasoningFinal.has(rMsgId)) {
+        break; // stale rolling snapshot arriving after the final block
+      }
       const rStartedAt = state.reasoningStartedAt[rMsgId] ?? eventCreatedAt;
       state.reasoningStartedAt[rMsgId] = rStartedAt;
       out.push({

@@ -604,18 +604,41 @@ class EventBus:
             # pill would visually attach to the prior message instead of
             # the queen's response. Stamping the first timestamp keeps
             # cold-replay ordering consistent with the live stream.
+            # event.type is part of the key: reasoning deltas and text deltas
+            # share iteration/inner_turn but must coalesce into SEPARATE
+            # slots — merged, the prose snapshot inherits the reasoning
+            # stream's start timestamp (breaking cold-replay ordering) or is
+            # outright overwritten by a late reasoning delta.
             key = (
                 event.stream_id,
                 event.node_id,
                 event.execution_id,
                 event.data.get("iteration"),
                 event.data.get("inner_turn", 0),
+                event.type,
             )
             existing = self._pending_output_snapshots.get(key)
             if existing is not None:
                 event = replace(event, timestamp=existing.timestamp)
             self._pending_output_snapshots[key] = event
             return
+
+        # The consolidated reasoning block supersedes the tail-capped rolling
+        # snapshot for the same turn: drop the pending delta slot so a
+        # tool-only turn doesn't flush a stale subset AFTER the full block
+        # (disk replay applies events in order — last write would win).
+        if event.type == EventType.CLIENT_REASONING:
+            self._pending_output_snapshots.pop(
+                (
+                    event.stream_id,
+                    event.node_id,
+                    event.execution_id,
+                    event.data.get("iteration"),
+                    event.data.get("inner_turn", 0),
+                    EventType.LLM_REASONING_DELTA,
+                ),
+                None,
+            )
 
         # On turn-complete, flush accumulated snapshots for this stream first
         if event.type == EventType.LLM_TURN_COMPLETE:
@@ -651,7 +674,7 @@ class EventBus:
         to_flush: list[tuple] = []
         for key, _evt in self._pending_output_snapshots.items():
             if stream_id is not None:
-                k_stream, k_node, k_exec, _, _ = key
+                k_stream, k_node, k_exec, _, _, _ = key
                 if k_stream != stream_id or k_node != node_id or k_exec != execution_id:
                     continue
             to_flush.append(key)

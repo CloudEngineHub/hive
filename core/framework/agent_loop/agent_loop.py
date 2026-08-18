@@ -2026,9 +2026,15 @@ class AgentLoop(AgentProtocol):
             )
             # Sync max_context_tokens from live config so mid-session model
             # switches are reflected in compaction decisions and the UI bar.
+            # Fallback = this loop's own budget, NOT the global 32k default:
+            # when config/catalog don't resolve (local/proxy models), the
+            # compaction trigger must agree with the LoopConfig-driven
+            # prune/summary budgets instead of collapsing to 32k under them.
             from framework.config import get_max_context_tokens as _live_mct
 
-            conversation._max_context_tokens = _live_mct()
+            conversation._max_context_tokens = _live_mct(
+                fallback=self._config.max_context_tokens
+            )
 
             await self._publish_context_usage(ctx, conversation, "iteration_start", tools=tools)
 
@@ -6738,10 +6744,18 @@ class AgentLoop(AgentProtocol):
 
     # --- Compaction -----------------------------------------------------------
 
-    # Max chars of formatted messages before proactively splitting for LLM.
-    _LLM_COMPACT_CHAR_LIMIT = 240_000
+    # Optional override for the window-derived split threshold (tests
+    # shrink it); None -> llm_compact_char_limit(max_context_tokens).
+    _LLM_COMPACT_CHAR_LIMIT: int | None = None
     # Max recursion depth for binary-search splitting.
     _LLM_COMPACT_MAX_DEPTH = 10
+
+    def _compact_char_limit(self) -> int:
+        if self._LLM_COMPACT_CHAR_LIMIT is not None:
+            return self._LLM_COMPACT_CHAR_LIMIT
+        from framework.agent_loop.internals.compaction import llm_compact_char_limit
+
+        return llm_compact_char_limit(self._config.max_context_tokens)
 
     async def _compact(
         self,
@@ -6767,7 +6781,7 @@ class AgentLoop(AgentProtocol):
             accumulator=accumulator,
             config=self._config,
             event_bus=self._event_bus,
-            char_limit=self._LLM_COMPACT_CHAR_LIMIT,
+            char_limit=self._compact_char_limit(),
             max_depth=self._LLM_COMPACT_MAX_DEPTH,
         )
         # After compaction: re-announce surfaces the model can't see unless
@@ -6788,7 +6802,7 @@ class AgentLoop(AgentProtocol):
     ) -> str:
         """Summarise *messages* with LLM, splitting recursively if too large.
 
-        If the formatted text exceeds ``_LLM_COMPACT_CHAR_LIMIT`` or the LLM
+        If the formatted text exceeds the window-derived char limit or the LLM
         rejects the call with a context-length error, the messages are split
         in half and each half is summarised independently.  Tool history is
         appended once at the top-level call (``_depth == 0``).
@@ -6798,7 +6812,7 @@ class AgentLoop(AgentProtocol):
             messages=messages,
             accumulator=accumulator,
             _depth=_depth,
-            char_limit=self._LLM_COMPACT_CHAR_LIMIT,
+            char_limit=self._compact_char_limit(),
             max_depth=self._LLM_COMPACT_MAX_DEPTH,
             max_context_tokens=self._config.max_context_tokens,
         )

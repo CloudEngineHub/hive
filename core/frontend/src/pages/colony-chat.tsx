@@ -1114,6 +1114,9 @@ export default function ColonyChat() {
         case "client_output_delta":
         case "client_input_received":
         case "client_input_requested":
+        // Live thinking bubble — must upsert live, not only on disk replay.
+        case "llm_reasoning_delta":
+        case "client_reasoning":
         case "llm_text_delta": {
           // Defer the queen's ask_user bubble so it doesn't render alongside
           // the popup widget. Stash on request, commit on receive — see
@@ -1154,7 +1157,10 @@ export default function ColonyChat() {
 
           if (
             isQueen &&
-            (event.type === "llm_text_delta" || event.type === "client_output_delta")
+            (event.type === "llm_text_delta" ||
+              event.type === "client_output_delta" ||
+              event.type === "llm_reasoning_delta" ||
+              event.type === "client_reasoning")
           ) {
             // isStreaming narrow contract (matches queen-dm): true while the
             // QUEEN is emitting text tokens. Gated on isQueen because workers

@@ -193,6 +193,13 @@ class LLMProvider(ABC):
             TextEndEvent,
         )
 
+        # Resolve here, not in acomplete: a stream's None contract is the
+        # MAIN budget (llm.max_tokens), while acomplete's is the aux budget.
+        if max_tokens is None:
+            from framework.config import get_max_tokens
+
+            max_tokens = get_max_tokens()
+
         response = await self.acomplete(
             messages=messages,
             system=system,
