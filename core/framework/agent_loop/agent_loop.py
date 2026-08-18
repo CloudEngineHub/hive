@@ -324,31 +324,16 @@ async def _captioning_chain(
     intent: str,
     image_content: list[dict[str, Any]],
 ) -> tuple[str, str] | None:
-    """Configured vision_fallback → ``gemini/gemini-3-flash-preview``.
+    """The configured ``vision_fallback`` — and nothing else.
 
-    The Gemini override reuses the configured ``api_key`` / ``api_base``,
-    so a Hive subscriber (whose token routes to a multi-model proxy)
-    keeps coverage when their primary model glitches. Without
-    configured creds litellm falls through to env-based Gemini auth;
-    users with neither Hive nor a ``GEMINI_API_KEY`` simply lose the
-    second try.
+    There used to be a hardcoded ``gemini-3-flash-preview`` retry here
+    that reused the configured endpoint's base/auth. Against any custom
+    endpoint that base is wrong for Gemini, so the retry could only fail
+    confusingly — and its noise masked the real error from the
+    configured attempt. The configured slot is the single source of
+    truth: it works, or the images are dropped with an honest log line.
     """
-    if result := await caption_tool_image(intent, image_content):
-        return result
-    # Match the configured model's proxy prefix so the override is routed
-    # through the same endpoint with the same auth shape. Without this,
-    # a Hive subscriber's `hive/...` config would override to
-    # `gemini/...` — which sends Google's Gemini protocol to the
-    # Anthropic-compatible Hive proxy (404), not what we want.
-    configured = (get_vision_fallback_model() or "").lower()
-    if configured.startswith("hive/"):
-        override = "hive/gemini-3-flash-preview"
-    elif configured.startswith("kimi/"):
-        override = "kimi/gemini-3-flash-preview"
-    else:
-        override = "gemini/gemini-3-flash-preview"
-    logger.warning("vision_fallback failed; trying %s", override)
-    return await caption_tool_image(intent, image_content, model_override=override)
+    return await caption_tool_image(intent, image_content)
 
 
 # Pattern for detecting context-window-exceeded errors across LLM providers.

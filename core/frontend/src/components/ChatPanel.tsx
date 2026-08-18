@@ -1,4 +1,4 @@
-import { memo, useState, useRef, useEffect, useLayoutEffect, useMemo } from "react";
+import { memo, useCallback, useState, useRef, useEffect, useLayoutEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { apiUrl } from "@/api/client";
@@ -366,6 +366,10 @@ const UPLOAD_LIMITS = {
   csvMaxBytes: 100 * MB,
   textMaxBytes: 100 * MB,
   imageMaxBytes: 10 * MB,
+  // Any other type (docx, xlsx, archives, ...) uploads as-is; the runtime
+  // saves it to the session's attachments dir and tells the agent to read
+  // it with terminal tools — nothing is inlined, so context cost is nil.
+  fileMaxBytes: 100 * MB,
   maxAttachments: 5,
   // Combined cap must clear a single max-size attachment (PDF or CSV);
   // otherwise the per-file check passes and the batch-total check rejects
@@ -730,7 +734,7 @@ function GeneratedImageCard({
   );
 }
 
-type AttachmentKind = "pdf" | "csv" | "text" | "image" | "unsupported";
+type AttachmentKind = "pdf" | "csv" | "text" | "image" | "file";
 
 function classifyAttachment(file: File): AttachmentKind {
   const name = file.name.toLowerCase();
@@ -740,7 +744,10 @@ function classifyAttachment(file: File): AttachmentKind {
   // data-URI image path — the runtime's text allowlist excludes it too.
   if (file.type.startsWith("image/")) return "image";
   if (TEXT_FILE_EXT_RE.test(name)) return "text";
-  return "unsupported";
+  // Everything else (docx, xlsx, archives, ...) uploads as a generic file:
+  // saved to the session's attachments dir, referenced by path, read by
+  // the agent with terminal tools. No type is rejected.
+  return "file";
 }
 
 /** Returns null if the file is acceptable, or a human-readable error string. */
@@ -754,10 +761,7 @@ function checkAttachmentSize(file: File, kind: AttachmentKind): string | null {
           ? UPLOAD_LIMITS.textMaxBytes
           : kind === "image"
             ? UPLOAD_LIMITS.imageMaxBytes
-            : 0;
-  if (kind === "unsupported") {
-    return `${file.name}: unsupported file type (PDF, CSV, image, or text file only).`;
-  }
+            : UPLOAD_LIMITS.fileMaxBytes;
   if (file.size > cap) {
     return `${file.name} is ${formatBytes(file.size)} — ${kind.toUpperCase()} limit is ${formatBytes(cap)}.`;
   }
@@ -791,6 +795,11 @@ export interface ChatMessage {
   agentColor: string;
   content: string;
   timestamp: string;
+  /** Attachment URLs in this message resolve against THIS session id
+   * (set on messages restored from a predecessor session after a
+   * cold-resume — their files live under the old id's directory, and
+   * resolving against the live session id 404s → invisible images). */
+  attachmentSessionId?: string;
   type?:
     | "system"
     | "agent"
@@ -2116,8 +2125,8 @@ const MessageBubble = memo(
                       url={img.image_url.url}
                       fileName={img._fileName}
                       credits={img._credits}
-                      sessionId={feedbackSessionId ?? undefined}
-                      onClick={() => onImageClick?.(msg.images!, i, feedbackSessionId ?? undefined)}
+                      sessionId={msg.attachmentSessionId ?? feedbackSessionId ?? undefined}
+                      onClick={() => onImageClick?.(msg.images!, i, msg.attachmentSessionId ?? feedbackSessionId ?? undefined)}
                     />
                   ) : (
                     <AttachmentChip
@@ -2127,8 +2136,8 @@ const MessageBubble = memo(
                       byteSize={img._byteSize}
                       credits={img._credits}
                       variant="history"
-                      sessionId={feedbackSessionId ?? undefined}
-                      onClick={() => onImageClick?.(msg.images!, i, feedbackSessionId ?? undefined)}
+                      sessionId={msg.attachmentSessionId ?? feedbackSessionId ?? undefined}
+                      onClick={() => onImageClick?.(msg.images!, i, msg.attachmentSessionId ?? feedbackSessionId ?? undefined)}
                     />
                   )
                 ))}
@@ -2300,8 +2309,8 @@ const MessageBubble = memo(
                       url={img.image_url.url}
                       fileName={img._fileName}
                       credits={img._credits}
-                      sessionId={feedbackSessionId ?? undefined}
-                      onClick={() => onImageClick?.(msg.images!, i, feedbackSessionId ?? undefined)}
+                      sessionId={msg.attachmentSessionId ?? feedbackSessionId ?? undefined}
+                      onClick={() => onImageClick?.(msg.images!, i, msg.attachmentSessionId ?? feedbackSessionId ?? undefined)}
                     />
                   ) : (
                     <AttachmentChip
@@ -2311,8 +2320,8 @@ const MessageBubble = memo(
                       byteSize={img._byteSize}
                       credits={img._credits}
                       variant="history"
-                      sessionId={feedbackSessionId ?? undefined}
-                      onClick={() => onImageClick?.(msg.images!, i, feedbackSessionId ?? undefined)}
+                      sessionId={msg.attachmentSessionId ?? feedbackSessionId ?? undefined}
+                      onClick={() => onImageClick?.(msg.images!, i, msg.attachmentSessionId ?? feedbackSessionId ?? undefined)}
                     />
                   )
                 ))}
@@ -2484,6 +2493,30 @@ export default function ChatPanel({
   // refs against the session the attachment actually lives in — for history
   // timeline messages that's a *previous* session, not the active one.
   const [lightbox, setLightbox] = useState<{ images: ImageContent[]; index: number; sessionId?: string } | null>(null);
+
+  // Stable handlers for MessageBubble — it is memo()ized, and fresh inline
+  // closures on every render defeated that: every SSE delta re-rendered
+  // every bubble on long transcripts, which is also what starved
+  // react-router's low-priority navigation transitions (the "click Home,
+  // page revives but never navigates" failure).
+  const handleBubbleImageClick = useCallback(
+    (images: ImageContent[], index: number, sessionId?: string) =>
+      setLightbox({ images, index, sessionId }),
+    [],
+  );
+  const handleBubbleRetry = useCallback(
+    (text: string) => {
+      if (onSend) {
+        onSend(text, activeThread);
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+      }
+    },
+    [onSend, activeThread],
+  );
+  const handleBubbleEdit = useCallback((text: string) => {
+    setInput(text);
+    setTimeout(() => editorRef.current?.focus(), 0);
+  }, []);
   const [readMap, setReadMap] = useState<Record<string, number>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
   const bottomSpacerRef = useRef<HTMLDivElement>(null);
@@ -3668,7 +3701,7 @@ export default function ChatPanel({
         continue;
       }
 
-      if (kind === "pdf" || kind === "csv" || kind === "text") {
+      if (kind === "pdf" || kind === "csv" || kind === "text" || kind === "file") {
         // Read bytes eagerly — on macOS the security-scoped file access
         // granted during the picker can expire before the user submits.
         const bytes = await file.arrayBuffer();
@@ -4073,7 +4106,7 @@ export default function ChatPanel({
                   queenProfileId={queenProfileId}
                   queenAvatarUrl={queenAvatarUrl}
                   queenPortrait={queenPortrait}
-                  onImageClick={(imgs, idx, sid) => setLightbox({ images: imgs, index: idx, sessionId: sid })}
+                  onImageClick={handleBubbleImageClick}
                 />
               </div>
             );
@@ -4103,22 +4136,14 @@ export default function ChatPanel({
                 queenAvatarUrl={queenAvatarUrl}
                 queenPortrait={queenPortrait}
                 onColonyLinkClick={onColonyLinkClick}
-                onImageClick={(imgs, idx, sid) => setLightbox({ images: imgs, index: idx, sessionId: sid })}
+                onImageClick={handleBubbleImageClick}
                 onSteer={onSteer}
                 onCancelQueued={onCancelQueued}
                 isQueenBusy={isBusy && msg.id === lastQueenMessageId}
                 feedbackSessionId={sessionId}
                 initialVote={feedbackVotes[msg.id]}
-                onRetry={(text) => {
-                  if (onSend) {
-                    onSend(text, activeThread);
-                    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
-                  }
-                }}
-                onEdit={(text) => {
-                  setInput(text);
-                  setTimeout(() => editorRef.current?.focus(), 0);
-                }}
+                onRetry={handleBubbleRetry}
+                onEdit={handleBubbleEdit}
               />
             </div>
           );

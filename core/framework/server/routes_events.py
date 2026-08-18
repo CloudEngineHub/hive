@@ -248,6 +248,15 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
         "credentials_required",
         "worker_graph_loaded",
         "queen_phase_changed",
+        # Gate keys: these are the ONLY events that clear the frontend's
+        # isStreaming flag and flush its pending-message queue. Dropping
+        # one under backpressure used to leave the composer stuck forever
+        # (messages queued client-side, never posted, "fixed" only by a
+        # page refresh). A visible disconnect + snapshot resync on
+        # queue-full beats a silent dropped state transition.
+        "llm_turn_complete",
+        "loop_state_changed",
+        "tool_call_completed",
     }
 
     client_disconnected = asyncio.Event()

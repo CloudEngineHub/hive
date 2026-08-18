@@ -334,6 +334,8 @@ def get_vision_fallback_api_key() -> str | None:
     vision = get_hive_config().get("vision_fallback", {})
     if not vision:
         return get_api_key()
+    if vision.get("api_key"):
+        return vision["api_key"]
     api_key_env_var = vision.get("api_key_env_var")
     if api_key_env_var:
         return os.environ.get(api_key_env_var)
@@ -362,6 +364,11 @@ def get_worker_api_key() -> str | None:
     worker_llm = get_hive_config().get("worker_llm", {})
     if not worker_llm:
         return get_api_key()
+
+    # Literal key in the worker section (provider activation writes it).
+    literal = worker_llm.get("api_key")
+    if literal:
+        return literal
 
     # Worker-specific subscription / env var
     if worker_llm.get("use_claude_code_subscription"):
@@ -606,6 +613,15 @@ def get_api_key() -> str | None:
 
     llm = get_hive_config().get("llm", {})
     provider = llm.get("provider", "")
+
+    # Literal key in configuration.json (written by provider activation in
+    # the UI). A key that travels WITH the endpoint config beats every
+    # ambient source — the whole point of a provider entry is "this base,
+    # this model, this key", independent of launch-shell env state.
+    literal = llm.get("api_key")
+    if literal:
+        logger.debug("[hive-auth] get_api_key -> llm.api_key fp=%s", _fp(literal))
+        return literal
 
     # Claude Code subscription: read OAuth token directly
     if llm.get("use_claude_code_subscription"):

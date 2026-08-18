@@ -754,9 +754,41 @@ export function replayEvent(
     case "execution_started":
       state.turnCounters[turnKey] = currentTurn + 1;
       break;
-    case "llm_turn_complete":
+    case "llm_turn_complete": {
       state.turnCounters[turnKey] = currentTurn + 1;
+      // Flush any attach_file chips still queued for this execution. The
+      // normal path drains them into the NEXT queen text bubble — but the
+      // turn can end without one (or the trailing text delta is dropped
+      // under SSE backpressure, being non-critical), and the chips then
+      // never rendered live while a refresh (full disk replay) showed
+      // them: the exact "attachment invisible until refresh" asymmetry.
+      // Stable id (execution-scoped) so live + replay paths dedupe.
+      const leftover = event.execution_id
+        ? state.queenPendingChips[event.execution_id]
+        : undefined;
+      if (leftover && leftover.length > 0) {
+        const chips = leftover.splice(0);
+        const chipMsgId = `chips-${streamId}-${event.execution_id}`;
+        state.queenChipsAppliedByMsgId[chipMsgId] = chips;
+        out.push({
+          id: chipMsgId,
+          agent: queenDisplayName || agentDisplayName || "Queen",
+          agentColor: "",
+          content: "",
+          timestamp: "",
+          thread,
+          createdAt: eventCreatedAt,
+          images: chips.map((c) => ({
+            type: "image_url" as const,
+            image_url: { url: c.url },
+            _fileName: c.filename,
+            _credits: c.credits,
+            _generated: c.generated,
+          })),
+        });
+      }
       break;
+    }
     case "tool_call_started": {
       if (!event.node_id) break;
       const toolName = (event.data?.tool_name as string) || "unknown";

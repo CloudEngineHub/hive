@@ -216,6 +216,11 @@ def list_queens() -> list[dict[str, Any]]:
                     "name": data.get("name", ""),
                     "title": _current_title(queen_id, data.get("title", "")),
                     "has_avatar": _queen_has_avatar(queen_id),
+                    # Not part of the shipped catalog — created by the user
+                    # (UI "New Queen" or a hand-written profile.yaml). The
+                    # frontend groups these under "Custom" in the leader
+                    # catalog instead of a preset function slot.
+                    "custom": queen_id not in DEFAULT_QUEENS,
                 }
                 if data.get("portrait"):
                     entry["portrait"] = data["portrait"]
@@ -223,6 +228,66 @@ def list_queens() -> list[dict[str, Any]]:
             except Exception:
                 logger.warning("Failed to read queen profile %s", profile_path)
     return sorted(results.values(), key=lambda q: q["id"])
+
+
+_QUEEN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+def _slugify_queen_id(name: str) -> str:
+    """Derive a queen id from a display name: ascii-fold to [a-z0-9_-].
+
+    Non-latin names (CJK etc.) can slug to nothing — fall back to a short
+    stable suffix so the id is still deterministic-ish and readable.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:40]
+    if not slug:
+        slug = f"custom_{abs(hash(name)) % 100000:05d}"
+    return slug if slug.startswith("queen_") else f"queen_{slug}"
+
+
+def create_queen_profile(
+    name: str,
+    title: str = "",
+    persona: str = "",
+    queen_id: str = "",
+) -> dict[str, Any]:
+    """Create a brand-new custom queen from scratch.
+
+    Writes ``queens/<id>/profile.yaml`` with the persona fields the loader
+    understands; :func:`list_queens` picks it up on the next call with
+    ``custom: True``. Raises ``ValueError`` for a missing name or malformed
+    id, ``FileExistsError`` when the id is already taken (on disk or by the
+    built-in catalog — shadowing a shipped default would silently replace
+    her persona).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    qid = (queen_id or "").strip() or _slugify_queen_id(name)
+    if not _QUEEN_ID_RE.match(qid):
+        raise ValueError(
+            "queen_id must match [a-z0-9][a-z0-9_-]{0,62} (lowercase slug)"
+        )
+    if qid in DEFAULT_QUEENS or (QUEENS_DIR / qid / "profile.yaml").exists():
+        raise FileExistsError(qid)
+    profile: dict[str, Any] = {"name": name, "title": (title or "").strip()}
+    if (persona or "").strip():
+        # core_traits is the free-text persona field every shipped profile
+        # carries; the system-prompt builder and the API's summary both
+        # read it, so a from-scratch queen speaks in her own voice at once.
+        profile["core_traits"] = persona.strip()
+    _atomic_write_text(
+        QUEENS_DIR / qid / "profile.yaml",
+        yaml.safe_dump(profile, sort_keys=False, allow_unicode=True),
+    )
+    logger.info("Created custom queen profile: %s (%s)", qid, name)
+    return {
+        "id": qid,
+        "name": name,
+        "title": profile["title"],
+        "has_avatar": False,
+        "custom": True,
+    }
 
 
 # Titles this build has RETIRED, per queen id. A queen's display name is defined

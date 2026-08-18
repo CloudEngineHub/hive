@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from framework.config import (
+    get_hive_config,
     get_vision_fallback_api_base,
     get_vision_fallback_api_key,
     get_vision_fallback_model,
@@ -271,7 +272,11 @@ async def caption_tool_image(
     api_key = get_vision_fallback_api_key()
     api_base = get_vision_fallback_api_base()
     if not api_key and not model_override:
-        logger.debug("vision_fallback configured but no API key resolved; skipping")
+        logger.info(
+            "vision_fallback configured (%s) but no API key resolved (literal api_key / env %s both empty); skipping",
+            model,
+            get_hive_config().get("vision_fallback", {}).get("api_key_env_var"),
+        )
         return None
 
     try:

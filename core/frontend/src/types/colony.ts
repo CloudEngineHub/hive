@@ -46,6 +46,9 @@ export interface QueenProfileSummary {
    * Renderers gate the `<img>` load on this so first-time users don't
    * see a 404 for every queen in the sidebar. */
   has_avatar?: boolean;
+  /** True for user-created queens (not part of the shipped catalog).
+   * The leader catalog groups these under "Custom". */
+  custom?: boolean;
 }
 
 export interface UserProfile {
