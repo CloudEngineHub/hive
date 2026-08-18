@@ -86,7 +86,9 @@ async def select_memories(
         resp = await llm.acomplete(
             messages=[{"role": "user", "content": user_msg}],
             system=SELECT_MEMORIES_SYSTEM_PROMPT,
-            max_tokens=1024,
+            # Reasoning models spend budget thinking before the JSON appears;
+            # 1024 starved deepseek-v4-flash into empty responses every call.
+            max_tokens=8192,
             response_format={"type": "json_object"},
         )
         raw = (resp.content or "").strip()

@@ -485,6 +485,10 @@ export interface ReplayState {
    * until the first identity event; queen bubbles then fall back to the
    * page-level `queenDisplayName`. */
   queenIdentityName?: string;
+  /** First-seen epoch-ms per reasoning bubble id. Streaming upserts replace
+   * the message wholesale, so ordering needs the bubble's original time,
+   * not the latest snapshot's. */
+  reasoningStartedAt: Record<string, number>;
 }
 
 export function newReplayState(): ReplayState {
@@ -501,6 +505,7 @@ export function newReplayState(): ReplayState {
     seenEventKeys: new Set<string>(),
     snapshotSeq: 0,
     snapshotAt: 0,
+    reasoningStartedAt: {},
   };
 }
 
@@ -787,6 +792,40 @@ export function replayEvent(
           })),
         });
       }
+      break;
+    }
+    case "llm_reasoning_delta":
+    case "client_reasoning": {
+      // Live thinking feedback: a thinking model can reason for minutes
+      // before its first visible character — without a bubble the session
+      // looks dead the whole time. llm_reasoning_delta carries a rolling
+      // tail-capped snapshot; the final client_reasoning replaces it with
+      // the full consolidated block. Same id → one upserted bubble, in
+      // both live SSE and disk replay.
+      const rIter = (event.data?.iteration as number | undefined) ?? currentTurn;
+      const rInner = (event.data?.inner_turn as number | undefined) ?? 0;
+      const rText =
+        event.type === "client_reasoning"
+          ? (event.data?.reasoning as string) || ""
+          : (event.data?.snapshot as string) || (event.data?.content as string) || "";
+      if (!rText.trim()) break;
+      const rMsgId = `reason-${streamId}-${event.execution_id || "exec"}-${rIter}-t${rInner}`;
+      const rStartedAt = state.reasoningStartedAt[rMsgId] ?? eventCreatedAt;
+      state.reasoningStartedAt[rMsgId] = rStartedAt;
+      out.push({
+        id: rMsgId,
+        agent: effectiveName || event.node_id || "Agent",
+        agentColor: "",
+        content: rText,
+        timestamp: "",
+        type: "reasoning",
+        role,
+        thread,
+        createdAt: rStartedAt,
+        nodeId: event.node_id || undefined,
+        executionId: event.execution_id || undefined,
+        streamId: event.stream_id || undefined,
+      });
       break;
     }
     case "tool_call_started": {

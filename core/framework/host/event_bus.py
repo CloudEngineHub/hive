@@ -1142,15 +1142,28 @@ class EventBus:
         node_id: str,
         content: str,
         execution_id: str | None = None,
+        iteration: int | None = None,
+        inner_turn: int = 0,
+        snapshot: str | None = None,
     ) -> None:
-        """Emit LLM reasoning delta event."""
+        """Emit LLM reasoning delta event.
+
+        ``snapshot`` mirrors the client_output_delta contract: accumulated
+        reasoning so far (possibly tail-capped by the emitter), so consumers
+        render by replacement instead of concatenating deltas.
+        """
+        data: dict = {"content": content, "inner_turn": inner_turn}
+        if iteration is not None:
+            data["iteration"] = iteration
+        if snapshot is not None:
+            data["snapshot"] = snapshot
         await self.publish(
             AgentEvent(
                 type=EventType.LLM_REASONING_DELTA,
                 stream_id=stream_id,
                 node_id=node_id,
                 execution_id=execution_id,
-                data={"content": content},
+                data=data,
             )
         )
 

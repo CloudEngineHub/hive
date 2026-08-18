@@ -31,6 +31,11 @@ DEFAULT_EVENT_TYPES = [
     # live streaming would leave the reply merged above the steer.
     EventType.CLIENT_INPUT_COMMITTED,
     EventType.LLM_TEXT_DELTA,
+    # Thinking-model feedback: throttled reasoning stream while the model is
+    # still silent, then the consolidated block. Without these a long native
+    # think (minutes on deepseek/glm) renders as a dead page.
+    EventType.LLM_REASONING_DELTA,
+    EventType.CLIENT_REASONING,
     EventType.TOOL_CALL_STARTED,
     EventType.TOOL_CALL_COMPLETED,
     EventType.EXECUTION_STARTED,

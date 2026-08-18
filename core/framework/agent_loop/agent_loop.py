@@ -4082,6 +4082,37 @@ class AgentLoop(AgentProtocol):
                 _clean_snapshot = ""  # visible-only text for the frontend
                 _reasoning_emitted = ""  # last reasoning emitted via CLIENT_REASONING (dedup)
                 _reasoning_native = ""  # accumulated native reasoning-delta text (thinking models)
+                _reasoning_streamed_len = 0  # chars of _reasoning_native already published live
+                _reasoning_last_pub = 0.0
+
+                async def _stream_reasoning_delta() -> None:
+                    """Live-stream native reasoning to the UI, throttled to ~1/s.
+
+                    A thinking model can reason for minutes before its first
+                    visible character; without these events the session looks
+                    dead the whole time. Snapshot is tail-capped — the full
+                    text still arrives via CLIENT_REASONING at flush.
+                    """
+                    nonlocal _reasoning_streamed_len, _reasoning_last_pub
+                    if not (self._event_bus and ctx.emits_client_io):
+                        return
+                    if len(_reasoning_native) <= _reasoning_streamed_len:
+                        return
+                    now = time.monotonic()
+                    if now - _reasoning_last_pub < 1.0:
+                        return
+                    tail = _reasoning_native[_reasoning_streamed_len:]
+                    _reasoning_streamed_len = len(_reasoning_native)
+                    _reasoning_last_pub = now
+                    await self._event_bus.emit_llm_reasoning_delta(
+                        stream_id=stream_id,
+                        node_id=node_id,
+                        content=tail,
+                        execution_id=execution_id,
+                        iteration=iteration,
+                        inner_turn=inner_turn,
+                        snapshot=_reasoning_native[-4000:],
+                    )
 
                 async def _flush_reasoning() -> None:
                     """Surface reasoning to monitors once per turn (deduped).
@@ -4132,6 +4163,7 @@ class AgentLoop(AgentProtocol):
                         # Accumulate; flushed to monitors when the first visible
                         # text arrives (or at FinishEvent for tool-only turns).
                         _reasoning_native += event.content
+                        await _stream_reasoning_delta()
 
                     elif isinstance(event, TextDeltaEvent):
                         accumulated_text = event.snapshot

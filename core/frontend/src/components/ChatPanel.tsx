@@ -31,6 +31,7 @@ import {
   ExternalLink,
   Sparkles,
   Table2,
+  Brain,
 } from "lucide-react";
 import { ReportModal } from "@/components/SessionReportAction";
 import {
@@ -809,7 +810,8 @@ export interface ChatMessage {
     | "run_divider"
     | "colony_link"
     | "inherited_block"
-    | "trigger";
+    | "trigger"
+    | "reasoning";
   role?: "queen" | "worker";
   /** Which worker thread this message belongs to (worker agent name) */
   thread?: string;
@@ -1341,6 +1343,36 @@ function revealFailed(t: ToolEntryLike): boolean {
 /** "linkedin_outreach" → "linkedin outreach" — the user's own colony name. */
 function humanizeColony(c: MigrationCandidate): string {
   return (c.name || c.colony_id).replace(/[_-]+/g, " ").trim();
+}
+
+/** Collapsible thinking trace. Streams a tail-capped snapshot live, then the
+ *  full block on completion — collapsed by default so it never crowds the
+ *  conversation, but present so a long native think doesn't look like a hang. */
+export function ReasoningRow({ content }: { content: string }) {
+  const [open, setOpen] = useState(false);
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+  const preview = trimmed.length > 120 ? trimmed.slice(0, 120) + "…" : trimmed;
+  return (
+    <div className="my-1 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 text-muted-foreground/70 hover:text-muted-foreground transition-colors"
+      >
+        <Brain className="w-3.5 h-3.5 shrink-0" />
+        <span className="italic">{open ? "思考过程" : preview}</span>
+        <ChevronRight
+          className={`w-3 h-3 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
+        />
+      </button>
+      {open && (
+        <div className="mt-1 ml-5 pl-3 border-l border-border/60 text-muted-foreground/80 whitespace-pre-wrap leading-relaxed">
+          {trimmed}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function ToolActivityRow({
@@ -2108,6 +2140,10 @@ const MessageBubble = memo(
 
     if (msg.type === "tool_status") {
       return <ToolActivityRow content={msg.content} />;
+    }
+
+    if (msg.type === "reasoning") {
+      return <ReasoningRow content={msg.content} />;
     }
 
     if (isUser) {
@@ -2953,6 +2989,15 @@ export default function ChatPanel({
           // these aside and emit them as standalone pills after the
           // bubble so the worker run stays aggregated.
           if (m.type === "tool_status" && m.role === "queen") {
+            interleavedQueenTools.push(m);
+            i++;
+            continue;
+          }
+
+          // Queen reasoning row — same treatment: the queen's thinking is
+          // part of the queen↔user thread, not worker activity. Keep aside
+          // so it renders standalone instead of folding into the worker card.
+          if (m.type === "reasoning" && m.role === "queen") {
             interleavedQueenTools.push(m);
             i++;
             continue;
