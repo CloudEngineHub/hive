@@ -26,15 +26,6 @@ export interface QueenBee {
   status: "online" | "offline";
 }
 
-export interface Template {
-  id: string;
-  title: string;
-  description: string;
-  category: string;
-  icon: string;
-  agentPath: string;
-}
-
 import type { PortraitDescriptor } from "@/api/queens";
 
 export interface QueenProfileSummary {
