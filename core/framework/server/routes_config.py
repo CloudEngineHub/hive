@@ -1160,6 +1160,60 @@ async def handle_get_llm_sections(request: web.Request) -> web.Response:
     )
 
 
+async def _write_role_section(
+    request: web.Request, role: str, section: dict, validate: bool
+) -> web.Response:
+    """Validate + commit one provider section into a slot, verbatim.
+
+    Shared by the direct slot editor (PUT /llm-sections) and the library
+    apply endpoint — both paths must behave identically: same health check,
+    same verbatim write, same hot-swap when the main slot changes.
+    """
+    if not str(section.get("model") or "").strip():
+        return web.json_response({"error": "'model' is required"}, status=400)
+
+    provider = str(section.get("provider") or "openai")
+    api_base = str(section.get("api_base") or "").strip() or None
+    api_key = str(section.get("api_key") or "")
+    if not api_key:
+        env_var = section.get("api_key_env_var")
+        if env_var:
+            api_key = os.environ.get(str(env_var), "")
+
+    if validate and api_key and api_base:
+        check = await _validate_provider_key(
+            provider, api_key, api_base=api_base, model=str(section["model"])
+        )
+        if check.get("valid") is False:
+            return web.json_response(
+                {"error": f"Key check failed against {api_base}: "
+                          f"{check.get('message', 'unknown error')}"},
+                status=400,
+            )
+
+    config = get_hive_config()
+    config[role] = section  # verbatim — the file mirrors the editor exactly
+    _write_config_atomic(config)
+
+    swapped = 0
+    if role == "llm":
+        full_model = f"{provider}/{section['model']}"
+        swapped = _hot_swap_sessions(
+            request, full_model, api_key=api_key or None, api_base=api_base
+        )
+    logger.info(
+        "Provider slot %s written: %s/%s @ %s, hot-swapped %d session(s)",
+        role,
+        provider,
+        section.get("model"),
+        api_base,
+        swapped,
+    )
+    return web.json_response(
+        {"role": role, "section": section, "sessions_swapped": swapped}
+    )
+
+
 async def handle_put_llm_section(request: web.Request) -> web.Response:
     """PUT /api/config/llm-sections — write ONE slot verbatim.
 
@@ -1200,48 +1254,108 @@ async def handle_put_llm_section(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "'section' must be a JSON object or null"}, status=400
         )
+    return await _write_role_section(
+        request, role, section, validate=bool(body.get("validate", True))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider library — named vendor configs saved under "provider_library" in
+# configuration.json. A library entry is the same verbatim section shape as a
+# slot; applying one COPIES it into the slot (no reference indirection), so
+# the runtime getters and the slots' verbatim contract stay untouched.
+# ---------------------------------------------------------------------------
+
+
+def _get_provider_library() -> dict[str, dict]:
+    lib = get_hive_config().get("provider_library")
+    if not isinstance(lib, dict):
+        return {}
+    return {str(k): v for k, v in lib.items() if isinstance(v, dict)}
+
+
+async def handle_get_provider_library(request: web.Request) -> web.Response:
+    """GET /api/config/provider-library — saved vendor configs, verbatim."""
+    return web.json_response({"library": _get_provider_library()})
+
+
+async def handle_put_provider_library(request: web.Request) -> web.Response:
+    """PUT /api/config/provider-library — save or delete ONE library entry.
+
+    Body: ``{"name": n, "section": {...} | null}``. ``section: null``
+    deletes the entry. No health check here — a stored config may hold a
+    key for an endpoint that isn't reachable right now; validation runs
+    when the entry is applied to a slot.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return web.json_response({"error": "'name' is required"}, status=400)
+    section = body.get("section", None)
+
+    config = get_hive_config()
+    library = config.get("provider_library")
+    if not isinstance(library, dict):
+        library = {}
+
+    if section is None:
+        library.pop(name, None)
+        if library:
+            config["provider_library"] = library
+        else:
+            config.pop("provider_library", None)
+        _write_config_atomic(config)
+        logger.info("Provider library entry deleted: %s", name)
+        return web.json_response({"name": name, "section": None})
+
+    if not isinstance(section, dict):
+        return web.json_response(
+            {"error": "'section' must be a JSON object or null"}, status=400
+        )
     if not str(section.get("model") or "").strip():
         return web.json_response({"error": "'model' is required"}, status=400)
 
-    provider = str(section.get("provider") or "openai")
-    api_base = str(section.get("api_base") or "").strip() or None
-    api_key = str(section.get("api_key") or "")
-    if not api_key:
-        env_var = section.get("api_key_env_var")
-        if env_var:
-            api_key = os.environ.get(str(env_var), "")
-
-    if body.get("validate", True) and api_key and api_base:
-        check = await _validate_provider_key(
-            provider, api_key, api_base=api_base, model=str(section["model"])
-        )
-        if check.get("valid") is False:
-            return web.json_response(
-                {"error": f"Key check failed against {api_base}: "
-                          f"{check.get('message', 'unknown error')}"},
-                status=400,
-            )
-
-    config = get_hive_config()
-    config[role] = section  # verbatim — the file mirrors the editor exactly
+    library[name] = section  # verbatim, unknown keys included
+    config["provider_library"] = library
     _write_config_atomic(config)
-
-    swapped = 0
-    if role == "llm":
-        full_model = f"{provider}/{section['model']}"
-        swapped = _hot_swap_sessions(
-            request, full_model, api_key=api_key or None, api_base=api_base
-        )
     logger.info(
-        "Provider slot %s written: %s/%s @ %s, hot-swapped %d session(s)",
-        role,
-        provider,
+        "Provider library entry saved: %s (%s/%s)",
+        name,
+        section.get("provider"),
         section.get("model"),
-        api_base,
-        swapped,
     )
-    return web.json_response(
-        {"role": role, "section": section, "sessions_swapped": swapped}
+    return web.json_response({"name": name, "section": section})
+
+
+async def handle_apply_provider_library(request: web.Request) -> web.Response:
+    """POST /api/config/provider-library/apply — copy a library entry into a slot.
+
+    Body: ``{"name": n, "role": r, "validate"?: true}``. The entry is
+    written into the slot verbatim through the same path as the direct
+    slot editor: health-checked (unless ``validate`` is false) and
+    hot-swapped into running sessions when the main llm slot changes.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    role = str(body.get("role") or "")
+    if role not in _ROLE_SECTIONS:
+        return web.json_response(
+            {"error": "'role' must be llm | worker_llm | vision_fallback"},
+            status=400,
+        )
+    name = str(body.get("name") or "").strip()
+    section = _get_provider_library().get(name)
+    if section is None:
+        return web.json_response(
+            {"error": f"No provider library entry named '{name}'"}, status=404
+        )
+    return await _write_role_section(
+        request, role, section, validate=bool(body.get("validate", True))
     )
 
 
@@ -1355,6 +1469,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/config/external-skills", handle_get_external_skills)
     app.router.add_put("/api/config/external-skills", handle_put_external_skills)
     app.router.add_put("/api/config/llm-sections", handle_put_llm_section)
+    app.router.add_get("/api/config/provider-library", handle_get_provider_library)
+    app.router.add_put("/api/config/provider-library", handle_put_provider_library)
+    app.router.add_post("/api/config/provider-library/apply", handle_apply_provider_library)
     app.router.add_put("/api/config/llm", handle_update_llm_config)
     app.router.add_get("/api/config/models", handle_get_models)
     app.router.add_get("/api/config/sentinel", handle_get_sentinel_config)

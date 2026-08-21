@@ -717,8 +717,6 @@ async def handle_chat(request: web.Request) -> web.Response:
         if node is None and session.queen_task is not None and not session.queen_task.done():
             logger.warning("[handle_chat] Queen executor exists but node not ready yet (initializing). Waiting...")
             # Wait a short time for initialization to progress
-            import asyncio
-
             for _ in range(50):  # Max 5 seconds
                 await asyncio.sleep(0.1)
                 node = queen_executor.node_registry.get("queen")

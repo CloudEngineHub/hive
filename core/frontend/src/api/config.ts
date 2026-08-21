@@ -113,6 +113,26 @@ export const configApi = {
       { role, section },
     ),
 
+  /** Saved vendor configs (configuration.json "provider_library"), verbatim. */
+  getProviderLibrary: () =>
+    api.get<{ library: Record<string, LlmSection> }>("/config/provider-library"),
+
+  /** Save (or delete, with null) one named library entry. No health check —
+   * validation happens when the entry is applied to a slot. */
+  putProviderLibraryEntry: (name: string, section: LlmSection | null) =>
+    api.put<{ name: string; section: LlmSection | null }>(
+      "/config/provider-library",
+      { name, section },
+    ),
+
+  /** Copy a library entry into a slot — same validation + hot-swap path as
+   * putLlmSection. */
+  applyProviderLibraryEntry: (name: string, role: LlmRole) =>
+    api.post<{ role: LlmRole; section: LlmSection; sessions_swapped?: number }>(
+      "/config/provider-library/apply",
+      { name, role },
+    ),
+
   /** External skill roots (configuration.json "external_skills"), verbatim.
    * `suggestions` = auto-discovered known agent skill dirs (exist, contain
    * skills, not yet configured). */
